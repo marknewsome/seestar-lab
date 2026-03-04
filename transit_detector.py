@@ -77,6 +77,14 @@ SHAKE_HOT_FRAC    = 0.015  # >1.5 % of disk pixels lit up → shake / noise fram
 MAX_BLOBS_PER_FRAME = 5    # more blobs than this in one frame → treat as noise
 MAX_EVENTS_PER_VIDEO = 30  # safety cap: more than this almost certainly means FPs
 
+# Telescope tracking-drift / wobble compensation
+# A slow correction move shifts crater edges against the static background,
+# creating linear blob tracks that look like transits.  Per-frame phase
+# correlation detects the drift and realigns the background before differencing.
+DRIFT_CROP = 256   # px: side of the square crop used for phase correlation
+DRIFT_MAX  = 8.0   # px: clamp on the correction (larger = re-pointing or error)
+DRIFT_MIN  = 0.3   # px: ignore sub-pixel noise below this threshold
+
 # Timezone used when parsing timestamps from filenames
 VIDEO_TIMEZONE    = "America/Los_Angeles"
 
@@ -301,6 +309,38 @@ class TransitDetector:
 
     # ── Blob tracker ──────────────────────────────────────────────────────────
 
+    # ── Drift compensation ────────────────────────────────────────────────────
+
+    def _estimate_disk_shift(
+        self,
+        frame_gray: np.ndarray,
+        bg_f32: np.ndarray,
+    ) -> tuple[float, float]:
+        """
+        Estimate the translational drift of the disk since the background was
+        computed, using phase correlation on a square crop centred on the disk.
+
+        The Seestar's alt-az mount makes smooth servo corrections that shift
+        crater edges against the static background, generating blobs that look
+        like transiting objects.  Measuring the shift here lets _track_blobs
+        realign the background before differencing so those artefacts subtract
+        away cleanly.
+
+        Returns (dx, dy) in pixels (sub-pixel accurate).
+        """
+        cx, cy = self._disk_center
+        half   = DRIFT_CROP // 2
+        x1, x2 = cx - half, cx + half
+        y1, y2 = cy - half, cy + half
+        # If the disk is too close to the frame edge for a full crop, skip.
+        if x1 < 0 or y1 < 0 or x2 > self.width or y2 > self.height:
+            return 0.0, 0.0
+        (dx, dy), _ = cv2.phaseCorrelate(
+            bg_f32[y1:y2, x1:x2],
+            frame_gray[y1:y2, x1:x2].astype(np.float32),
+        )
+        return float(dx), float(dy)
+
     def _track_blobs(
         self,
         background: np.ndarray,
@@ -318,6 +358,10 @@ class TransitDetector:
         match_dist = self._disk_radius * 0.12        # 12 % of disk radius
         kernel     = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
+        # Pre-convert background to float32 once for phase-correlation drift
+        # estimation (phaseCorrelate requires float input).
+        bg_f32 = background.astype(np.float32)
+
         active: dict[int, dict]  = {}
         completed: list[dict]    = []
         next_id = 0
@@ -334,7 +378,25 @@ class TransitDetector:
                 raise RuntimeError("cancelled")
 
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            diff  = cv2.absdiff(gray, background)
+
+            # Telescope drift compensation: estimate how far the disk has
+            # shifted since the background was computed, then realign before
+            # differencing.  This prevents servo corrections from producing
+            # linear crater-edge blobs that mimic transiting objects.
+            _dx, _dy = self._estimate_disk_shift(gray, bg_f32)
+            _dx = max(-DRIFT_MAX, min(DRIFT_MAX, _dx))
+            _dy = max(-DRIFT_MAX, min(DRIFT_MAX, _dy))
+            if abs(_dx) >= DRIFT_MIN or abs(_dy) >= DRIFT_MIN:
+                _M  = np.float32([[1, 0, _dx], [0, 1, _dy]])
+                _bg = cv2.warpAffine(
+                    background, _M, (self.width, self.height),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+                diff = cv2.absdiff(gray, _bg)
+            else:
+                diff = cv2.absdiff(gray, background)
+
             _, th = cv2.threshold(diff, self._diff_thresh, 255, cv2.THRESH_BINARY)
             th    = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
             th    = cv2.bitwise_and(th, mask)
