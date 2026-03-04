@@ -335,8 +335,14 @@ class TransitDetector:
         # If the disk is too close to the frame edge for a full crop, skip.
         if x1 < 0 or y1 < 0 or x2 > self.width or y2 > self.height:
             return 0.0, 0.0
+        bg_crop = bg_f32[y1:y2, x1:x2]
+        # Texture gate: a featureless crop (dark side of a crescent moon, or a
+        # very smooth solar disk with no sunspots) gives noisy phase-correlation
+        # output and should not be used for drift correction.
+        if float(bg_crop.std()) < 4.0:
+            return 0.0, 0.0
         (dx, dy), _ = cv2.phaseCorrelate(
-            bg_f32[y1:y2, x1:x2],
+            bg_crop,
             frame_gray[y1:y2, x1:x2].astype(np.float32),
         )
         return float(dx), float(dy)
