@@ -156,9 +156,12 @@ class TransitDetector:
         # sunspots and its surface features cause less blob noise.
         if video_type == "lunar":
             self._diff_thresh         = 8     # was 12 — lower contrast vs solar
-            self._min_track_frames    = 5     # was 8  — catch shorter tracks
+            self._min_track_frames    = 7     # raised from 5: ≥7 pts for reliable R²
             self._min_vel_pct         = 2.0   # was 3.0
             self._min_confidence      = 0.60  # was 0.70
+            self._min_linearity       = 0.60  # hard R² floor — seeing shimmer clusters < 0.60
+            self._min_fill_frac       = 0.50  # blob must appear in ≥50 % of spanned frames
+            self._min_perimeter_frac  = 0.60  # one track end must reach 60 % of disk radius
             self._shake_hot_frac      = 0.04  # was 0.015 — more lenient
             self._max_blobs_per_frame = 10    # was 5    — more lenient
             self._max_blob_frac       = 0.95  # allow large objects (e.g. nearby aircraft)
@@ -167,6 +170,9 @@ class TransitDetector:
             self._min_track_frames    = MIN_TRACK_FRAMES
             self._min_vel_pct         = MIN_VEL_PCT
             self._min_confidence      = MIN_CONFIDENCE
+            self._min_linearity       = 0.0   # no hard floor for solar
+            self._min_fill_frac       = 0.0   # disabled for solar
+            self._min_perimeter_frac  = 0.0   # disabled for solar
             self._shake_hot_frac      = SHAKE_HOT_FRAC
             self._max_blobs_per_frame = MAX_BLOBS_PER_FRAME
             self._max_blob_frac       = MAX_BLOB_FRAC
@@ -233,17 +239,28 @@ class TransitDetector:
     # ── Background model ──────────────────────────────────────────────────────
 
     def _compute_background(self) -> np.ndarray:
-        interval = max(1, self.total_frames // N_BG_SAMPLES)
-        cap      = cv2.VideoCapture(self.video_path)
-        frames: list[np.ndarray] = []
-        pos = 0
+        """
+        Sample N_BG_SAMPLES frames evenly across the video in a single
+        forward pass.  cap.grab() advances the stream without a full pixel
+        decode; only the N keeper frames pay the decompression cost, making
+        this faster than N random cap.set() seeks regardless of storage type.
+        """
+        interval  = max(1, self.total_frames // N_BG_SAMPLES)
+        cap       = cv2.VideoCapture(self.video_path)
+        frames:   list[np.ndarray] = []
+        frame_idx = 0
+        next_keep = 0
         while len(frames) < N_BG_SAMPLES:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-            pos += interval
+            if frame_idx == next_keep:
+                ret, frame = cap.read()      # full decode — keeper frame
+                if not ret:
+                    break
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                next_keep += interval
+            else:
+                if not cap.grab():           # advance stream, skip decode
+                    break
+            frame_idx += 1
         cap.release()
         if not frames:
             return np.zeros((self.height, self.width), dtype=np.uint8)
@@ -477,7 +494,34 @@ class TransitDetector:
             if velocity_pct < self._min_vel_pct:
                 continue
 
+            # Track continuity: a real transit blob is visible in most frames
+            # it spans.  Seeing shimmer materialises and vanishes erratically,
+            # accumulating the minimum point count but with many gaps in between.
+            fill_frac = len(pts) / max(duration_frames, 1)
+            if fill_frac < self._min_fill_frac:
+                continue
+
             linearity  = _linearity_r2(xs, ys)
+
+            # Hard R² floor.  ISS candidates (fast + near-perfect linearity) are
+            # exempt so a genuine satellite transit isn't silently discarded even
+            # if the track is short.  For everything else, low-R² tracks are
+            # almost always atmospheric seeing shimmer; reject them early.
+            _iss_candidate = velocity_pct > 40 and linearity > 0.95
+            if linearity < self._min_linearity and not _iss_candidate:
+                continue
+
+            # Entry/exit proximity: real transits cross the disk and therefore
+            # begin or end near the disk perimeter.  Blobs that materialise
+            # entirely inside the disk are almost certainly atmospheric artefacts.
+            if self._min_perimeter_frac > 0:
+                _cx, _cy = self._disk_center
+                _r       = max(self._disk_radius, 1)
+                start_r  = ((xs[0]  - _cx) ** 2 + (ys[0]  - _cy) ** 2) ** 0.5 / _r
+                end_r    = ((xs[-1] - _cx) ** 2 + (ys[-1] - _cy) ** 2) ** 0.5 / _r
+                if max(start_r, end_r) < self._min_perimeter_frac:
+                    continue
+
             label      = _classify(velocity_pct, linearity, duration_s)
             confidence = _confidence(linearity, velocity_pct, duration_s)
 
@@ -542,35 +586,34 @@ class TransitDetector:
             pad     = int(pad_secs * self.fps)
             start_f = max(0, ev.frame_start - pad)
             end_f   = min(self.total_frames - 1, ev.frame_end + pad)
+            hero_f  = self._hero_frame_num(ev)   # always within [start_f, end_f]
 
             slug      = f"{stem}_t{i:02d}_{ev.label}_{ev.confidence:.2f}"
             clip_path = os.path.join(output_dir, slug + ".mp4")
             meta_path = os.path.join(output_dir, slug + ".json")
 
-            # Extract clip, burning UTC timestamp onto each frame
+            # Extract clip and capture the hero frame in the same pass —
+            # no second VideoCapture / seek needed for the thumbnail.
             cap = cv2.VideoCapture(self.video_path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
             out = cv2.VideoWriter(
                 clip_path, fourcc, self.fps, (self.width, self.height)
             )
+            hero_frame = None
             for clip_frame_i in range(end_f - start_f + 1):
                 ret, frame = cap.read()
                 if not ret:
                     break
-                _burn_utc(frame, self._video_start_utc, start_f + clip_frame_i, self.fps)
+                abs_frame = start_f + clip_frame_i
+                _burn_utc(frame, self._video_start_utc, abs_frame, self.fps)
                 out.write(frame)
+                if abs_frame == hero_f:
+                    hero_frame = frame.copy()   # UTC already burned in
             out.release()
             cap.release()
 
-            # Hero-frame thumbnail: the track point closest to the disk centre
-            hero_f = self._hero_frame_num(ev)
-            cap_h  = cv2.VideoCapture(self.video_path)
-            cap_h.set(cv2.CAP_PROP_POS_FRAMES, hero_f)
-            ret_h, hero_frame = cap_h.read()
-            cap_h.release()
             thumb_path = os.path.join(output_dir, slug + "_thumb.jpg")
-            if ret_h:
-                _burn_utc(hero_frame, self._video_start_utc, hero_f, self.fps)
+            if hero_frame is not None:
                 cv2.imwrite(thumb_path, hero_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 ev.thumb_path = thumb_path
                 _embed_thumbnail(clip_path, thumb_path)
