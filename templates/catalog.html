@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ catalog_title }} — Seestar Lab</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link {% if catalog_type == 'messier' %}active{% endif %}" href="/catalog/messier">Messier</a>
+        <a class="nav-link {% if catalog_type == 'caldwell' %}active{% endif %}" href="/catalog/caldwell">Caldwell</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- Catalog header + progress bar -->
+    <div class="catalog-header">
+      <h1 class="catalog-title">{{ catalog_title }}</h1>
+      <div class="catalog-progress" id="catalog-progress" style="display:none;">
+        <div class="progress-bar-wrap">
+          <div class="progress-bar-fill" id="progress-fill"></div>
+        </div>
+        <span class="progress-label" id="progress-label"></span>
+      </div>
+    </div>
+
+    <!-- Type filter tabs -->
+    <div class="filter-bar catalog-filter-bar">
+      <button class="filter-btn active" data-group="all"     data-label="All">All</button>
+      <button class="filter-btn"        data-group="galaxy"  data-label="Galaxies">Galaxies</button>
+      <button class="filter-btn"        data-group="cluster" data-label="Clusters">Clusters</button>
+      <button class="filter-btn"        data-group="nebula"  data-label="Nebulae">Nebulae</button>
+      <button class="filter-btn"        data-group="other"   data-label="Other">Other</button>
+    </div>
+
+    <!-- Captured / all toggle -->
+    <div class="catalog-toggle">
+      <label class="toggle-label">
+        <input type="checkbox" id="captured-only" />
+        Show captured only
+      </label>
+    </div>
+
+    <!-- Loading state -->
+    <div id="catalog-loading" class="empty-state">
+      <div class="empty-icon">🔭</div>
+      <p>Loading catalog…</p>
+    </div>
+
+    <!-- Catalog grid -->
+    <div class="catalog-grid" id="catalog-grid" style="display:none;"></div>
+
+  </main>
+
+  <script>
+    const CATALOG_TYPE = {{ catalog_type | tojson }};
+    const CATALOG_TOTAL = {{ catalog_total }};
+  </script>
+  <script src="/static/js/catalog.js"></script>
+</body>
+</html>

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Seestar Lab</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link active" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+        <div class="header-actions">
+          <span id="scan-status" class="scan-status">
+            {% if last_scan %}Last scan: {{ last_scan }}{% endif %}
+          </span>
+          <button id="scan-btn"      class="btn-rescan"    onclick="triggerScan(false)"
+                  title="Re-scan only directories that changed">↻ Rescan</button>
+          <button id="scan-full-btn" class="btn-full-scan" onclick="triggerScan(true)"
+                  title="Force a complete re-read of all files">Full</button>
+        </div>
+      </div>
+    </div>
+    <!-- Scan progress bar — sits at the bottom of the sticky header -->
+    <div class="scan-progress-bar" id="scan-progress-bar" style="display:none;">
+      <div class="scan-progress-fill" id="scan-progress-fill"></div>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- Summary bar -->
+    <div class="summary-bar" id="summary-bar" style="display:none;">
+      <div class="stat"><span class="stat-val" id="stat-sessions">—</span><span class="stat-label">sessions</span></div>
+      <div class="stat"><span class="stat-val" id="stat-subs">—</span><span class="stat-label">subs</span></div>
+      <div class="stat"><span class="stat-val" id="stat-size">—</span><span class="stat-label">total size</span></div>
+      <div class="stat"><span class="stat-val" id="stat-videos">—</span><span class="stat-label">video files</span></div>
+      <div class="stat"><span class="stat-val" id="stat-video-hrs">—</span><span class="stat-label">video</span></div>
+    </div>
+
+    <!-- Transit queue controls — shown only while jobs are active -->
+    <div class="transit-queue-bar" id="transit-queue-bar" style="display:none;">
+      <span class="transit-queue-label" id="transit-queue-label">Transit queue</span>
+      <button id="transit-pause-btn" class="btn-tq-pause" onclick="toggleTransitPause()">⏸ Pause</button>
+      <button class="btn-tq-cancel" onclick="cancelAllTransit()">✕ Cancel All</button>
+    </div>
+
+    <!-- Filter bar — data-label is the base text used when adding counts -->
+    <div class="filter-bar">
+      <button class="filter-btn active" data-type="all"      data-label="All">All</button>
+      <button class="filter-btn"        data-type="messier"  data-label="Messier">Messier</button>
+      <button class="filter-btn"        data-type="caldwell" data-label="Caldwell">Caldwell</button>
+      <button class="filter-btn"        data-type="dso"      data-label="DSO">DSO</button>
+      <button class="filter-btn"        data-type="planet"   data-label="Planets">Planets</button>
+      <button class="filter-btn"        data-type="solar"    data-label="Solar">Solar</button>
+      <button class="filter-btn"        data-type="lunar"    data-label="Lunar">Lunar</button>
+      <button class="filter-btn"        data-type="comet"    data-label="Comets">Comets</button>
+      <button class="filter-btn"        data-type="unknown"  data-label="Unknown">Unknown</button>
+    </div>
+
+    <!-- Session cards -->
+    <div class="sessions-grid" id="sessions-grid">
+      <div class="empty-state">
+        <div class="empty-icon">🔭</div>
+        <p>Connecting…</p>
+      </div>
+    </div>
+
+  </main>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
