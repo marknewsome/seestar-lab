@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transits — Seestar Lab</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link active" href="/transits">Transits</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- Controls row -->
+    <div class="gallery-controls">
+
+      <!-- Solar / Lunar filter -->
+      <div class="filter-bar" id="scope-bar">
+        <button class="filter-btn active" data-scope="all">All</button>
+        <button class="filter-btn" data-scope="solar">Solar</button>
+        <button class="filter-btn" data-scope="lunar">Lunar</button>
+      </div>
+
+      <!-- Object type filter -->
+      <div class="filter-bar" id="label-bar">
+        <button class="filter-btn active" data-label="all">All types</button>
+        <button class="filter-btn" data-label="plane">Plane</button>
+        <button class="filter-btn" data-label="bird">Bird</button>
+        <button class="filter-btn" data-label="iss">ISS</button>
+        <button class="filter-btn" data-label="unknown">Unknown</button>
+      </div>
+
+      <!-- YOLO confirmed-only toggle -->
+      <label class="gallery-yolo-toggle" id="yolo-toggle-wrap"
+             title="Only show events visually confirmed by YOLO">
+        <input type="checkbox" id="yolo-only" checked />
+        Confirmed only
+      </label>
+
+    </div>
+
+    <!-- Summary line -->
+    <div class="gallery-summary" id="gallery-summary"></div>
+
+    <!-- Loading placeholder -->
+    <div id="gallery-loading" class="empty-state">
+      <div class="empty-icon">🔭</div>
+      <p>Loading transits…</p>
+    </div>
+
+    <!-- Gallery grid -->
+    <div class="transit-gallery" id="transit-gallery" style="display:none;"></div>
+
+  </main>
+
+  <script src="/static/js/transits.js"></script>
+</body>
+</html>

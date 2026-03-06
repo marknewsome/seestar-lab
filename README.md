@@ -15,6 +15,7 @@ solar or lunar disk.
 | **Session browser** | Scans the data directory and displays every observation session as a card with thumbnail, dates, sub-count, and video hours |
 | **Catalog matching** | Messier and Caldwell bingo-card views show which objects have been captured |
 | **Transit detection** | Background-subtraction + blob-tracking pipeline finds transiting objects in solar and lunar videos; clips and thumbnails are saved automatically |
+| **YOLO validation** | Optional second-stage YOLOv8n inference on the hero frame confirms visually recognisable aircraft or birds; unconfirmed events are still shown but can be filtered |
 | **Aircraft lookup** | Detected events are cross-referenced against the OpenSky Network ADS-B feed to identify the aircraft |
 | **Live updates** | A Server-Sent Events stream pushes progress to the browser in real time — no polling, no page reloads |
 
@@ -23,12 +24,17 @@ solar or lunar disk.
 ## Requirements
 
 - Python 3.10+
-- `ffmpeg` on `PATH` (for embedding thumbnail cover-art into clip MP4s)
+- `ffmpeg` on `PATH` (for H.264 transcoding and cover-art embedding)
 - OpenCV, Flask, scipy — see `requirements.txt`
 
 ```
 pip install -r requirements.txt
 ```
+
+`ultralytics` (YOLOv8) is an **optional** dependency.  If it is not installed the
+first-stage CV detector works as normal and the YOLO filter toggle is hidden in the UI.
+Model weights (`yolov8n.pt`, ~6 MB) are downloaded automatically by ultralytics on first
+use and cached in `~/.cache/ultralytics/`.
 
 ---
 
@@ -69,9 +75,13 @@ app.py               Flask routes, SSE broadcaster, transit job queue
 scanner.py           Filesystem crawler; builds and diffs session records
 db.py                SQLite persistence (sessions, video jobs, transit events)
 transit_detector.py  Computer-vision transit-detection pipeline
+yolo_validator.py    Optional YOLOv8n second-stage confirmation (soft dependency)
 aircraft_lookup.py   OpenSky REST API integration
+catalogs.py          Messier / Caldwell catalog data and DSO type/group mappings
+object_catalog.py    Object-type detection (solar/lunar/planet/comet/messier/…) and descriptions
 static/js/app.js     Sessions-page UI; SSE client; transit controls
 static/js/catalog.js Messier / Caldwell bingo-card pages
+static/js/transits.js Transit gallery page
 templates/           Jinja2 HTML templates
 ```
 
@@ -85,12 +95,22 @@ Filesystem
                                               ▼
                        app.py ──► _transit_queue (thread)
                                        │
+                              [copy to local SSD if source
+                               is on a different device]
+                                       │
                               transit_detector.py
+                                       │
+                              yolo_validator.py (optional)
                                        │
                               db.transit_events ──► SSE ──► browser
                                        │
                               aircraft_lookup.py (OpenSky)
 ```
+
+**Local SSD caching** — if the source video is on a different storage device from the
+system temp directory (e.g. a spinning external drive), the app copies the file to a local
+temp path before detection and deletes the copy when done.  This eliminates random-seek
+latency on spinning media without changing where clips are written.
 
 ### Session scanning
 
@@ -107,14 +127,16 @@ database on startup.
 
 ## Transit Detection
 
-Transit detection runs entirely on the CPU using OpenCV.  No GPU or ML model is required.
+Transit detection runs entirely on the CPU using OpenCV.  No GPU is required.  The optional
+YOLO second stage uses a small pretrained model (YOLOv8n, ~6 MB) and runs on CPU.
 
 ### Triggering detection
 
 Click **Detect Transits** on any Solar or Lunar session card.  The app enumerates every
-video file in the session's directories and queues one job per file.  A single background
-worker thread processes them in order (oldest file first).  The queue can be paused,
-cancelled, or force-rerun with **↻ Re-detect**.
+video file in the session's directories and queues one job per file.  A thread pool
+processes up to **3 videos concurrently** (OpenCV decode and NumPy both release the GIL,
+so threading gives real parallelism without multiprocessing overhead).  The queue can be
+paused, cancelled, or force-rerun with **↻ Re-detect**.
 
 ### Output files
 
@@ -122,26 +144,30 @@ For each detected event three files are written to `SEESTAR_OUTPUT_DIR`:
 
 | File | Contents |
 |---|---|
-| `{stem}_t01_plane_0.87.mp4` | Padded clip (±3 s of context) with UTC timestamp burned on each frame; hero-frame JPEG embedded as cover art |
-| `{stem}_t01_plane_0.87_thumb.jpg` | Hero-frame JPEG (the track point closest to disk center) |
-| `{stem}_t01_plane_0.87.json` | Full metadata sidecar (all `TransitEvent` fields, video metadata, detected_at) |
+| `{stem}_t01_plane_0.87.mp4` | Padded clip (±5 s of context) transcoded to H.264 with UTC timestamp burned on each frame; hero-frame JPEG embedded as cover art |
+| `{stem}_t01_plane_0.87_thumb.jpg` | Hero-frame JPEG (the track point closest to disk centre) |
+| `{stem}_t01_plane_0.87.json` | Full metadata sidecar (all `TransitEvent` fields, video metadata, `detected_at`) |
+
+The clip filename encodes: original video stem · event index · first-stage label ·
+confidence (e.g. `0.87` = 87 %).
 
 ---
 
 ### Algorithm
 
-The pipeline runs in five sequential steps.
+The pipeline runs in six sequential steps.  See `DETECTION_PIPELINE.md` for a visual
+flowchart.
 
 #### Step 1 — Temporal median background
 
-Thirty frames are sampled evenly across the video and stacked into a pixel-wise median
-image.  Stationary features — sunspots, lunar craters, surface detail — are baked into
-this background and cancel out when subtracted.  Moving objects (aircraft, birds, ISS)
-leave a clean residual.
+Thirty frames are sampled evenly across the video in a single forward pass.
+`cap.grab()` advances the stream without a full pixel decode; only the 30 keeper frames
+pay the decompression cost.  The 30 grayscale frames are stacked and reduced to a
+pixel-wise median image.
 
-For short clips where the transiting object appears in many background-sample frames a
-"ghost" of the object is partially baked in; this reduces the effective blob contrast but
-does not prevent detection for objects large enough to dominate a single frame.
+Stationary features — sunspots, lunar craters, surface detail — are baked into this
+background and cancel out when subtracted.  Moving objects (aircraft, birds, ISS) leave
+a clean residual.
 
 #### Step 2 — Disk detection
 
@@ -158,29 +184,40 @@ disk diameter.
 
 Each frame is processed in order:
 
-1. **Difference** — `abs(gray_frame − background)` pixel by pixel.
-2. **Threshold** — pixels differing by more than `DIFF_THRESH` (12 DN solar, 8 DN lunar)
-   become foreground.
-3. **Morphological open** — a 3×3 elliptical kernel removes single-pixel noise.
-4. **Disk mask** — pixels outside the disk circle are zeroed.
-5. **Connected components** — each remaining blob is measured: area, centroid, aspect ratio.
+1. **Drift compensation** — The Seestar's alt-az mount makes slow servo corrections that
+   shift crater edges and solar-surface features against the static background, generating
+   spurious linear blobs that can mimic transiting objects.  Before differencing, a
+   256 × 256 pixel crop centred on the disk is phase-correlated between the current frame
+   and the background to measure sub-pixel translational drift `(dx, dy)`.  If the shift
+   exceeds 0.3 px (the sub-pixel noise floor) the background is realigned with an affine
+   warp before differencing.  Corrections larger than 8 px are clamped (likely a re-point
+   or tracking failure, not a smooth correction).  A texture gate skips phase correlation
+   on featureless crops — the dark side of a crescent moon or a smooth solar disk with no
+   sunspots — where the output would be unreliable.
 
-**Dominant-blob detection** (the key false-positive guard)
+2. **Difference** — `abs(gray_frame − aligned_background)` pixel by pixel.
+3. **Threshold** — pixels differing by more than `DIFF_THRESH` (12 DN solar, 8 DN lunar)
+   become foreground.
+4. **Morphological open** — a 3×3 elliptical kernel removes single-pixel noise.
+5. **Disk mask** — pixels outside the disk circle are zeroed.
+6. **Connected components** — each remaining blob is measured: area, centroid, aspect ratio.
+
+**Dominant-blob detection** (large-aircraft guard)
 
 After computing all blob areas the code checks whether one blob overwhelmingly dominates
 the frame before applying any size cap:
 
 - If `largest / second_largest ≥ 20×` → a single giant object (e.g. a nearby Cessna)
   occupies the frame.  Keep only that blob and pass it to the tracker regardless of size.
-- Else if `largest / second_largest ≥ 5×` **and** `largest ≥ 0.3 % of disk area` →
-  a moderately large aircraft whose ratio isn't extreme but whose absolute size rules out
-  ordinary atmospheric shimmer.  Keep only that blob.
+- Else if `largest / second_largest ≥ 5×` **and** `largest ≥ 0.3 % of disk area` (solar
+  only) → a moderately large aircraft whose absolute size rules out ordinary shimmer.
+  Keep only that blob.
 - Otherwise → apply the normal per-blob size cap (`MAX_BLOB_FRAC × disk_area`), then
   check the remaining blob count.
 
 If more than `MAX_BLOBS_PER_FRAME` blobs survive after the dominance check the frame is
 treated as camera shake or atmospheric seeing noise and skipped.  Active tracks have their
-gap counter incremented; tracks that miss more than `MAX_GAP_FRAMES` consecutive frames
+gap counter incremented; tracks that miss more than `MAX_GAP_FRAMES` (4) consecutive frames
 are finalised.
 
 **Track association**
@@ -192,21 +229,28 @@ it.  Unmatched blobs start new tracks.
 
 #### Step 4 — Track scoring and classification
 
-Finalised tracks are scored against three criteria:
+Finalised tracks pass through a gauntlet of rejection filters (cheapest first), then a
+weighted confidence score.
+
+**Rejection filters**
+
+| # | Filter | Solar | Lunar | Notes |
+|---|---|---|---|---|
+| 1 | Minimum track length | 8 pts | 7 pts | R² over < 7 points is statistically unreliable |
+| 2 | Minimum displacement | 5 % of disk radius | same | Rejects stationary residuals |
+| 3 | Minimum velocity | 3.0 %Ø/s | 2.0 %Ø/s | Sunspots drift at ~0.04 %Ø/day — five orders of magnitude below threshold |
+| 4 | Fill fraction | — | ≥ 0.50 | `n_points ÷ (frame_end − frame_start + 1)` — rejects erratic shimmer tracks that accumulate the minimum point count through large gaps |
+| 5 | R² floor | — | ≥ 0.60 | Hard linearity floor; seeing-shimmer clusters below 0.60.  ISS candidates (vel > 40 %Ø/s **and** R² > 0.95) are exempt |
+| 6 | Perimeter proximity | — | ≥ 0.60 | `max(radial_start, radial_end) ÷ disk_radius` — blobs that materialise mid-disk cannot be real transits |
+| 7 | Confidence score | ≥ 0.70 | ≥ 0.60 | Weighted sum below (see table) |
+
+**Confidence score weights**
 
 | Criterion | Weight | Notes |
 |---|---|---|
-| **Linearity (R²)** | 50 % | Scipy linear regression of track coordinates; axis chosen by larger variance; degenerate vertical tracks return R² = 1 |
-| **Velocity** | 30 % | `(displacement_px / duration_frames × fps) / (2 × disk_radius) × 100`; optimal 3–50 %Ø/s scores 1.0 |
+| **Linearity (R²)** | 50 % | Scipy linear regression; axis chosen by larger variance; degenerate vertical lines return R² = 1 |
+| **Velocity** | 30 % | Optimal 3–50 %Ø/s scores 1.0; tapers outside that range |
 | **Duration** | 20 % | 0.1–30 s scores 1.0; outside that range scores 0.3 |
-
-Tracks are rejected before scoring if:
-
-- Fewer than `MIN_TRACK_FRAMES` points (8 solar, 5 lunar)
-- Total displacement < 5 % of disk radius
-- Velocity < `MIN_VEL_PCT` %Ø/s (3 % solar, 2 % lunar) — this is the primary sunspot
-  residual filter; sunspots drift at ~0.04 %Ø/day, five orders of magnitude below the
-  minimum threshold
 
 **Classification heuristics**
 
@@ -214,21 +258,33 @@ Tracks are rejected before scoring if:
 |---|---|
 | `iss` | velocity > 40 %Ø/s **and** R² > 0.97 |
 | `plane` | R² ≥ 0.90 **and** velocity ≥ 3 %Ø/s |
-| `bird` | velocity < 8 %Ø/s (slow, erratic path) |
+| `bird` | velocity < 8 %Ø/s |
 | `unknown` | everything else |
 
-Events with `confidence < MIN_CONFIDENCE` (0.70 solar, 0.60 lunar) are discarded.  If
-more than 30 events survive for a single video the entire result set is discarded as
-likely false positives.
+If more than 30 events survive for a single video the entire result set is discarded as
+almost certainly false positives (the shake filter was insufficient for that video).
 
 #### Step 5 — Clip extraction
 
-For each accepted event the code re-reads the original video and writes a padded clip
-(±3 s of context by default) using OpenCV's `VideoWriter`.  A UTC timestamp parsed from
-the filename (`YYYY-MM-DD-HHMMSS`) is burned onto every frame.  The track point closest
-to the disk centre is saved as a JPEG thumbnail, which is then embedded into the MP4
-container as cover art via `ffmpeg` so Windows Explorer and macOS Finder show a preview.
-A JSON sidecar with the complete `TransitEvent` fields is written alongside each clip.
+For each accepted event the code seeks to `frame_start − pad` (5 s of context) and reads
+forward through `frame_end + pad` in a single pass.  A UTC timestamp parsed from the
+filename (`YYYY-MM-DD-HHMMSS`) is burned onto every frame.  The hero frame (the track
+point closest to the disk centre) is captured during this same pass — no second seek is
+needed.
+
+After writing the raw `mp4v` clip, `ffmpeg` transcodes it to H.264 (`libx264 -crf 23
+-preset fast`) and embeds the hero JPEG as cover art so file browsers show a preview.  A
+JSON sidecar with the complete `TransitEvent` fields is written alongside each clip.
+
+#### Step 6 — YOLO second-stage validation (optional)
+
+If `ultralytics` is installed, YOLOv8n inference is run on the hero-frame JPEG for each
+event.  Only two COCO classes are checked: `airplane` (4) and `bird` (14).  The result is
+stored as `yolo_label` / `yolo_confidence` on the event.
+
+In the UI, confirmed events show a **✓ airplane** or **✓ bird** badge on the pill.  A
+"confirmed only" toggle on each session card hides all first-stage detections that YOLO did
+not confirm.
 
 ---
 
@@ -236,17 +292,27 @@ A JSON sidecar with the complete `TransitEvent` fields is written alongside each
 
 | Parameter | Solar | Lunar | Purpose |
 |---|---|---|---|
-| `DIFF_THRESH` | 12 | 8 | Foreground threshold (DN) |
-| `MIN_TRACK_FRAMES` | 8 | 5 | Minimum track length |
-| `MIN_VEL_PCT` | 3.0 | 2.0 | Minimum speed (%Ø/s) |
-| `MIN_CONFIDENCE` | 0.70 | 0.60 | Score cutoff |
-| `SHAKE_HOT_FRAC` | 0.015 | 0.04 | Hot-pixel fraction that signals shake (unused in current blob-count logic; retained for reference) |
-| `MAX_BLOBS_PER_FRAME` | 5 | 10 | Blob-count shake threshold |
-| `MAX_BLOB_FRAC` | 0.02 | 0.95 | Normal per-blob size cap (dominant-blob bypass overrides this) |
+| `diff_thresh` | 12 | 8 | Foreground threshold (DN) — moon is dimmer |
+| `min_track_frames` | 8 | 7 | Minimum track length for reliable R² |
+| `min_vel_pct` | 3.0 | 2.0 | Minimum speed (%Ø/s) |
+| `min_confidence` | 0.70 | 0.60 | Weighted score cutoff |
+| `min_linearity` | — | 0.60 | Hard R² floor (seeing shimmer clusters below this) |
+| `min_fill_frac` | — | 0.50 | Minimum fraction of spanned frames with a blob |
+| `min_perimeter_frac` | — | 0.60 | One track end must reach 60 % of disk radius |
+| `shake_hot_frac` | 0.015 | 0.04 | Fraction of disk pixels lit up that signals a shake frame |
+| `max_blobs_per_frame` | 5 | 10 | Blob-count threshold beyond which a frame is skipped |
+| `max_blob_frac` | 0.02 | 0.95 | Normal per-blob size cap (dominant-blob bypass overrides this) |
 
-Lunar thresholds are more lenient because the moon is dimmer than the sun (lower contrast
-silhouettes) and its surface features — craters, maria — generate more residual blobs in
-quiet frames due to atmospheric seeing.
+**Drift-compensation constants** (solar and lunar share the same values):
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `DRIFT_CROP` | 256 px | Side of the square disk crop used for phase correlation |
+| `DRIFT_MAX` | 8.0 px | Clamp on accepted shift; larger values treated as re-points and ignored |
+| `DRIFT_MIN` | 0.3 px | Sub-pixel noise floor; shifts below this threshold are ignored |
+
+The three lunar-only filters (`min_linearity`, `min_fill_frac`, `min_perimeter_frac`) are
+set to `0.0` / disabled for solar, so solar detection behaviour is unchanged.
 
 ---
 
@@ -257,6 +323,7 @@ quiet frames due to atmospheric seeing.
 | `GET` | `/` | Sessions index page |
 | `GET` | `/catalog/messier` | Messier bingo-card page |
 | `GET` | `/catalog/caldwell` | Caldwell bingo-card page |
+| `GET` | `/transits` | Transit gallery page (all events across sessions) |
 | `GET` | `/api/events` | SSE stream (sessions, progress, transit events) |
 | `GET` | `/api/sessions` | JSON: all sessions |
 | `GET` | `/api/catalog/<type>` | JSON: Messier or Caldwell catalog with capture status |
@@ -264,7 +331,8 @@ quiet frames due to atmospheric seeing.
 | `GET` | `/api/status` | JSON: scan state, last scan time, session count |
 | `POST` | `/api/scan` | Start scan — body: `{"force": bool}` |
 | `POST` | `/api/transit/detect` | Queue transit detection — body: `{"session_name": str, "force": bool}` |
-| `GET` | `/api/transit/all` | JSON: all video jobs and detected events |
+| `GET` | `/api/transit/all` | JSON: all video jobs and detected events grouped by session |
+| `GET` | `/api/transit/gallery` | JSON: all transit events as a flat list (newest first) |
 | `GET` | `/api/transit/clip/<id>` | Stream MP4 clip for event |
 | `GET` | `/api/transit/thumb/<id>` | Serve hero-frame JPEG for event |
 | `POST` | `/api/transit/pause` | Pause transit worker |
@@ -288,7 +356,7 @@ quiet frames due to atmospheric seeing.
 
 ## Database
 
-SQLite at `seestar.db` in the project root.  The schema is created automatically on
+SQLite at `seestar-lab.db` in the project root.  The schema is created automatically on
 startup; new columns are added with `ALTER TABLE` for backwards compatibility.
 
 | Table | Purpose |
@@ -297,4 +365,4 @@ startup; new columns are added with `ALTER TABLE` for backwards compatibility.
 | `scanned_dirs` | Directory paths + mtimes for differential scanning |
 | `meta` | Key-value store (last scan time, data dir) |
 | `video_jobs` | One row per video file queued for transit detection |
-| `transit_events` | One row per detected transit event |
+| `transit_events` | One row per detected transit event; includes `yolo_label` and `yolo_confidence` |

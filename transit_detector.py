@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import subprocess
+import concurrent.futures
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -81,9 +82,10 @@ MAX_EVENTS_PER_VIDEO = 30  # safety cap: more than this almost certainly means F
 # A slow correction move shifts crater edges against the static background,
 # creating linear blob tracks that look like transits.  Per-frame phase
 # correlation detects the drift and realigns the background before differencing.
-DRIFT_CROP = 256   # px: side of the square crop used for phase correlation
-DRIFT_MAX  = 8.0   # px: clamp on the correction (larger = re-pointing or error)
-DRIFT_MIN  = 0.3   # px: ignore sub-pixel noise below this threshold
+DRIFT_CROP   = 256  # px: side of the square crop used for phase correlation
+DRIFT_MAX    = 8.0  # px: clamp on the correction (larger = re-pointing or error)
+DRIFT_MIN    = 0.3  # px: ignore sub-pixel noise below this threshold
+DRIFT_STRIDE = 5    # re-estimate drift every N frames; hold correction in between
 
 # Timezone used when parsing timestamps from filenames
 VIDEO_TIMEZONE    = "America/Los_Angeles"
@@ -240,6 +242,17 @@ class TransitDetector:
                 for ev in events:
                     if ev.thumb_path:
                         ev.yolo_label, ev.yolo_confidence = yolo_validator.validate(ev.thumb_path)
+                        # Patch YOLO results into the sidecar that _write_clips() already wrote
+                        if ev.meta_path and os.path.exists(ev.meta_path):
+                            try:
+                                with open(ev.meta_path) as _f:
+                                    _sidecar = json.load(_f)
+                                _sidecar["yolo_label"]      = ev.yolo_label
+                                _sidecar["yolo_confidence"] = ev.yolo_confidence
+                                with open(ev.meta_path, "w") as _f:
+                                    json.dump(_sidecar, _f, indent=2)
+                            except Exception:
+                                pass  # sidecar patch is best-effort
 
         _cb(100, f"Done — {len(events)} event(s) found")
         return events
@@ -371,6 +384,11 @@ class TransitDetector:
         active: dict[int, dict]  = {}
         completed: list[dict]    = []
         next_id = 0
+        # Cached drift values — recomputed every DRIFT_STRIDE frames; held
+        # constant in between.  Telescope drift is smooth so a 5-frame hold
+        # is imperceptible while cutting phase-correlation cost by ~80 %.
+        _drift_dx = 0.0
+        _drift_dy = 0.0
 
         cap = cv2.VideoCapture(self.video_path)
         for frame_idx in range(self.total_frames):
@@ -389,7 +407,11 @@ class TransitDetector:
             # shifted since the background was computed, then realign before
             # differencing.  This prevents servo corrections from producing
             # linear crater-edge blobs that mimic transiting objects.
-            _dx, _dy = self._estimate_disk_shift(gray, bg_f32)
+            # Re-estimate every DRIFT_STRIDE frames; hold the correction value
+            # in between — drift is smooth so the approximation is accurate.
+            if frame_idx % DRIFT_STRIDE == 0:
+                _drift_dx, _drift_dy = self._estimate_disk_shift(gray, bg_f32)
+            _dx, _dy = _drift_dx, _drift_dy
             _dx = max(-DRIFT_MAX, min(DRIFT_MAX, _dx))
             _dy = max(-DRIFT_MAX, min(DRIFT_MAX, _dy))
             if abs(_dx) >= DRIFT_MIN or abs(_dy) >= DRIFT_MIN:
@@ -650,6 +672,11 @@ class TransitDetector:
         stem   = Path(self._source_path).stem
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
+        # Pairs of (clip_path, thumb_path) to be transcoded to H.264 after all
+        # clips are extracted.  Collecting them here lets us run the ffmpeg
+        # subprocesses in parallel once the (sequential) video reads are done.
+        to_transcode: list[tuple[str, str]] = []
+
         for i, ev in enumerate(events, start=1):
             pad     = int(pad_secs * self.fps)
             start_f = max(0, ev.frame_start - pad)
@@ -684,12 +711,13 @@ class TransitDetector:
             if hero_frame is not None:
                 cv2.imwrite(thumb_path, hero_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 ev.thumb_path = thumb_path
-                _embed_thumbnail(clip_path, thumb_path)
+                to_transcode.append((clip_path, thumb_path))
 
             ev.clip_path = clip_path
             ev.meta_path = meta_path
 
-            # JSON sidecar
+            # JSON sidecar (written before transcoding; the clip path is stable
+            # because _embed_thumbnail replaces the file at the same path).
             sidecar = {
                 "video_path":  self._source_path,
                 "video_type":  self.video_type,
@@ -698,6 +726,18 @@ class TransitDetector:
             }
             with open(meta_path, "w") as f:
                 json.dump(sidecar, f, indent=2)
+
+        # Transcode all raw mp4v clips to H.264 concurrently.  Each ffmpeg
+        # subprocess replaces the clip file in-place, so clip_path references
+        # in the sidecars remain valid.
+        if to_transcode:
+            workers = min(len(to_transcode), 3)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(_embed_thumbnail, cp, tp)
+                    for cp, tp in to_transcode
+                ]
+                concurrent.futures.wait(futures)
 
 
 # ── Pure-function helpers ─────────────────────────────────────────────────────

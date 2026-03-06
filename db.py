@@ -443,6 +443,43 @@ def get_transit_event(event_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def get_transit_gallery() -> list[dict]:
+    """
+    Return all transit events as a flat list ordered by detected_at descending.
+    Includes video_type and detected_at, which get_transit_summary omits.
+    """
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transit_events ORDER BY detected_at DESC"
+        ).fetchall()
+    result = []
+    for ev in rows:
+        ac: list = []
+        try:
+            if ev["aircraft_candidates"]:
+                ac = json.loads(ev["aircraft_candidates"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+        result.append({
+            "id":                   ev["id"],
+            "video_path":           ev["video_path"],
+            "session_name":         ev["session_name"],
+            "video_type":           ev["video_type"],
+            "label":                ev["label"],
+            "confidence":           ev["confidence"],
+            "duration_s":           ev["duration_s"],
+            "velocity_pct_per_sec": ev["velocity_pct_per_sec"],
+            "linearity":            ev["linearity"],
+            "clip_path":            ev["clip_path"],
+            "thumb_path":           ev["thumb_path"],
+            "aircraft_candidates":  ac,
+            "yolo_label":           ev["yolo_label"],
+            "yolo_confidence":      ev["yolo_confidence"],
+            "detected_at":          ev["detected_at"],
+        })
+    return result
+
+
 def get_transit_summary() -> dict:
     """
     Return {session_name: {video_jobs: [...], events: [...]}} for all sessions

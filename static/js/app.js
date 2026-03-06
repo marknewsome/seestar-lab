@@ -536,19 +536,26 @@ function buildTransitFooter(sessionName) {
 
   const hasActive = jobs.some(j => j.status === 'running' || j.status === 'pending');
 
-  // Compute position counter: "5/125" = (done so far + 1) / total
-  const totalJobs  = jobs.length;
-  const doneCount  = jobs.filter(j => j.status === 'done' || j.status === 'cancelled' || j.status === 'error').length;
-  const runningPos = doneCount + 1;
+  // Compute position counters for the progress label "5/125 · …"
+  // With concurrent workers multiple jobs can be 'running' at once; each gets
+  // its own sequential position (doneCount+1, doneCount+2, …) rather than all
+  // sharing the same number.
+  const totalJobs = jobs.length;
+  const doneCount = jobs.filter(j => j.status === 'done' || j.status === 'cancelled' || j.status === 'error').length;
 
   // --- job progress rows (skip done/cancelled/pending — only show active/errored) ---
   let jobRows = '';
+  let runningIdx = 0;
   for (const j of jobs) {
     if (j.status === 'done' || j.status === 'cancelled' || j.status === 'pending') continue;
     const pctBar = j.status === 'running'
       ? `<div class="transit-progress-wrap"><div class="transit-progress-fill" style="width:${j.pct}%"></div></div>`
       : '';
-    const posLabel = (j.status === 'running' && totalJobs > 1) ? `${runningPos}/${totalJobs} · ` : '';
+    let posLabel = '';
+    if (j.status === 'running' && totalJobs > 1) {
+      runningIdx++;
+      posLabel = `${doneCount + runningIdx}/${totalJobs} · `;
+    }
     const statusLabel = j.status === 'error'
       ? `<span class="transit-status error">✗ ${esc(j.error_msg || 'error')}</span>`
       : `<span class="transit-status running">${posLabel}${esc(j.message || j.status)} ${j.pct}%</span>`;

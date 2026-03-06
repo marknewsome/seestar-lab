@@ -110,11 +110,12 @@ def start_scan(force: bool = False) -> bool:
 
 # ── Transit job queue ─────────────────────────────────────────────────────────
 
-_transit_queue:    queue.Queue    = queue.Queue()
-_transit_paused:   threading.Event = threading.Event()
+_transit_queue:       queue.Queue      = queue.Queue()
+_transit_paused:      threading.Event  = threading.Event()
 _transit_paused.set()   # set = running; clear = paused
-_cancel_sessions:  set  = set()
-_cancel_lock:      threading.Lock = threading.Lock()
+_cancel_sessions:     set              = set()
+_cancel_lock:         threading.Lock   = threading.Lock()
+_TRANSIT_CONCURRENCY: int             = 3   # video files processed concurrently
 
 
 def _is_cancelled(session_name: str) -> bool:
@@ -148,6 +149,7 @@ def _run_transit_job(job: dict) -> None:
             "session_name":   session_name,
             "video_path":     video_path,
             "video_basename": basename,
+            "video_type":     job["video_type"],
             "status":         "running",
             "pct":            pct,
             "message":        message,
@@ -248,70 +250,69 @@ def _run_transit_job(job: dict) -> None:
         "session_name":   session_name,
         "video_path":     video_path,
         "video_basename": basename,
+        "video_type":     job["video_type"],
         "events":         event_rows,
         "total_events":   len(event_rows),
     })
 
 
 def _transit_worker_loop() -> None:
-    while True:
-        job = _transit_queue.get()
+    """
+    Pull video jobs from the queue and dispatch them to a small thread pool so
+    _TRANSIT_CONCURRENCY files are processed concurrently.
+
+    OpenCV decode and NumPy both release the GIL, so threading achieves real
+    parallelism without multiprocessing overhead.
+    """
+    sema = threading.Semaphore(_TRANSIT_CONCURRENCY)
+
+    def _broadcast_status(job: dict, status: str, message: str) -> None:
+        _broadcast({
+            "type":           "transit_progress",
+            "session_name":   job["session_name"],
+            "video_path":     job["video_path"],
+            "video_basename": job["video_path"].rsplit("/", 1)[-1],
+            "video_type":     job.get("video_type"),
+            "status":         status,
+            "message":        message,
+            "pct":            0,
+        })
+
+    def _run_one(job: dict) -> None:
         try:
-            # ── Pause gate ────────────────────────────────────────────────────
-            _transit_paused.wait()   # blocks here while paused
-
-            # ── Cancellation check ────────────────────────────────────────────
-            if _is_cancelled(job["session_name"]):
-                db.cancel_video_jobs(job["session_name"])
-                _broadcast({
-                    "type":           "transit_progress",
-                    "session_name":   job["session_name"],
-                    "video_path":     job["video_path"],
-                    "video_basename": job["video_path"].rsplit("/", 1)[-1],
-                    "status":         "cancelled",
-                    "message":        "Cancelled",
-                    "pct":            0,
-                })
-                continue
-
             _run_transit_job(job)
-
         except RuntimeError as exc:
             if "cancelled" in str(exc).lower():
                 db.cancel_video_jobs(job["session_name"])
-                _broadcast({
-                    "type":           "transit_progress",
-                    "session_name":   job["session_name"],
-                    "video_path":     job["video_path"],
-                    "video_basename": job["video_path"].rsplit("/", 1)[-1],
-                    "status":         "cancelled",
-                    "message":        "Cancelled",
-                    "pct":            0,
-                })
+                _broadcast_status(job, "cancelled", "Cancelled")
             else:
                 db.fail_video_job(job["video_path"], str(exc))
-                _broadcast({
-                    "type":           "transit_progress",
-                    "session_name":   job["session_name"],
-                    "video_path":     job["video_path"],
-                    "video_basename": job["video_path"].rsplit("/", 1)[-1],
-                    "status":         "error",
-                    "message":        str(exc),
-                    "pct":            0,
-                })
+                _broadcast_status(job, "error", str(exc))
         except Exception as exc:
             db.fail_video_job(job["video_path"], str(exc))
-            _broadcast({
-                "type":           "transit_progress",
-                "session_name":   job["session_name"],
-                "video_path":     job["video_path"],
-                "video_basename": job["video_path"].rsplit("/", 1)[-1],
-                "status":         "error",
-                "message":        str(exc),
-                "pct":            0,
-            })
+            _broadcast_status(job, "error", str(exc))
         finally:
             _transit_queue.task_done()
+            sema.release()
+
+    while True:
+        job = _transit_queue.get()
+
+        # ── Pause gate ────────────────────────────────────────────────────────
+        _transit_paused.wait()
+
+        # ── Cancellation check ────────────────────────────────────────────────
+        if _is_cancelled(job["session_name"]):
+            db.cancel_video_jobs(job["session_name"])
+            _broadcast_status(job, "cancelled", "Cancelled")
+            _transit_queue.task_done()
+            continue
+
+        # Acquire a worker slot (blocks if _TRANSIT_CONCURRENCY jobs are
+        # already running), then hand the job to a background thread so the
+        # main loop can immediately dequeue the next job.
+        sema.acquire()
+        threading.Thread(target=_run_one, args=(job,), daemon=True).start()
 
 
 # ── SSE endpoint ──────────────────────────────────────────────────────────────
@@ -399,6 +400,16 @@ def api_catalog(catalog_type: str):
     }
     result = build_catalog_response(catalog, catalog_type, session_map)
     return jsonify(result)
+
+
+@app.route("/transits")
+def transits() -> str:
+    return render_template("transits.html", data_dir=DATA_DIR)
+
+
+@app.route("/api/transit/gallery")
+def api_transit_gallery():
+    return jsonify(db.get_transit_gallery())
 
 
 @app.route("/api/thumbnail/<path:object_name>")
@@ -497,6 +508,14 @@ def api_transit_all():
             if ev.get("thumb_path") and not os.path.exists(ev["thumb_path"]):
                 ev["thumb_path"] = None
     return jsonify(summary)
+
+
+@app.route("/api/transit/running")
+def api_transit_running():
+    """Return the set of video_types (solar/lunar) with pending or running jobs."""
+    jobs = db.get_pending_jobs()
+    types = list({j["video_type"] for j in jobs if j.get("video_type")})
+    return jsonify({"types": types})
 
 
 @app.route("/api/transit/clip/<int:event_id>")
