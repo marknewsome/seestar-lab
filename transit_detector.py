@@ -70,7 +70,7 @@ MIN_TRACK_FRAMES  = 8      # shortest valid track (raised from 4)
 MAX_GAP_FRAMES    = 4      # frames a track may miss before it is ended
 MIN_DISP_FRAC     = 0.05   # min displacement relative to disk radius
 MIN_VEL_PCT       = 3.0    # min velocity (% of disk Ø/s); raised from 1.0
-MIN_CONFIDENCE    = 0.70   # overall score threshold; raised from 0.65
+MIN_CONFIDENCE    = 0.75   # overall score threshold; raised from 0.70
 PAD_SECS          = 5.0    # seconds of context added to each clip
 
 # False-positive / camera-shake guards
@@ -175,14 +175,14 @@ class TransitDetector:
             self._shake_hot_frac      = 0.04  # was 0.015 — more lenient
             self._max_blobs_per_frame = 10    # was 5    — more lenient
             self._max_blob_frac       = 0.95  # allow large objects (e.g. nearby aircraft)
-        else:  # solar — original calibrated values
+        else:  # solar
             self._diff_thresh         = DIFF_THRESH
             self._min_track_frames    = MIN_TRACK_FRAMES
             self._min_vel_pct         = MIN_VEL_PCT
             self._min_confidence      = MIN_CONFIDENCE
-            self._min_linearity       = 0.0   # no hard floor for solar
-            self._min_fill_frac       = 0.0   # disabled for solar
-            self._min_perimeter_frac  = 0.0   # disabled for solar
+            self._min_linearity       = 0.70  # hard R² floor — cloud wisps / shimmer cluster below this
+            self._min_fill_frac       = 0.40  # blob must appear in ≥40 % of spanned frames
+            self._min_perimeter_frac  = 0.50  # one track end must reach 50 % of disk radius from edge
             self._shake_hot_frac      = SHAKE_HOT_FRAC
             self._max_blobs_per_frame = MAX_BLOBS_PER_FRAME
             self._max_blob_frac       = MAX_BLOB_FRAC
@@ -467,7 +467,7 @@ class TransitDetector:
                 if _lg_area > max_blob:   # only for blobs exceeding the cap
                     _dom = _ratio >= 20
                     if not _dom and self.video_type == "solar":
-                        _dom = _ratio >= 5 and _lg_area >= min_dominant_px
+                        _dom = _ratio >= 10 and _lg_area >= min_dominant_px
                     if _dom:
                         blobs = [_top[0]]
 
@@ -495,7 +495,7 @@ class TransitDetector:
                         # visible against the moon are close enough to clear 20×,
                         # and applying the looser threshold to lunar videos causes
                         # crater-shimmer blobs to generate false detections.
-                        is_dominant = ratio >= 5 and largest_area >= min_dominant_px
+                        is_dominant = ratio >= 10 and largest_area >= min_dominant_px
 
                 if is_dominant:
                     blobs = [all_sorted[0]]
@@ -583,6 +583,20 @@ class TransitDetector:
             # Primary velocity filter (sunspot residuals / surface shimmer)
             if velocity_pct < self._min_vel_pct:
                 continue
+
+            # Solar cloud-wisp rejection — slow objects (vel < 10 %/s) whose
+            # blobs are too large to be a compact bird silhouette are almost
+            # certainly thin cloud wisps drifting across the disk.
+            # mean_blob_frac: average blob area relative to disk area.
+            # A bird silhouette is typically < 0.5 % of disk area; cloud wisps
+            # and seeing blobs routinely run 0.6–2 %.
+            # Also reject very long slow transits (> 5 s) — no bird dwells
+            # that long on the solar disk at a velocity under 10 %/s.
+            if self.video_type == "solar" and velocity_pct < 10.0:
+                _disk_area     = max(1.0, np.pi * self._disk_radius ** 2)
+                _mean_blob_frac = float(np.mean([p["area"] for p in pts])) / _disk_area
+                if _mean_blob_frac > 0.006 or duration_s > 5.0:
+                    continue
 
             # Track continuity: a real transit blob is visible in most frames
             # it spans.  Seeing shimmer materialises and vanishes erratically,

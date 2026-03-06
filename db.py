@@ -62,6 +62,21 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     finished_at   TEXT
 );
 
+-- Sub-frame stacking: one row per session ever stacked
+CREATE TABLE IF NOT EXISTS stack_jobs (
+    session_name    TEXT PRIMARY KEY,
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending|running|done|error
+    pct             INTEGER DEFAULT 0,
+    stage           TEXT DEFAULT '',
+    frames_total    INTEGER DEFAULT 0,
+    frames_accepted INTEGER DEFAULT 0,
+    output_path     TEXT,
+    error_msg       TEXT,
+    queued_at       TEXT NOT NULL,
+    started_at      TEXT,
+    finished_at     TEXT
+);
+
 -- Transit detection: one row per detected event
 CREATE TABLE IF NOT EXISTS transit_events (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +140,22 @@ def init_db() -> None:
             conn.execute("ALTER TABLE transit_events ADD COLUMN yolo_label TEXT")
         if "yolo_confidence" not in te_cols:
             conn.execute("ALTER TABLE transit_events ADD COLUMN yolo_confidence REAL")
+        # stack_jobs table (added in later schema revision)
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS stack_jobs ("
+            "  session_name    TEXT PRIMARY KEY,"
+            "  status          TEXT NOT NULL DEFAULT 'pending',"
+            "  pct             INTEGER DEFAULT 0,"
+            "  stage           TEXT DEFAULT '',"
+            "  frames_total    INTEGER DEFAULT 0,"
+            "  frames_accepted INTEGER DEFAULT 0,"
+            "  output_path     TEXT,"
+            "  error_msg       TEXT,"
+            "  queued_at       TEXT NOT NULL,"
+            "  started_at      TEXT,"
+            "  finished_at     TEXT"
+            ");"
+        )
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
@@ -528,3 +559,107 @@ def get_transit_summary() -> dict:
         })
 
     return result
+
+
+# ── Stack jobs ─────────────────────────────────────────────────────────────────
+
+def queue_stack_job(session_name: str, force: bool = False) -> bool:
+    """
+    Insert a pending stack_job row.
+    Returns False (without inserting) if one already exists in a non-error state
+    and force=False.
+    """
+    with _db() as conn:
+        existing = conn.execute(
+            "SELECT status FROM stack_jobs WHERE session_name = ?", (session_name,)
+        ).fetchone()
+        if existing and not force:
+            if existing["status"] in ("pending", "running", "done"):
+                return False
+        conn.execute(
+            """
+            INSERT INTO stack_jobs
+                (session_name, status, pct, stage, frames_total, frames_accepted,
+                 output_path, error_msg, queued_at)
+            VALUES (?, 'pending', 0, '', 0, 0, NULL, NULL, datetime('now'))
+            ON CONFLICT(session_name) DO UPDATE SET
+                status          = 'pending',
+                pct             = 0,
+                stage           = '',
+                frames_total    = 0,
+                frames_accepted = 0,
+                output_path     = NULL,
+                error_msg       = NULL,
+                queued_at       = datetime('now'),
+                started_at      = NULL,
+                finished_at     = NULL
+            """,
+            (session_name,),
+        )
+    return True
+
+
+def start_stack_job(session_name: str) -> None:
+    with _db() as conn:
+        conn.execute(
+            "UPDATE stack_jobs SET status='running', started_at=datetime('now'), pct=0 "
+            "WHERE session_name=?", (session_name,)
+        )
+
+
+def update_stack_job_progress(
+    session_name: str, pct: int, stage: str,
+    frames_accepted: int, frames_total: int,
+) -> None:
+    with _db() as conn:
+        conn.execute(
+            "UPDATE stack_jobs SET pct=?, stage=?, frames_accepted=?, frames_total=? "
+            "WHERE session_name=?",
+            (pct, stage, frames_accepted, frames_total, session_name),
+        )
+
+
+def finish_stack_job(
+    session_name: str, output_path: str,
+    frames_accepted: int, frames_total: int,
+) -> None:
+    with _db() as conn:
+        conn.execute(
+            "UPDATE stack_jobs SET status='done', pct=100, "
+            "output_path=?, frames_accepted=?, frames_total=?, "
+            "finished_at=datetime('now') WHERE session_name=?",
+            (output_path, frames_accepted, frames_total, session_name),
+        )
+
+
+def fail_stack_job(session_name: str, error_msg: str) -> None:
+    with _db() as conn:
+        conn.execute(
+            "UPDATE stack_jobs SET status='error', error_msg=?, "
+            "finished_at=datetime('now') WHERE session_name=?",
+            (error_msg, session_name),
+        )
+
+
+def get_stack_job(session_name: str) -> Optional[dict]:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM stack_jobs WHERE session_name=?", (session_name,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_all_stack_jobs() -> dict:
+    """Return {session_name: job_dict} for every stack job."""
+    with _db() as conn:
+        rows = conn.execute("SELECT * FROM stack_jobs").fetchall()
+    return {r["session_name"]: dict(r) for r in rows}
+
+
+def get_pending_stack_jobs() -> list[dict]:
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM stack_jobs WHERE status IN ('pending','running') "
+            "ORDER BY queued_at"
+        ).fetchall()
+    return [dict(r) for r in rows]

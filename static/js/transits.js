@@ -118,7 +118,7 @@ function applyFilters() {
   if (labelFilter !== 'all') {
     visible = visible.filter(ev => ev.label === labelFilter);
   }
-  if (yoloOnly && hasAnyYolo()) {
+  if (yoloOnly) {
     visible = visible.filter(ev => ev.yolo_label != null);
   }
 

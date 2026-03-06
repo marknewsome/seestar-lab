@@ -3,6 +3,7 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 const sessions          = {};   // object_name → session dict  (source of truth)
 const transitData       = {};   // object_name → {video_jobs: [...], events: [...]}
+const stackData         = {};   // object_name → stack job dict
 const yoloConfirmedOnly = {};   // object_name → bool (confirmed-only filter per card)
 let activeFilter    = 'all';
 let evtSource       = null;
@@ -54,8 +55,8 @@ function handleEvent(ev) {
 
     case 'db_loaded':
       dbLoaded = true;
-      // Load transit data then render everything once both are ready
-      loadTransitData().then(() => {
+      // Load transit + stack data then render everything once both are ready
+      Promise.all([loadTransitData(), loadStackData()]).then(() => {
         applyFilter();
         updateFilterCounts();
         updateSummary();
@@ -101,6 +102,14 @@ function handleEvent(ev) {
 
     case 'transit_done':
       handleTransitDone(ev);
+      break;
+
+    case 'stack_progress':
+      handleStackProgress(ev);
+      break;
+
+    case 'stack_done':
+      handleStackDone(ev);
       break;
 
     case 'transit_queue_state':
@@ -191,6 +200,48 @@ async function loadTransitData() {
     const data = await res.json();
     Object.assign(transitData, data);
   } catch { /* non-fatal */ }
+}
+
+async function loadStackData() {
+  try {
+    const res = await fetch('/api/stack/status');
+    if (!res.ok) return;
+    Object.assign(stackData, await res.json());
+  } catch { /* non-fatal */ }
+}
+
+function handleStackProgress(ev) {
+  const sn = ev.session_name;
+  stackData[sn] = Object.assign(stackData[sn] || {}, {
+    session_name:    sn,
+    status:          ev.status || 'running',
+    pct:             ev.pct,
+    stage:           ev.stage,
+    frames_accepted: ev.frames_accepted,
+    frames_total:    ev.frames_total,
+  });
+  _refreshStackFooter(sn);
+}
+
+function handleStackDone(ev) {
+  const sn = ev.session_name;
+  stackData[sn] = Object.assign(stackData[sn] || {}, {
+    session_name:    sn,
+    status:          'done',
+    pct:             100,
+    stage:           'Done',
+    frames_accepted: ev.frames_accepted,
+    frames_total:    ev.frames_total,
+    output_path:     ev.output_path,
+  });
+  _refreshStackFooter(sn);
+}
+
+function _refreshStackFooter(sessionName) {
+  const card = document.getElementById(cardId(sessionName));
+  if (!card) return;
+  const footer = card.querySelector('.stack-footer');
+  if (footer) footer.outerHTML = buildStackFooter(sessionName);
 }
 
 function updateTransitQueueControls() {
@@ -382,9 +433,17 @@ function passesFilter(session) {
 }
 
 function applyFilter() {
+  const isCatalogFilter = activeFilter === 'messier' || activeFilter === 'caldwell'
+                       || activeFilter === 'dso'     || activeFilter === 'unknown';
+
   const visible = Object.values(sessions)
     .filter(passesFilter)
     .sort((a, b) => {
+      if (isCatalogFilter) {
+        const na = parseInt(a.object_name.replace(/\D/g, ''), 10);
+        const nb = parseInt(b.object_name.replace(/\D/g, ''), 10);
+        return na - nb;
+      }
       const da = a.dates[a.dates.length - 1] || '';
       const db = b.dates[b.dates.length - 1] || '';
       return db.localeCompare(da);
@@ -452,6 +511,15 @@ function buildCard(s) {
   const desc  = s.description
     ? `<div class="object-desc">${esc(s.description)}</div>` : '';
 
+  // Thumbnail — shown for any session that has a preview image on disk
+  const thumbHtml = s.thumbnail
+    ? `<div class="card-thumb-wrap">
+         <img class="card-thumb" src="/api/thumbnail/${encodeURIComponent(s.object_name)}"
+              alt="${esc(s.object_name)} preview"
+              onerror="this.closest('.card-thumb-wrap').style.display='none'">
+       </div>`
+    : '';
+
   const allDates  = s.dates || [];
   const DATES_MAX = 5;
   const dateChips = allDates.map((d, i) => {
@@ -485,8 +553,12 @@ function buildCard(s) {
   const isTransitType = s.object_type === 'solar' || s.object_type === 'lunar';
   const transitFooter = isTransitType ? buildTransitFooter(s.object_name) : '';
 
+  const isSubSession  = s.object_name.endsWith('_sub') && s.num_subs > 0;
+  const stackFooter   = isSubSession ? buildStackFooter(s.object_name) : '';
+
   return `
     <div class="session-card" id="${cardId(s.object_name)}">
+      ${thumbHtml}
       <div class="card-header">
         <div class="object-name">${esc(s.object_name)}</div>
         ${badge}
@@ -502,7 +574,116 @@ function buildCard(s) {
         ${videoRow}
       </div>
       ${transitFooter}
+      ${stackFooter}
     </div>`;
+}
+
+// ── Stack footer ──────────────────────────────────────────────────────────────
+
+async function queueStack(sessionName, force = false) {
+  const btn = document.getElementById(`stack-btn-${cardId(sessionName).slice(5)}`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Queuing…'; }
+  try {
+    const res  = await fetch('/api/stack/start', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ session_name: sessionName, force }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      alert(`Stack error: ${body.error || res.status}`);
+      if (btn) { btn.disabled = false; btn.textContent = 'Stack'; }
+      return;
+    }
+    // Optimistically set state so the footer re-renders immediately
+    stackData[sessionName] = Object.assign(stackData[sessionName] || {}, {
+      session_name: sessionName,
+      status: 'pending',
+      pct: 0,
+      stage: 'Queued…',
+      frames_total: body.fits_count || 0,
+      frames_accepted: 0,
+    });
+    _refreshStackFooter(sessionName);
+  } catch {
+    if (btn) { btn.disabled = false; btn.textContent = 'Stack'; }
+  }
+}
+
+function buildStackFooter(sessionName) {
+  const job     = stackData[sessionName];
+  const sn_js   = sessionName.replace(/'/g, "\\'");
+  const idSuffix = sessionName.replace(/[^a-z0-9]/gi, '_');
+  const status  = job?.status;
+  const isActive = status === 'pending' || status === 'running';
+  const isDone   = status === 'done';
+  const isError  = status === 'error';
+
+  // Progress bar row
+  let progressRow = '';
+  if (isActive) {
+    const pct   = job.pct || 0;
+    const stage = esc(job.stage || 'Working…');
+    const counts = (job.frames_total > 0)
+      ? ` · ${job.frames_accepted || 0}/${job.frames_total} frames`
+      : '';
+    progressRow = `
+      <div class="stack-progress-wrap">
+        <div class="stack-progress-fill" style="width:${pct}%"></div>
+      </div>
+      <div class="stack-stage">${stage}${esc(counts)} ${pct}%</div>`;
+  }
+
+  // Result thumbnail + view link
+  let resultRow = '';
+  if (isDone && job.output_path) {
+    resultRow = `
+      <div class="stack-result">
+        <img class="stack-result-thumb"
+             src="/api/stack/image/${encodeURIComponent(sessionName)}"
+             alt="Stacked result"
+             onclick="window.open('/api/stack/image/${encodeURIComponent(sessionName)}','_blank')"
+             title="Click to view full size">
+        <a class="stack-view-link"
+           href="/api/stack/image/${encodeURIComponent(sessionName)}"
+           target="_blank">View full size</a>
+      </div>`;
+  }
+
+  // Error message
+  const errorRow = isError
+    ? `<div class="stack-error">Error: ${esc(job.error_msg || 'unknown')}</div>`
+    : '';
+
+  // Buttons
+  const stackBtn = (!isActive)
+    ? `<button id="stack-btn-${idSuffix}" class="btn-stack"
+         onclick="queueStack('${sn_js}')">Stack</button>`
+    : `<button id="stack-btn-${idSuffix}" class="btn-stack" disabled>Stacking…</button>`;
+
+  const restackBtn = (isDone || isError)
+    ? `<button class="btn-stack-rerun"
+         onclick="queueStack('${sn_js}', true)"
+         title="Re-stack with current settings">↻ Re-stack</button>`
+    : '';
+
+  const frameInfo = isDone
+    ? `<span class="stack-frame-info">${job.frames_accepted}/${job.frames_total} frames used</span>`
+    : '';
+
+  return `<div class="stack-footer">
+    <div class="stack-header-row">
+      <span class="stack-label">Stacking</span>
+      ${frameInfo}
+      <div class="stack-btn-group">
+        ${restackBtn}
+        ${stackBtn}
+      </div>
+    </div>
+    ${progressRow}
+    ${resultRow}
+    ${errorRow}
+  </div>`;
 }
 
 // ── Date chip toggle ──────────────────────────────────────────────────────────
@@ -563,19 +744,16 @@ function buildTransitFooter(sessionName) {
   }
 
   // --- YOLO confirmed-only toggle ---
-  const hasYoloData    = events.some(ev => ev.yolo_label != null);
-  const yoloActive     = yoloConfirmedOnly[sessionName] || false;
-  const displayEvents  = (hasYoloData && yoloActive)
+  const yoloActive    = yoloConfirmedOnly[sessionName] ?? true;
+  const displayEvents = yoloActive
     ? events.filter(ev => ev.yolo_label != null)
     : events;
 
-  const yoloToggle = hasYoloData
-    ? `<label class="yolo-filter-label">
-         <input type="checkbox" ${yoloActive ? 'checked' : ''}
-                onchange="setYoloFilter('${sn_js}', this.checked)">
-         confirmed only
-       </label>`
-    : '';
+  const yoloToggle = `<label class="yolo-filter-label">
+       <input type="checkbox" ${yoloActive ? 'checked' : ''}
+              onchange="setYoloFilter('${sn_js}', this.checked)">
+       confirmed only
+     </label>`;
 
   // --- detected event pills ---
   let eventPills = '';

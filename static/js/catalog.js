@@ -78,6 +78,12 @@ function render() {
     return true;
   });
 
+  visible.sort((a, b) => {
+    const na = parseInt(a.label.replace(/\D/g, ''), 10);
+    const nb = parseInt(b.label.replace(/\D/g, ''), 10);
+    return na - nb;
+  });
+
   const grid = document.getElementById('catalog-grid');
   if (!visible.length) {
     grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">

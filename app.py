@@ -315,6 +315,86 @@ def _transit_worker_loop() -> None:
         threading.Thread(target=_run_one, args=(job,), daemon=True).start()
 
 
+# ── Stack job queue ───────────────────────────────────────────────────────────
+
+_stack_queue: queue.Queue = queue.Queue()
+
+
+def _run_stack_job(job: dict) -> None:
+    from stack_processor import StackProcessor, StackCancelled
+
+    session_name = job["session_name"]
+    fits_files   = job["fits_files"]
+    output_path  = job["output_path"]
+
+    db.start_stack_job(session_name)
+
+    def progress_cb(pct: int, stage: str, frames_accepted: int, frames_total: int) -> None:
+        db.update_stack_job_progress(session_name, pct, stage, frames_accepted, frames_total)
+        _broadcast({
+            "type":            "stack_progress",
+            "session_name":    session_name,
+            "pct":             pct,
+            "stage":           stage,
+            "frames_accepted": frames_accepted,
+            "frames_total":    frames_total,
+            "status":          "running",
+        })
+
+    try:
+        result = StackProcessor().run(fits_files, output_path, progress_cb)
+        db.finish_stack_job(
+            session_name, output_path,
+            result["frames_accepted"], result["frames_total"],
+        )
+        # Update the session thumbnail directly so the card refreshes without a rescan
+        sessions_list = db.get_all_sessions()
+        session = next((s for s in sessions_list if s["object_name"] == session_name), None)
+        if session:
+            session["thumbnail"] = output_path
+            db.upsert_session(session)
+            _broadcast({"type": "session", "data": session})
+        _broadcast({
+            "type":            "stack_done",
+            "session_name":    session_name,
+            "output_path":     output_path,
+            "frames_accepted": result["frames_accepted"],
+            "frames_total":    result["frames_total"],
+        })
+    except StackCancelled:
+        db.fail_stack_job(session_name, "Cancelled")
+        _broadcast({
+            "type":         "stack_progress",
+            "session_name": session_name,
+            "pct":          0,
+            "stage":        "Cancelled",
+            "status":       "error",
+            "frames_accepted": 0,
+            "frames_total":    len(fits_files),
+        })
+    except Exception as exc:
+        db.fail_stack_job(session_name, str(exc))
+        _broadcast({
+            "type":         "stack_progress",
+            "session_name": session_name,
+            "pct":          0,
+            "stage":        str(exc),
+            "status":       "error",
+            "frames_accepted": 0,
+            "frames_total":    len(fits_files),
+        })
+
+
+def _stack_worker_loop() -> None:
+    """Single background thread: process stack jobs one at a time."""
+    while True:
+        job = _stack_queue.get()
+        try:
+            _run_stack_job(job)
+        finally:
+            _stack_queue.task_done()
+
+
 # ── SSE endpoint ──────────────────────────────────────────────────────────────
 
 @app.route("/api/events")
@@ -582,6 +662,74 @@ def api_transit_cancel():
     return jsonify({"cancelled": cancelled})
 
 
+@app.route("/api/stack/start", methods=["POST"])
+def api_stack_start():
+    """
+    Queue a stacking job for a _sub session.
+    Body: {"session_name": str, "force": bool}
+    """
+    from pathlib import Path as _Path
+    body         = request.get_json(silent=True) or {}
+    session_name = body.get("session_name", "").strip()
+    force        = bool(body.get("force", False))
+
+    if not session_name:
+        return jsonify({"error": "session_name required"}), 400
+
+    sessions_list = db.get_all_sessions()
+    session = next((s for s in sessions_list if s["object_name"] == session_name), None)
+    if not session:
+        return jsonify({"error": "session not found"}), 404
+
+    # Collect FITS files from every directory belonging to this session
+    FITS_EXT = {".fit", ".fits", ".fts"}
+    fits_files: list[str] = []
+    for dir_path in session.get("paths", []):
+        try:
+            for fname in sorted(os.listdir(dir_path)):
+                if fname.startswith("."):
+                    continue
+                if _Path(fname).suffix.lower() in FITS_EXT:
+                    fits_files.append(os.path.join(dir_path, fname))
+        except OSError:
+            pass
+
+    if not fits_files:
+        return jsonify({"error": "no FITS files found in session"}), 400
+
+    # Output path: write into the sub directory so scanner picks it up as thumbnail
+    output_dir  = session["paths"][0] if session.get("paths") else OUTPUT_DIR
+    output_path = os.path.join(output_dir, "seestar_stacked.jpg")
+
+    if not db.queue_stack_job(session_name, force=force):
+        return jsonify({"error": "job already queued or running", "status": "already_queued"}), 409
+
+    _stack_queue.put({
+        "session_name": session_name,
+        "fits_files":   fits_files,
+        "output_path":  output_path,
+    })
+    return jsonify({"status": "queued", "fits_count": len(fits_files), "output": output_path})
+
+
+@app.route("/api/stack/status")
+def api_stack_status():
+    """Return all stack job statuses keyed by session_name."""
+    return jsonify(db.get_all_stack_jobs())
+
+
+@app.route("/api/stack/image/<path:session_name>")
+def api_stack_image(session_name: str):
+    """Serve the full-size stacked JPEG for a session."""
+    job = db.get_stack_job(session_name)
+    if not job or not job.get("output_path"):
+        abort(404)
+    path = job["output_path"]
+    if not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="image/jpeg")
+
+
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
     body  = request.get_json(silent=True) or {}
@@ -642,6 +790,38 @@ if __name__ == "__main__":
     # Start the single transit-detection worker thread.
     _worker = threading.Thread(target=_transit_worker_loop, daemon=True, name="transit-worker")
     _worker.start()
+
+    # Start the single stacking worker thread.
+    _stack_worker = threading.Thread(target=_stack_worker_loop, daemon=True, name="stack-worker")
+    _stack_worker.start()
+    pending_stack = db.get_pending_stack_jobs()
+    for sj in pending_stack:
+        # Re-queue interrupted stack jobs — we need the fits_files list, so
+        # rebuild it from the session's paths rather than storing it in the DB.
+        sessions_list = db.get_all_sessions()
+        session = next((s for s in sessions_list if s["object_name"] == sj["session_name"]), None)
+        if not session:
+            db.fail_stack_job(sj["session_name"], "Session no longer found")
+            continue
+        from pathlib import Path as _Path
+        FITS_EXT = {".fit", ".fits", ".fts"}
+        fits_files = []
+        for dir_path in session.get("paths", []):
+            try:
+                for fname in sorted(os.listdir(dir_path)):
+                    if not fname.startswith(".") and _Path(fname).suffix.lower() in FITS_EXT:
+                        fits_files.append(os.path.join(dir_path, fname))
+            except OSError:
+                pass
+        if fits_files:
+            output_dir  = session["paths"][0] if session.get("paths") else OUTPUT_DIR
+            _stack_queue.put({
+                "session_name": sj["session_name"],
+                "fits_files":   fits_files,
+                "output_path":  os.path.join(output_dir, "seestar_stacked.jpg"),
+            })
+    if pending_stack:
+        print(f"[startup] Re-queued {len(pending_stack)} interrupted stack job(s).")
 
     # Backfill missing video durations (one-time, silently skips when all done).
     _bf = threading.Thread(target=_backfill_video_durations, daemon=True, name="duration-backfill")
