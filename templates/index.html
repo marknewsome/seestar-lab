@@ -19,6 +19,8 @@
         <a class="nav-link" href="/catalog/messier">Messier</a>
         <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
         <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link" href="/comet">Comet</a>
       </nav>
       <div class="header-meta">
         <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
@@ -30,6 +32,8 @@
                   title="Re-scan only directories that changed">↻ Rescan</button>
           <button id="scan-full-btn" class="btn-full-scan" onclick="triggerScan(true)"
                   title="Force a complete re-read of all files">Full</button>
+          <button class="btn-shutdown" onclick="shutdownApp()"
+                  title="Stop the Seestar Lab server">⏻</button>
         </div>
       </div>
     </div>

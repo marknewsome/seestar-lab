@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Activity — Seestar Lab</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <style>
+    .activity-wrap {
+      max-width: 1100px;
+      margin: 2rem auto;
+      padding: 0 1.5rem;
+    }
+
+    /* ── Stats bar ─────────────────────────────────────────────────────────── */
+    .act-stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    .act-stat {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+      min-width: 130px;
+      flex: 1;
+    }
+    .act-stat-val {
+      font-size: 1.9rem;
+      font-weight: 700;
+      color: var(--accent);
+      line-height: 1;
+    }
+    .act-stat-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    /* ── Heat map card ─────────────────────────────────────────────────────── */
+    .heatmap-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+      overflow-x: auto;
+    }
+    .heatmap-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.75rem;
+    }
+    .heatmap-title { font-weight: 600; font-size: 0.95rem; }
+    .heatmap-mode  { display: flex; gap: 0.4rem; }
+    .mode-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: 6px;
+      padding: 0.2rem 0.7rem;
+      cursor: pointer;
+      font-size: 0.78rem;
+      transition: var(--transition);
+    }
+    .mode-btn.active {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    /* Month labels row */
+    .heatmap-months {
+      position: relative;
+      height: 18px;
+      margin-left: 28px;
+      margin-bottom: 4px;
+    }
+    .month-label {
+      position: absolute;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      top: 0;
+    }
+
+    /* Grid body: day-labels + week columns */
+    .heatmap-body  { display: flex; }
+    .day-labels {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      margin-right: 6px;
+      padding-top: 1px;
+    }
+    .day-label {
+      height: 13px;
+      line-height: 13px;
+      width: 20px;
+      text-align: right;
+      font-size: 0.68rem;
+      color: var(--text-muted);
+    }
+    .heatmap-grid { display: flex; gap: 3px; }
+    .heatmap-week { display: flex; flex-direction: column; gap: 3px; }
+
+    /* Individual cell */
+    .heatmap-cell {
+      width: 13px;
+      height: 13px;
+      border-radius: 2px;
+      cursor: pointer;
+      transition: opacity 0.1s;
+      flex-shrink: 0;
+    }
+    .heatmap-cell:hover { opacity: 0.75; outline: 1px solid var(--accent); }
+
+    /* Intensity levels (blue palette matching --accent) */
+    .level-0      { background: var(--surface); border: 1px solid var(--border); }
+    .level-1      { background: #1e3a5f; border: none; }
+    .level-2      { background: #2a5890; border: none; }
+    .level-3      { background: #3b7abf; border: none; }
+    .level-4      { background: var(--accent); border: none; }
+    .level-future { background: transparent; cursor: default; }
+
+    /* Legend */
+    .heatmap-legend {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      margin-top: 10px;
+      justify-content: flex-end;
+    }
+    .legend-label { font-size: 0.7rem; color: var(--text-muted); }
+    .legend-cells { display: flex; gap: 3px; }
+
+    /* ── Tooltip ───────────────────────────────────────────────────────────── */
+    .hm-tooltip {
+      position: fixed;
+      pointer-events: none;
+      background: #1a2540;
+      border: 1px solid var(--border-hi);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 0.6rem 0.9rem;
+      font-size: 0.82rem;
+      z-index: 1000;
+      display: none;
+      max-width: 230px;
+      line-height: 1.7;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.6);
+    }
+    .hm-tooltip.visible { display: block; }
+    .tt-date  { font-weight: 600; color: var(--accent); margin-bottom: 0.2rem; }
+    .tt-row   { color: var(--text-muted); }
+    .tt-row span { color: var(--text); }
+    .tt-types { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 0.35rem; }
+    .tt-type  {
+      font-size: 0.7rem;
+      padding: 1px 7px;
+      border-radius: 10px;
+      font-weight: 500;
+    }
+
+    /* ── Type breakdown ────────────────────────────────────────────────────── */
+    .type-breakdown {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+    }
+    .tb-title { font-weight: 600; font-size: 0.95rem; margin-bottom: 1rem; }
+    .tb-rows  { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+    .tb-row {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 1rem;
+      min-width: 180px;
+      flex: 1;
+    }
+    .tb-dot       { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .tb-name      { font-size: 0.85rem; text-transform: capitalize; flex: 1; }
+    .tb-bar-wrap  { flex: 2; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .tb-bar       { height: 100%; border-radius: 2px; transition: width 0.5s ease; }
+    .tb-count     { font-size: 0.82rem; color: var(--text-muted); min-width: 24px; text-align: right; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link active" href="/activity">Activity</a>
+        <a class="nav-link" href="/comet">Comet</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="activity-wrap">
+
+      <!-- Stats bar -->
+      <div class="act-stats">
+        <div class="act-stat">
+          <span class="act-stat-val" id="st-nights">—</span>
+          <span class="act-stat-label">Nights observed</span>
+        </div>
+        <div class="act-stat">
+          <span class="act-stat-val" id="st-streak">—</span>
+          <span class="act-stat-label">Best streak (nights)</span>
+        </div>
+        <div class="act-stat">
+          <span class="act-stat-val" id="st-subs">—</span>
+          <span class="act-stat-label">Total subs</span>
+        </div>
+        <div class="act-stat">
+          <span class="act-stat-val" id="st-video">—</span>
+          <span class="act-stat-label">Video recorded</span>
+        </div>
+        <div class="act-stat">
+          <span class="act-stat-val" id="st-month">—</span>
+          <span class="act-stat-label">Busiest month</span>
+        </div>
+      </div>
+
+      <!-- Heat map -->
+      <div class="heatmap-card">
+        <div class="heatmap-header">
+          <span class="heatmap-title">Observation activity — last 52 weeks</span>
+          <div class="heatmap-mode">
+            <button class="mode-btn active" id="mode-subs"     onclick="setMode('subs')">Subs</button>
+            <button class="mode-btn"        id="mode-sessions" onclick="setMode('sessions')">Sessions</button>
+          </div>
+        </div>
+        <div id="heatmap-months" class="heatmap-months"></div>
+        <div class="heatmap-body">
+          <div class="day-labels">
+            <div class="day-label"></div>   <!-- Sun -->
+            <div class="day-label">Mon</div>
+            <div class="day-label"></div>   <!-- Tue -->
+            <div class="day-label">Wed</div>
+            <div class="day-label"></div>   <!-- Thu -->
+            <div class="day-label">Fri</div>
+            <div class="day-label"></div>   <!-- Sat -->
+          </div>
+          <div class="heatmap-grid" id="heatmap-grid"></div>
+        </div>
+        <div class="heatmap-legend">
+          <span class="legend-label">Less</span>
+          <div class="legend-cells">
+            <div class="heatmap-cell level-0" style="cursor:default"></div>
+            <div class="heatmap-cell level-1" style="cursor:default"></div>
+            <div class="heatmap-cell level-2" style="cursor:default"></div>
+            <div class="heatmap-cell level-3" style="cursor:default"></div>
+            <div class="heatmap-cell level-4" style="cursor:default"></div>
+          </div>
+          <span class="legend-label">More</span>
+        </div>
+      </div>
+
+      <!-- Type breakdown -->
+      <div class="type-breakdown">
+        <div class="tb-title">Sessions by object type</div>
+        <div class="tb-rows" id="tb-rows"></div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- Floating tooltip -->
+  <div class="hm-tooltip" id="hm-tooltip"></div>
+
+  <script>
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+    const TYPE_COLORS = {
+      solar:    { dot: '#fca5a5', bg: 'var(--solar-bg)',    fg: 'var(--solar-fg)'    },
+      lunar:    { dot: '#94a3b8', bg: 'var(--lunar-bg)',    fg: 'var(--lunar-fg)'    },
+      galaxy:   { dot: '#c4b5fd', bg: 'var(--dso-bg)',      fg: 'var(--dso-fg)'      },
+      nebula:   { dot: '#d8b4fe', bg: 'var(--dso-bg)',      fg: '#d8b4fe'            },
+      cluster:  { dot: '#fcd34d', bg: 'var(--planet-bg)',   fg: 'var(--planet-fg)'   },
+      planet:   { dot: '#fcd34d', bg: 'var(--planet-bg)',   fg: 'var(--planet-fg)'   },
+      comet:    { dot: '#6ee7b7', bg: 'var(--comet-bg)',    fg: 'var(--comet-fg)'    },
+      messier:  { dot: '#93c5fd', bg: 'var(--messier-bg)',  fg: 'var(--messier-fg)'  },
+      caldwell: { dot: '#6ee7b7', bg: 'var(--caldwell-bg)', fg: 'var(--caldwell-fg)' },
+      dso:      { dot: '#c4b5fd', bg: 'var(--dso-bg)',      fg: 'var(--dso-fg)'      },
+      unknown:  { dot: '#9ca3af', bg: 'var(--unknown-bg)',  fg: 'var(--unknown-fg)'  },
+    };
+
+    let _data = null;
+    let _mode = 'subs';
+
+    function setMode(m) {
+      _mode = m;
+      document.getElementById('mode-subs').classList.toggle('active', m === 'subs');
+      document.getElementById('mode-sessions').classList.toggle('active', m === 'sessions');
+      if (_data) renderGrid(_data);
+    }
+
+    function toISO(d) {
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
+
+    function addDays(d, n) {
+      const r = new Date(d);
+      r.setDate(r.getDate() + n);
+      return r;
+    }
+
+    // Compute percentile-based thresholds so colour adapts to actual data range
+    function computeThresholds(days, key) {
+      const vals = Object.values(days).map(v => v[key]).filter(v => v > 0).sort((a, b) => a - b);
+      if (!vals.length) return [0, 0, 0, 0, Infinity];
+      const q = p => vals[Math.max(0, Math.floor(p * vals.length) - 1)];
+      return [0, q(0.25), q(0.5), q(0.75), Infinity];
+    }
+
+    function getLevel(val, thr) {
+      if (val <= 0)         return 0;
+      if (val <= thr[1])    return 1;
+      if (val <= thr[2])    return 2;
+      if (val <= thr[3])    return 3;
+      return 4;
+    }
+
+    function renderGrid(data) {
+      const grid       = document.getElementById('heatmap-grid');
+      const monthsEl   = document.getElementById('heatmap-months');
+      grid.innerHTML   = '';
+      monthsEl.innerHTML = '';
+
+      // End on the coming Sunday so today is always visible
+      const today   = new Date(); today.setHours(0, 0, 0, 0);
+      const endSun  = addDays(today, 6 - today.getDay());
+      const startSun = addDays(endSun, -51 * 7);
+
+      const thr     = computeThresholds(data.days, _mode);
+      const cellW   = 16;   // 13px cell + 3px gap
+      let lastMonth = -1;
+
+      for (let w = 0; w < 52; w++) {
+        const weekStart = addDays(startSun, w * 7);
+
+        // Month label on the first week of a new month
+        if (weekStart.getMonth() !== lastMonth) {
+          lastMonth = weekStart.getMonth();
+          const lbl = document.createElement('span');
+          lbl.className   = 'month-label';
+          lbl.textContent = MONTHS[lastMonth];
+          lbl.style.left  = `${w * cellW}px`;
+          monthsEl.appendChild(lbl);
+        }
+
+        const weekEl = document.createElement('div');
+        weekEl.className = 'heatmap-week';
+
+        for (let d = 0; d < 7; d++) {
+          const date = addDays(weekStart, d);
+          const cell = document.createElement('div');
+          cell.className = 'heatmap-cell';
+
+          if (date > today) {
+            cell.classList.add('level-future');
+          } else {
+            const iso  = toISO(date);
+            const info = data.days[iso];
+            const val  = info ? info[_mode] : 0;
+            cell.classList.add(`level-${getLevel(val, thr)}`);
+            cell.dataset.iso      = iso;
+            cell.dataset.subs     = info ? info.subs     : 0;
+            cell.dataset.sessions = info ? info.sessions : 0;
+            cell.dataset.video_s  = info ? info.video_s  : 0;
+            cell.dataset.types    = info ? JSON.stringify(info.types) : '[]';
+            cell.addEventListener('mousemove',  showTooltip);
+            cell.addEventListener('mouseleave', hideTooltip);
+          }
+          weekEl.appendChild(cell);
+        }
+        grid.appendChild(weekEl);
+      }
+    }
+
+    // ── Tooltip ──────────────────────────────────────────────────────────────
+
+    function showTooltip(e) {
+      const cell = e.currentTarget;
+      const iso  = cell.dataset.iso;
+      if (!iso) return;
+
+      const subs     = +cell.dataset.subs     || 0;
+      const sessions = +cell.dataset.sessions || 0;
+      const video_s  = +cell.dataset.video_s  || 0;
+      const types    = JSON.parse(cell.dataset.types || '[]');
+
+      const d       = new Date(iso + 'T12:00:00');
+      const dateStr = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+
+      let html = `<div class="tt-date">${dateStr}</div>`;
+      if (sessions === 0) {
+        html += `<div style="color:var(--text-muted)">No observations</div>`;
+      } else {
+        html += `<div class="tt-row"><span>${sessions}</span> session${sessions !== 1 ? 's' : ''}</div>`;
+        if (subs    > 0) html += `<div class="tt-row"><span>${subs.toLocaleString()}</span> subs</div>`;
+        if (video_s > 0) html += `<div class="tt-row"><span>${fmtDuration(video_s)}</span> video</div>`;
+        if (types.length) {
+          html += '<div class="tt-types">';
+          types.forEach(t => {
+            const col = TYPE_COLORS[t] || TYPE_COLORS.unknown;
+            html += `<span class="tt-type" style="background:${col.bg};color:${col.fg}">${t}</span>`;
+          });
+          html += '</div>';
+        }
+      }
+
+      const tt = document.getElementById('hm-tooltip');
+      tt.innerHTML = html;
+      tt.classList.add('visible');
+      moveTooltip(e);
+    }
+
+    function moveTooltip(e) {
+      const tt = document.getElementById('hm-tooltip');
+      const m  = 14;
+      let x = e.clientX + m, y = e.clientY + m;
+      const w = tt.offsetWidth || 200, h = tt.offsetHeight || 90;
+      if (x + w > window.innerWidth  - 8) x = e.clientX - w - m;
+      if (y + h > window.innerHeight - 8) y = e.clientY - h - m;
+      tt.style.left = x + 'px';
+      tt.style.top  = y + 'px';
+    }
+
+    function hideTooltip() {
+      document.getElementById('hm-tooltip').classList.remove('visible');
+    }
+
+    document.addEventListener('mousemove', e => {
+      const tt = document.getElementById('hm-tooltip');
+      if (tt.classList.contains('visible')) moveTooltip(e);
+    });
+
+    // ── Stats ─────────────────────────────────────────────────────────────────
+
+    function fmtDuration(s) {
+      if (s < 60)    return `${s}s`;
+      if (s < 3600)  return `${Math.round(s / 60)}m`;
+      return `${(s / 3600).toFixed(1)}h`;
+    }
+
+    function renderStats(stats) {
+      document.getElementById('st-nights').textContent = stats.total_days.toLocaleString();
+      document.getElementById('st-streak').textContent = stats.longest_streak;
+      document.getElementById('st-subs').textContent   = stats.total_subs.toLocaleString();
+      document.getElementById('st-video').textContent  = fmtDuration(stats.total_video_s);
+      document.getElementById('st-month').textContent  = stats.busiest_month || '—';
+    }
+
+    // ── Type breakdown ────────────────────────────────────────────────────────
+
+    function renderTypeBreakdown(days) {
+      const counts = {};
+      Object.values(days).forEach(day => {
+        day.types.forEach(t => { counts[t] = (counts[t] || 0) + day.sessions; });
+      });
+      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      const maxVal = sorted[0]?.[1] || 1;
+      const container = document.getElementById('tb-rows');
+      container.innerHTML = '';
+      sorted.forEach(([type, count]) => {
+        const col = TYPE_COLORS[type] || TYPE_COLORS.unknown;
+        const pct = Math.round(count / maxVal * 100);
+        const row = document.createElement('div');
+        row.className = 'tb-row';
+        row.innerHTML = `
+          <div class="tb-dot" style="background:${col.dot}"></div>
+          <span class="tb-name">${type}</span>
+          <div class="tb-bar-wrap">
+            <div class="tb-bar" style="width:${pct}%;background:${col.dot}"></div>
+          </div>
+          <span class="tb-count">${count}</span>`;
+        container.appendChild(row);
+      });
+    }
+
+    // ── Bootstrap ─────────────────────────────────────────────────────────────
+
+    async function loadActivity() {
+      try {
+        const res  = await fetch('/api/activity');
+        _data      = await res.json();
+        renderStats(_data.stats);
+        renderGrid(_data);
+        renderTypeBreakdown(_data.days);
+      } catch (err) {
+        console.error('Failed to load activity data:', err);
+      }
+    }
+
+    loadActivity();
+  </script>
+
+</body>
+</html>

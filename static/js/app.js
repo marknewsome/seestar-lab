@@ -1,5 +1,12 @@
 'use strict';
 
+// ── Shutdown ───────────────────────────────────────────────────────────────────
+async function shutdownApp() {
+  if (!confirm('Stop the Seestar Lab server?')) return;
+  await fetch('/api/shutdown', { method: 'POST' });
+  document.body.innerHTML = '<div style="padding:2rem;font-family:monospace;color:#aaa">Server stopped. You can close this tab.</div>';
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 const sessions          = {};   // object_name → session dict  (source of truth)
 const transitData       = {};   // object_name → {video_jobs: [...], events: [...]}
@@ -461,6 +468,15 @@ function applyFilter() {
     return;
   }
   grid.innerHTML = visible.map(buildCard).join('');
+  visible.filter(s => s.object_type === 'comet').forEach(s => loadCometInfo(s.object_name));
+
+  // Wire "View N images" buttons (data-attribute avoids inline JS quoting issues)
+  grid.querySelectorAll('.btn-view-images').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const imgs = JSON.parse(btn.dataset.images);
+      openLightbox(imgs, 0);
+    });
+  });
 }
 
 function updateFilterCounts() {
@@ -511,13 +527,33 @@ function buildCard(s) {
   const desc  = s.description
     ? `<div class="object-desc">${esc(s.description)}</div>` : '';
 
-  // Thumbnail — shown for any session that has a preview image on disk
-  const thumbHtml = s.thumbnail
-    ? `<div class="card-thumb-wrap">
-         <img class="card-thumb" src="/api/thumbnail/${encodeURIComponent(s.object_name)}"
-              alt="${esc(s.object_name)} preview"
-              onerror="this.closest('.card-thumb-wrap').style.display='none'">
-       </div>`
+  // Thumbnail — shown for any session that has a preview image on disk.
+  // For stacked comet sessions with multiple images, add prev/next arrows.
+  // For stacked comet sessions: use image_files list (≥1 triggers lightbox,
+  // >1 also shows prev/next arrows). For everything else use the thumbnail API.
+  const imgs    = (s.image_files && s.image_files.length >= 1) ? s.image_files : null;
+  const hasArrows = imgs && imgs.length > 1;
+  const imgUrl0 = imgs
+    ? `/api/image?path=${encodeURIComponent(imgs[0])}`
+    : (s.thumbnail ? `/api/thumbnail/${encodeURIComponent(s.object_name)}` : null);
+  const thumbHtml = imgUrl0
+    ? (() => {
+        const imgsAttr = imgs
+          ? ` data-images='${JSON.stringify(imgs).replace(/'/g,"&#39;")}' data-idx="0"` : '';
+        const arrows   = hasArrows ? `
+          <button class="thumb-arrow thumb-prev" onclick="thumbStep(this,-1,event)" title="Previous">&#8249;</button>
+          <button class="thumb-arrow thumb-next" onclick="thumbStep(this,+1,event)" title="Next">&#8250;</button>
+          <span class="thumb-counter">1 / ${imgs.length}</span>` : '';
+        const clickAttr = imgs
+          ? `onclick="openLightbox(JSON.parse(this.closest('.card-thumb-wrap').dataset.images),+this.closest('.card-thumb-wrap').dataset.idx)"`
+          : '';
+        return `<div class="card-thumb-wrap"${imgsAttr}>
+          <img class="card-thumb${imgs ? ' thumb-clickable' : ''}" src="${imgUrl0}"
+               alt="${esc(s.object_name)} preview" ${clickAttr}
+               onerror="this.closest('.card-thumb-wrap').style.display='none'">
+          ${arrows}
+        </div>`;
+      })()
     : '';
 
   const allDates  = s.dates || [];
@@ -550,11 +586,19 @@ function buildCard(s) {
          </span>
        </div>` : '';
 
+  const isComet       = s.object_type === 'comet';
   const isTransitType = s.object_type === 'solar' || s.object_type === 'lunar';
   const transitFooter = isTransitType ? buildTransitFooter(s.object_name) : '';
 
-  const isSubSession  = s.object_name.endsWith('_sub') && s.num_subs > 0;
+  // Comets get their own footer; exclude from stack to avoid false _sub match
+  const isSubSession  = !isComet && s.object_name.endsWith('_sub') && s.num_subs > 0;
   const stackFooter   = isSubSession ? buildStackFooter(s.object_name) : '';
+  const cometFooter   = isComet ? buildCometFooter(s) : '';
+
+  // Placeholder filled async by loadCometInfo()
+  const cometInfoRow  = isComet
+    ? `<div class="comet-fullname-row" id="comet-info-${cardId(s.object_name).slice(5)}"></div>`
+    : '';
 
   return `
     <div class="session-card" id="${cardId(s.object_name)}">
@@ -563,6 +607,7 @@ function buildCard(s) {
         <div class="object-name">${esc(s.object_name)}</div>
         ${badge}
       </div>
+      ${cometInfoRow}
       ${desc}
       <hr class="card-divider" />
       <div class="card-meta">
@@ -575,6 +620,7 @@ function buildCard(s) {
       </div>
       ${transitFooter}
       ${stackFooter}
+      ${cometFooter}
     </div>`;
 }
 
@@ -684,6 +730,76 @@ function buildStackFooter(sessionName) {
     ${resultRow}
     ${errorRow}
   </div>`;
+}
+
+// ── Comet footer ──────────────────────────────────────────────────────────────
+
+function buildCometFooter(s) {
+  const animations  = s.animations || {};
+  const isProcessed = !!(animations.stars_mp4 || animations.nucleus_mp4 ||
+                         animations.track_jpg  || animations.stack_jpg);
+  const isSub       = s.object_name.endsWith('_sub');
+
+  // Only _sub sessions have FITS subs that the wizard can process
+  const wizardBtn = isSub
+    ? (() => {
+        const paths  = s.paths || [];
+        const dir    = animations.anim_dir || (paths.length > 0 ? paths[0] : '');
+        const url    = dir ? `/comet?dir=${encodeURIComponent(dir)}` : '/comet';
+        return `<a class="btn-comet-wizard" href="${url}">Open in Wizard →</a>`;
+      })()
+    : '';
+
+  const statusChip = isSub
+    ? (isProcessed
+        ? '<span class="comet-status-chip processed">✓ Animations ready</span>'
+        : '<span class="comet-status-chip pending">Not yet processed</span>')
+    : '<span class="comet-status-chip stacked">Stacked images</span>';
+
+  // For non-_sub sessions: "View N images" button that opens the lightbox.
+  // Images are stored in a data-attribute; the click handler reads it at runtime.
+  const imgs = s.image_files && s.image_files.length > 0 ? s.image_files : null;
+  const viewBtn = (!isSub && imgs)
+    ? `<button class="btn-comet-wizard btn-view-images"
+               data-images="${esc(JSON.stringify(imgs))}">
+         View ${imgs.length} image${imgs.length !== 1 ? 's' : ''} →
+       </button>`
+    : '';
+
+  return `<div class="comet-footer">
+    <div class="comet-footer-row">
+      ${statusChip}
+      ${wizardBtn}${viewBtn}
+    </div>
+  </div>`;
+}
+
+const _cometInfoCache = {};
+
+async function loadCometInfo(name) {
+  const idSuffix = name.replace(/[^a-z0-9]/gi, '_');
+  const el = document.getElementById(`comet-info-${idSuffix}`);
+  if (!el) return;
+
+  if (_cometInfoCache[name] !== undefined) {
+    _renderCometInfo(el, _cometInfoCache[name]);
+    return;
+  }
+  try {
+    const res  = await fetch(`/api/comet/info?name=${encodeURIComponent(name)}`);
+    const data = await res.json();
+    _cometInfoCache[name] = data;
+    _renderCometInfo(el, data);
+  } catch (_) {}
+}
+
+function _renderCometInfo(el, data) {
+  if (!data || !data.fullname) return;
+  let html = `<span class="comet-fullname">${esc(data.fullname)}</span>`;
+  if (data.orbit_class) {
+    html += ` <span class="comet-orbit-class">${esc(data.orbit_class)}</span>`;
+  }
+  el.innerHTML = html;
 }
 
 // ── Date chip toggle ──────────────────────────────────────────────────────────
@@ -847,6 +963,87 @@ function setStatus(msg, running) {
   const el     = document.getElementById('scan-status');
   el.innerHTML = running ? `<span class="spinner"></span>${esc(msg)}` : esc(msg);
   el.className = 'scan-status' + (running ? ' running' : '');
+}
+
+// ── Multi-image thumb navigation ──────────────────────────────────────────────
+
+function thumbStep(btn, delta, event) {
+  event?.stopPropagation();
+  const wrap  = btn.closest('.card-thumb-wrap');
+  const imgs  = JSON.parse(wrap.dataset.images);
+  let   idx   = (+wrap.dataset.idx + delta + imgs.length) % imgs.length;
+  wrap.dataset.idx = idx;
+  wrap.querySelector('.card-thumb').src = `/api/image?path=${encodeURIComponent(imgs[idx])}`;
+  wrap.querySelector('.thumb-counter').textContent = `${idx + 1} / ${imgs.length}`;
+}
+
+// ── Lightbox ──────────────────────────────────────────────────────────────────
+
+let _lbImages = [];
+let _lbIdx    = 0;
+
+function _ensureLightbox() {
+  if (document.getElementById('lightbox')) return;
+  const lb = document.createElement('div');
+  lb.id = 'lightbox';
+  lb.innerHTML = `
+    <div id="lb-backdrop"></div>
+    <div id="lb-shell">
+      <button id="lb-close" title="Close (Esc)">✕</button>
+      <button id="lb-prev"  title="Previous (←)">&#8249;</button>
+      <img    id="lb-img"   alt="">
+      <button id="lb-next"  title="Next (→)">&#8250;</button>
+      <div id="lb-footer">
+        <span id="lb-counter"></span>
+        <span id="lb-filename"></span>
+        <a    id="lb-download" download title="Download">⬇</a>
+      </div>
+    </div>`;
+  document.body.appendChild(lb);
+
+  document.getElementById('lb-backdrop').addEventListener('click', closeLightbox);
+  document.getElementById('lb-close').addEventListener('click', closeLightbox);
+  document.getElementById('lb-prev').addEventListener('click', () => _lbNav(-1));
+  document.getElementById('lb-next').addEventListener('click', () => _lbNav(+1));
+
+  document.addEventListener('keydown', e => {
+    if (!document.getElementById('lightbox').classList.contains('open')) return;
+    if (e.key === 'Escape')     closeLightbox();
+    if (e.key === 'ArrowLeft')  _lbNav(-1);
+    if (e.key === 'ArrowRight') _lbNav(+1);
+  });
+}
+
+function openLightbox(images, startIdx) {
+  _ensureLightbox();
+  _lbImages = images;
+  _lbIdx    = startIdx ?? 0;
+  _lbShow();
+  document.getElementById('lightbox').classList.add('open');
+}
+
+function closeLightbox() {
+  document.getElementById('lightbox')?.classList.remove('open');
+}
+
+function _lbNav(delta) {
+  _lbIdx = (_lbIdx + delta + _lbImages.length) % _lbImages.length;
+  _lbShow();
+}
+
+function _lbShow() {
+  const path = _lbImages[_lbIdx];
+  const url  = `/api/image?path=${encodeURIComponent(path)}`;
+  const name = path.split(/[\\/]/).pop();
+  document.getElementById('lb-img').src        = url;
+  document.getElementById('lb-counter').textContent =
+    _lbImages.length > 1 ? `${_lbIdx + 1} / ${_lbImages.length}` : '';
+  document.getElementById('lb-filename').textContent = name;
+  const dl = document.getElementById('lb-download');
+  dl.href     = url;
+  dl.download = name;
+  document.getElementById('lb-prev').style.display = _lbImages.length > 1 ? '' : 'none';
+  document.getElementById('lb-next').style.display = _lbImages.length > 1 ? '' : 'none';
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

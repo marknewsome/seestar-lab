@@ -1,29 +1,222 @@
 """
-Seestar Lab — Flask backend.
+Seestar Lab — Flask web application backend.
 
-Key design points:
-  • On startup: init DB, kick off a differential scan in a background thread.
-  • GET /api/events  — SSE stream; immediately replays all DB sessions, then
-                       relays live broadcast events as the scan runs.
-  • Pub/sub via per-subscriber queues so multiple browser tabs all receive
-    the same events without blocking each other.
-  • GET /catalog/messier, /catalog/caldwell — catalog bingo-card pages.
-  • GET /api/catalog/messier, /api/catalog/caldwell — JSON catalog data.
-  • GET /api/thumbnail/<object_name> — serve resized preview image.
-  • POST /api/transit/detect — queue transit detection jobs for a session.
-  • GET  /api/transit/all   — return all job + event data.
-  • GET  /api/transit/clip/<id> — serve a detected-event clip MP4.
+════════════════════════════════════════════════════════════════════════════════
+ARCHITECTURE OVERVIEW
+════════════════════════════════════════════════════════════════════════════════
+
+  Single-process Flask app (threaded=True) running on localhost:5000.
+  All long-running work is delegated to daemon background threads so the
+  HTTP server always stays responsive.
+
+  Environment variables (from .env or shell):
+    SEESTAR_DATA_DIR    Root of the raw data tree (default /mnt/d/xfer).
+    SEESTAR_OUTPUT_DIR  Where rendered outputs are written (default /mnt/d/seestar-lab).
+
+════════════════════════════════════════════════════════════════════════════════
+SESSION SCANNER
+════════════════════════════════════════════════════════════════════════════════
+
+  On startup and on demand, scanner.Scanner walks SEESTAR_DATA_DIR looking
+  for Seestar observation sessions.  A session is a directory (or group of
+  files) identified by object name and observation date.
+
+  Two scan modes:
+    Full scan     — re-walks the entire tree; used on first run or when forced.
+    Differential  — stat-based comparison against the DB; skips unchanged
+                    directories.  Typically completes in < 1 s on subsequent runs.
+
+  Each discovered or updated session fires an SSE event that all connected
+  browser tabs receive in real time.
+
+════════════════════════════════════════════════════════════════════════════════
+SSE PUB/SUB  (/api/events)
+════════════════════════════════════════════════════════════════════════════════
+
+  The main data channel is a Server-Sent Events stream.  Each browser tab
+  subscribes by opening GET /api/events, which:
+    1. Creates a per-subscriber in-process queue (maxsize=500 events).
+    2. Immediately replays all sessions from the SQLite DB so new tabs get
+       the full current state without waiting for a rescan.
+    3. Streams new events from the queue as they arrive (scan updates,
+       transit progress/done, stack done, comet job progress).
+
+  _broadcast() fans out a JSON payload to every subscriber queue.
+  Slow or disconnected clients are detected by queue.Full and dropped.
+
+════════════════════════════════════════════════════════════════════════════════
+TRANSIT DETECTION  (transit_detector.py)
+════════════════════════════════════════════════════════════════════════════════
+
+  Detects objects transiting the solar or lunar disk in Seestar video files
+  (MP4 / AVI).  Algorithm summary (see transit_detector.py for full detail):
+
+  1. Temporal median background — samples N_BG_SAMPLES frames evenly and
+     computes the pixel-wise median.  Sunspots and craters are stationary so
+     they cancel out; a transiting satellite/ISS/plane shows up cleanly in
+     the per-frame difference.
+
+  2. Disk detection — Hough circle transform on the blurred background frame.
+     Falls back to contour fitting for crescent moons where Hough struggles.
+
+  3. Blob tracking — each frame is differenced from the background,
+     thresholded, morphologically opened, and masked to the disk interior.
+     Connected components are matched to active tracks by nearest-centroid
+     assignment with linear-extrapolation prediction.  Camera-shake frames
+     (where more than SHAKE_HOT_FRAC of the disk is lit up) are skipped
+     entirely to avoid mass false positives from re-pointing events.
+
+  4. Track scoring — tracks are scored on linearity (R²), velocity (% of disk
+     diameter per second), and duration.  Tracks slower than MIN_VEL_PCT %/s
+     are rejected (sunspot residuals move ~0.04 Ø/day — far below 3 %/s).
+
+  5. YOLO validation — detected clips are optionally run through a YOLOv8
+     model (yolo_validator.py) that classifies the object type (plane,
+     satellite, ISS, meteor, etc.) and provides a secondary confidence score.
+
+  6. Clip extraction — PAD_SECS of context is prepended/appended; UTC time
+     (parsed from the filename) is burned onto each frame; a JSON sidecar
+     with full track metadata is written alongside each MP4 clip.
+
+  Job lifecycle:
+    POST /api/transit/detect  →  enqueues jobs in _transit_queue
+    _transit_worker_loop()    →  pulls jobs, dispatches to a thread pool
+                                  (_TRANSIT_CONCURRENCY workers in parallel;
+                                  OpenCV and NumPy release the GIL so real
+                                  parallelism is achieved without multiprocessing)
+    _run_transit_job()        →  optionally copies video to local temp dir for
+                                  faster random-seek access, then runs the detector
+    _broadcast(transit_done)  →  notifies all SSE subscribers of results
+
+  Videos on a different filesystem device than /tmp are copied to a local
+  temp file before processing; random seeks on a network or external drive
+  are orders of magnitude slower than on the system SSD.
+
+  Pause / cancel:
+    POST /api/transit/pause   — sets _transit_paused; workers block at the gate.
+    POST /api/transit/resume  — clears the gate; workers continue.
+    POST /api/transit/cancel  — adds session_name to _cancel_sessions; the
+                                 worker skips or stops that session's jobs.
+
+════════════════════════════════════════════════════════════════════════════════
+STACKING WORKER
+════════════════════════════════════════════════════════════════════════════════
+
+  A single-threaded daemon runs _stack_worker_loop(), pulling jobs from
+  _stack_queue.  Each job mean-stacks a list of FITS files and writes a
+  JPEG output.  Stacking is CPU-heavy and sequential to avoid memory pressure.
+  Jobs are enqueued on startup to recover any interrupted sessions, and on
+  demand via POST /api/stack/start.
+
+════════════════════════════════════════════════════════════════════════════════
+COMET WIZARD  (comet_processor.py)
+════════════════════════════════════════════════════════════════════════════════
+
+  The Comet Wizard is a 3-step UI (select subs → parameters → render) that
+  drives comet_processor.py as a subprocess.
+
+  POST /api/comet/render    — launches the processor subprocess and returns a
+                               job_id.  Accepts:
+                                 files          — list of .fit paths
+                                 fps, gamma, crop, sky_pct, high_pct, noise,
+                                 width          — processing parameters
+                                 force_realign  — pass --no-cache to processor
+                                 redetect_nucleus — pass --redetect-nucleus
+                                 nucleus_hint_x/y — fractional nucleus hint
+
+  GET  /api/comet/status/<id>  — returns {status, log, outputs} for the job.
+                                  outputs includes URLs for both animations,
+                                  both stack images, the track image, and
+                                  individual annotated frame JPEGs.
+
+  GET  /api/comet/preview-frame — renders a single reference frame with the
+                                   current stretch parameters for the live
+                                   preview pane in Step 2.
+
+  GET  /api/comet/frame/<job_id>/<idx> — serve one annotated _frames/frame_NNNN.jpg.
+
+  GET  /api/comet/output/<job_id>/<filename> — serve any processor output file.
+
+  Comet jobs are tracked in the SQLite DB (comet_jobs table) so the browser
+  can reconnect to an in-progress render after a page refresh.
+
+════════════════════════════════════════════════════════════════════════════════
+DATABASE  (db.py / SQLite)
+════════════════════════════════════════════════════════════════════════════════
+
+  A single SQLite file stores:
+    sessions           — discovered Seestar observation sessions
+    transit_jobs       — one row per video file queued for transit detection
+    transit_events     — detected transiting-object events with clip paths
+    impact_events      — detected lunar impact flash events
+    stack_jobs         — stacking job queue and results
+    comet_jobs         — comet processor job queue and results
+
+  The DB is the source of truth for the SSE replay on new connections.
+
+════════════════════════════════════════════════════════════════════════════════
+API ROUTE SUMMARY
+════════════════════════════════════════════════════════════════════════════════
+
+  Pages
+    GET  /                         Main sessions dashboard
+    GET  /catalog/messier          Messier bingo-card catalog page
+    GET  /catalog/caldwell         Caldwell bingo-card catalog page
+    GET  /transits                 Transit detection page
+    GET  /activity                 Background-activity log page
+    GET  /comet                    Comet Wizard page
+
+  Sessions / data
+    GET  /api/events               SSE stream (sessions + live updates)
+    GET  /api/scan                 Trigger a full rescan
+    GET  /api/thumbnail/<name>     Serve a resized session preview JPEG
+    GET  /api/fits/<path>          Serve a FITS file for download
+
+  Catalog
+    GET  /api/catalog/messier      Messier catalog JSON
+    GET  /api/catalog/caldwell     Caldwell catalog JSON
+
+  Transit detection
+    POST /api/transit/detect       Queue transit jobs for a session
+    GET  /api/transit/all          All jobs + events JSON
+    GET  /api/transit/clip/<id>    Serve a transit clip MP4
+    GET  /api/transit/thumb/<id>   Serve a transit event thumbnail
+    POST /api/transit/pause        Pause the transit worker
+    POST /api/transit/resume       Resume the transit worker
+    POST /api/transit/cancel       Cancel a session's transit jobs
+    POST /api/transit/confirm/<id> Mark an event as confirmed / rejected
+
+  Stacking
+    POST /api/stack/start          Queue a stacking job
+    GET  /api/stack/status/<name>  Get stack job status
+    GET  /api/stack/result/<name>  Serve the stacked JPEG
+
+  Comet Wizard
+    POST /api/comet/render         Launch comet processor subprocess
+    GET  /api/comet/status/<id>    Poll job status + outputs
+    GET  /api/comet/preview-frame  Single-frame stretch preview
+    GET  /api/comet/frame/<id>/<n> Serve an annotated frame JPEG
+    GET  /api/comet/output/<id>/<f> Serve any processor output file
+
+  Utility
+    POST /api/shutdown             Gracefully stop the server (os._exit after 0.3 s)
 """
 
+import functools
+import hashlib
 import io
 import json
 import os
 import queue
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
+import urllib.parse
 from datetime import datetime
+from pathlib import Path as _Path
 from typing import Generator
 
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
@@ -46,7 +239,6 @@ _catalog = ObjectCatalog()
 
 _subscribers: list[queue.Queue] = []
 _sub_lock = threading.Lock()
-
 
 def _subscribe() -> queue.Queue:
     q: queue.Queue = queue.Queue(maxsize=500)
@@ -132,15 +324,10 @@ def _run_transit_job(job: dict) -> None:
     session_name = job["session_name"]
     basename     = _Path(video_path).name
 
-    # Aircraft lookup is optional — gracefully absent if module not installed
-    try:
-        from aircraft_lookup import lookup_aircraft as _lookup_fn
-    except ImportError:
-        _lookup_fn = None
-
     db.start_video_job(video_path)
     # Clear any stale events so re-detection starts with a clean slate.
     db.delete_transit_events_for_video(video_path)
+    db.delete_impact_events_for_video(video_path)
 
     def progress_cb(pct: int, _total: int, message: str) -> None:
         db.update_video_job_progress(video_path, pct, message)
@@ -191,27 +378,8 @@ def _run_transit_job(job: dict) -> None:
             except OSError:
                 pass
 
-    # ── Aircraft lookup ───────────────────────────────────────────────────────
-    # One OpenSky query per qualifying event (plane / iss / unknown with a UTC
-    # timestamp).  Birds are skipped — they don't appear in ADS-B data.
-    # Any failure returns [] so the job always completes successfully.
-    if _lookup_fn and any(
-        ev.frame_utc_start and ev.label != "bird" for ev in events
-    ):
-        progress_cb(98, 100, "Looking up aircraft…")
-
     event_rows = []
     for ev in events:
-        aircraft_candidates: list = []
-        if _lookup_fn and ev.frame_utc_start and ev.label != "bird":
-            try:
-                utc_dt = _datetime.fromisoformat(
-                    ev.frame_utc_start.replace("Z", "+00:00")
-                )
-                aircraft_candidates = _lookup_fn(utc_dt)
-            except Exception:
-                pass
-
         eid = db.insert_transit_event({
             "video_path":           video_path,
             "session_name":         session_name,
@@ -225,7 +393,7 @@ def _run_transit_job(job: dict) -> None:
             "linearity":            ev.linearity,
             "clip_path":            ev.clip_path,
             "meta_path":            ev.meta_path,
-            "aircraft_candidates":  json.dumps(aircraft_candidates) if aircraft_candidates else None,
+            "aircraft_candidates":  None,
             "thumb_path":           ev.thumb_path,
             "yolo_label":           ev.yolo_label,
             "yolo_confidence":      ev.yolo_confidence,
@@ -239,7 +407,6 @@ def _run_transit_job(job: dict) -> None:
             "velocity_pct_per_sec": ev.velocity_pct_per_sec,
             "clip_path":            ev.clip_path,
             "thumb_path":           ev.thumb_path,
-            "aircraft_candidates":  aircraft_candidates,
             "yolo_label":           ev.yolo_label,
             "yolo_confidence":      ev.yolo_confidence,
         })
@@ -406,6 +573,8 @@ def api_events() -> Response:
         #    the browser gets a full view before the scan even starts.
         sessions = db.get_all_sessions()
         for s in sessions:
+            if s.get("object_type") == "comet":
+                _enrich_comet_session(s)
             yield _sse({"type": "session", "data": s})
         yield _sse({"type": "db_loaded", "count": len(sessions)})
 
@@ -462,9 +631,79 @@ def catalog_caldwell() -> str:
     )
 
 
+def _enrich_comet_session(s: dict) -> None:
+    """Attach animation paths and image files to a comet session dict in-place."""
+    animations: dict = {}
+    # Check each path, its parent, and DATA_DIR/object_name.
+    # The wizard writes outputs into the directory the user selected, which may
+    # be the parent of the leaf FITS paths stored by the scanner.
+    dirs_to_check: list[str] = []
+    seen_dirs: set[str] = set()
+
+    def _add(d: str) -> None:
+        d = d.rstrip("/\\")
+        if d and d not in seen_dirs:
+            seen_dirs.add(d)
+            dirs_to_check.append(d)
+
+    for p in (s.get("paths") or []):
+        _add(p)
+        _add(os.path.dirname(p.rstrip("/\\")))
+    _add(os.path.join(str(DATA_DIR), s["object_name"]))
+
+    anim_dir: str = ""
+    for p in dirs_to_check:
+        for fname, key in [
+            ("comet_stars_fixed.mp4",   "stars_mp4"),
+            ("comet_nucleus_fixed.mp4", "nucleus_mp4"),
+            ("comet_track.jpg",         "track_jpg"),
+        ]:
+            if key not in animations and os.path.isfile(os.path.join(p, fname)):
+                animations[key] = os.path.join(p, fname)
+                if not anim_dir:
+                    anim_dir = p
+    animations["anim_dir"] = anim_dir
+    s["animations"] = animations
+
+    # Backfill thumbnail for _sub sessions processed after the initial scan.
+    if s["object_name"].endswith("_sub") and not s.get("thumbnail"):
+        for jpg_key in ("stack_jpg", "track_jpg"):
+            if animations.get(jpg_key):
+                s["image_files"] = [animations[jpg_key]]
+                break
+
+    # Gallery images for stacked (non-_sub) comet sessions.
+    if not s["object_name"].endswith("_sub"):
+        _WIZARD_OUTPUTS = {
+            "comet_stars_fixed.mp4", "comet_nucleus_fixed.mp4",
+            "comet_track.jpg", "comet_stack.jpg",
+        }
+        img_exts  = {".jpg", ".jpeg", ".png"}
+        seen_imgs: set[str] = set()
+        imgs: list[str] = []
+        for p in dirs_to_check:
+            try:
+                for fname in sorted(os.listdir(p)):
+                    if fname in _WIZARD_OUTPUTS:
+                        continue
+                    if _Path(fname).suffix.lower() not in img_exts:
+                        continue
+                    full = os.path.join(p, fname)
+                    if full not in seen_imgs and os.path.isfile(full):
+                        seen_imgs.add(full)
+                        imgs.append(full)
+            except OSError:
+                pass
+        s["image_files"] = imgs
+
+
 @app.route("/api/sessions")
 def api_sessions():
-    return jsonify(db.get_all_sessions())
+    sessions = db.get_all_sessions()
+    for s in sessions:
+        if s.get("object_type") == "comet":
+            _enrich_comet_session(s)
+    return jsonify(sessions)
 
 
 @app.route("/api/catalog/<catalog_type>")
@@ -523,6 +762,29 @@ def api_thumbnail(object_name: str):
     except Exception:
         # Serve the file directly if Pillow fails
         return send_file(thumb_path)
+
+
+@app.route("/api/image")
+def api_image():
+    """Serve an arbitrary image file by absolute path (local tool only)."""
+    path = request.args.get("path", "").strip()
+    if not path or not os.path.isfile(path):
+        abort(404)
+    ext = Path(path).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".tif", ".tiff"}:
+        abort(400)
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        img.thumbnail((1400, 1400))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88)
+        buf.seek(0)
+        return send_file(buf, mimetype="image/jpeg")
+    except Exception:
+        return send_file(path)
 
 
 @app.route("/api/transit/detect", methods=["POST"])
@@ -730,6 +992,596 @@ def api_stack_image(session_name: str):
     return send_file(path, mimetype="image/jpeg")
 
 
+@app.route("/impacts")
+def impacts() -> str:
+    return render_template("impacts.html", data_dir=DATA_DIR)
+
+
+@app.route("/api/impacts")
+def api_impacts():
+    gallery = db.get_impact_gallery()
+    # Null out paths for files that have been deleted from disk
+    for ev in gallery:
+        if ev.get("clip_path") and not os.path.exists(ev["clip_path"]):
+            ev["clip_path"] = None
+        if ev.get("thumb_path") and not os.path.exists(ev["thumb_path"]):
+            ev["thumb_path"] = None
+    return jsonify(gallery)
+
+
+@app.route("/api/impact/clip/<int:event_id>")
+def api_impact_clip(event_id: int):
+    ev = db.get_impact_event(event_id)
+    if not ev or not ev.get("clip_path"):
+        abort(404)
+    clip = ev["clip_path"]
+    if not os.path.isfile(clip):
+        abort(404)
+    return send_file(clip, mimetype="video/mp4")
+
+
+@app.route("/api/impact/thumb/<int:event_id>")
+def api_impact_thumb(event_id: int):
+    ev = db.get_impact_event(event_id)
+    if not ev or not ev.get("thumb_path"):
+        abort(404)
+    thumb = ev["thumb_path"]
+    if not os.path.isfile(thumb):
+        abort(404)
+    return send_file(thumb, mimetype="image/jpeg")
+
+
+@app.route("/activity")
+def activity() -> str:
+    return render_template("activity.html", data_dir=DATA_DIR)
+
+
+@app.route("/api/activity")
+def api_activity():
+    import calendar
+    from datetime import date as _date
+
+    sessions  = db.get_all_sessions()
+    days: dict = {}
+
+    for s in sessions:
+        dates    = s.get("dates", [])
+        if not dates:
+            continue
+        n        = max(len(dates), 1)
+        subs_d   = s.get("num_subs", 0) / n
+        video_d  = s.get("total_video_duration", 0) / n
+        otype    = s.get("object_type") or "unknown"
+        for d in dates:
+            if d not in days:
+                days[d] = {"sessions": 0, "subs": 0.0, "video_s": 0.0, "types": set()}
+            days[d]["sessions"] += 1
+            days[d]["subs"]     += subs_d
+            days[d]["video_s"]  += video_d
+            days[d]["types"].add(otype)
+
+    days_json = {
+        date: {
+            "sessions": v["sessions"],
+            "subs":     int(round(v["subs"])),
+            "video_s":  int(round(v["video_s"])),
+            "types":    sorted(v["types"]),
+        }
+        for date, v in days.items()
+    }
+
+    sorted_dates = sorted(days_json)
+    total_days   = len(sorted_dates)
+    total_subs   = sum(v["subs"]    for v in days_json.values())
+    total_video_s = sum(v["video_s"] for v in days_json.values())
+
+    # Longest streak of consecutive observation nights
+    max_streak = streak = 0
+    prev = None
+    for d in sorted_dates:
+        cur = _date.fromisoformat(d)
+        streak = (streak + 1) if (prev and (cur - prev).days == 1) else 1
+        max_streak = max(max_streak, streak)
+        prev = cur
+
+    # Busiest month by sub count
+    month_subs: dict = {}
+    for d, v in days_json.items():
+        month_subs[d[:7]] = month_subs.get(d[:7], 0) + v["subs"]
+    busiest = max(month_subs, key=month_subs.get) if month_subs else None
+    if busiest:
+        y, m       = busiest.split("-")
+        busiest_lbl = f"{calendar.month_abbr[int(m)]} {y}"
+    else:
+        busiest_lbl = "—"
+
+    return jsonify({
+        "days": days_json,
+        "stats": {
+            "total_days":     total_days,
+            "total_subs":     total_subs,
+            "total_video_s":  total_video_s,
+            "longest_streak": max_streak,
+            "busiest_month":  busiest_lbl,
+        },
+    })
+
+
+# ── Comet wizard ──────────────────────────────────────────────────────────────
+
+_COMET_THUMB_DIR = os.path.join(tempfile.gettempdir(), "seestar_comet_thumbs")
+os.makedirs(_COMET_THUMB_DIR, exist_ok=True)
+
+_comet_jobs: dict = {}
+_comet_jobs_lock  = threading.Lock()
+
+
+def _comet_thumb_bytes(fits_path: str, width: int = 240) -> bytes:
+    """Render a FITS sub to a small JPEG; returns raw bytes."""
+    import cv2
+    import numpy as np
+    from astropy.io import fits as _fits
+
+    _BAYER = {
+        "BGGR": cv2.COLOR_BayerBG2RGB, "GBRG": cv2.COLOR_BayerGB2RGB,
+        "GRBG": cv2.COLOR_BayerGR2RGB, "RGGB": cv2.COLOR_BayerRG2RGB,
+    }
+    with _fits.open(fits_path, memmap=False) as hdul:
+        hdr = hdul[0].header
+        raw = hdul[0].data
+    bscale = float(hdr.get("BSCALE", 1))
+    bzero  = float(hdr.get("BZERO",  0))
+    bayer  = hdr.get("BAYERPAT", "")
+
+    if raw.ndim == 2 and bayer:
+        code = _BAYER.get(bayer.upper(), cv2.COLOR_BayerGR2RGB)
+        rgb  = cv2.cvtColor(raw.astype(np.uint16), code).astype(np.float32) * bscale + bzero
+    elif raw.ndim == 3 and raw.shape[0] == 3:
+        rgb = np.transpose(raw, (1, 2, 0)).astype(np.float32) * bscale + bzero
+    else:
+        mono = raw.astype(np.float32) * bscale + bzero
+        rgb  = np.stack([mono, mono, mono], axis=2)
+
+    lum  = 0.299*rgb[...,0] + 0.587*rgb[...,1] + 0.114*rgb[...,2]
+    sky  = np.percentile(lum, 25)
+    rgb  = rgb - sky
+    hi   = np.percentile(lum[lum > sky] - sky, 99.5) if np.any(lum > sky) else 1.0
+    rgb  = np.power(np.clip(rgb / max(hi, 1e-9), 0, 1), 0.5)
+
+    h_px, w_px = rgb.shape[:2]
+    th = int(h_px * width / w_px)
+    bgr = cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    bgr = cv2.resize(bgr, (width, th), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        raise RuntimeError("JPEG encode failed")
+    return bytes(buf)
+
+
+def _comet_output_exists(directory: str, name: str):
+    p = os.path.join(directory, name)
+    return p if os.path.isfile(p) else None
+
+
+def _run_comet_job(job_id: str, cmd: list, out_dir: str) -> None:
+    _PASS_RE = re.compile(r"\[Pass\s+(\d+)\]")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip("\n")
+        with _comet_jobs_lock:
+            job = _comet_jobs[job_id]
+            job["log"].append(line)
+            if len(job["log"]) > 500:
+                job["log"].pop(0)
+            job["message"] = line
+            m = _PASS_RE.search(line)
+            if m:
+                job["pct"] = min(int((int(m.group(1)) - 1) / 5 * 100), 95)
+    proc.wait()
+    with _comet_jobs_lock:
+        job = _comet_jobs[job_id]
+        if proc.returncode == 0:
+            frames_dir  = os.path.join(out_dir, "_frames")
+            frame_count = 0
+            if os.path.isdir(frames_dir):
+                frame_count = sum(1 for f in os.listdir(frames_dir)
+                                  if f.lower().endswith(".jpg"))
+            job["status"]  = "done"
+            job["pct"]     = 100
+            job["outputs"] = {
+                "stars_mp4":         _comet_output_exists(out_dir, "comet_stars_fixed.mp4"),
+                "nucleus_mp4":       _comet_output_exists(out_dir, "comet_nucleus_fixed.mp4"),
+                "track_jpg":         _comet_output_exists(out_dir, "comet_track.jpg"),
+                "stack_jpg":         _comet_output_exists(out_dir, "comet_stack.jpg"),
+                "nucleus_stack_jpg": _comet_output_exists(out_dir, "comet_nucleus_stack.jpg"),
+                "ls_jpg":            _comet_output_exists(out_dir, "comet_ls.jpg"),
+                "portrait_jpg":      _comet_output_exists(out_dir, "comet_portrait.jpg"),
+                "frame_count":       frame_count,
+                "frame_dir":         out_dir if frame_count > 0 else None,
+            }
+        else:
+            job["status"] = "error"
+            job["error"]  = f"Process exited {proc.returncode}"
+
+
+_comet_info_cache: dict = {}
+
+
+@app.route("/api/comet/info")
+def api_comet_info():
+    """Fetch official designation + orbit class from JPL SBDB for a comet directory name."""
+    name = request.args.get("name", "").strip()
+    if not name:
+        return jsonify({}), 400
+    if name in _comet_info_cache:
+        return jsonify(_comet_info_cache[name])
+
+    # Strip common directory suffixes to get a bare designation
+    clean = re.sub(
+        r'[\s_]+(sub|processed|raw|stack|stacked|final|test|backup|archive)\b.*$',
+        '', name, flags=re.IGNORECASE,
+    ).strip()
+    # Normalise C-YYYY → C/YYYY for JPL query
+    designation = re.sub(r'^C-(\d{4})', r'C/\1', clean)
+
+    result = {"fullname": None, "orbit_class": None, "designation": designation}
+    try:
+        import urllib.request as _urlreq
+        import json as _json
+        url = ("https://ssd-api.jpl.nasa.gov/sbdb.api"
+               f"?sstr={urllib.parse.quote(designation)}&full-prec=false")
+        with _urlreq.urlopen(url, timeout=6) as r:
+            data = _json.loads(r.read())
+        obj = data.get("object", {})
+        result["fullname"]    = obj.get("fullname")
+        result["orbit_class"] = obj.get("orbit_class", {}).get("name")
+    except Exception:
+        pass  # Offline or unknown comet — just return empty fields
+
+    _comet_info_cache[name] = result
+    return jsonify(result)
+
+
+@app.route("/api/comet/discover")
+def api_comet_discover():
+    """Scan one directory level for comet-named subdirectories."""
+    root = request.args.get("root", DATA_DIR).strip()
+    if not os.path.isdir(root):
+        return jsonify({"error": f"Directory not found: {root}"}), 400
+
+    import re
+    # Match: C-YYYY…  (non-periodic)  or  NNP / NND… (periodic/defunct)
+    _COMET_RE = re.compile(r'C-\d{4}|\b\d+[PD]\b', re.IGNORECASE)
+
+    results = []
+    try:
+        for name in sorted(os.listdir(root)):
+            if not _COMET_RE.search(name):
+                continue
+            full = os.path.join(root, name)
+            if not os.path.isdir(full):
+                continue
+            try:
+                fits_count = sum(
+                    1 for f in os.listdir(full)
+                    if f.lower().endswith((".fit", ".fits"))
+                )
+            except OSError:
+                fits_count = 0
+            results.append({"name": name, "path": full, "fits_count": fits_count})
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"root": root, "comets": results})
+
+
+@app.route("/api/comet/preview-frame", methods=["POST"])
+def api_comet_preview_frame():
+    """Render a FITS frame with custom stretch/noise params — returns JPEG for live preview."""
+    import cv2 as _cv2
+    import numpy as _np
+
+    body     = request.get_json(silent=True) or {}
+    path     = body.get("path", "")
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "File not found"}), 404
+
+    sky_pct  = max(1.0,  min(50.0,  float(body.get("sky_pct",  25.0))))
+    high_pct = max(90.0, min(100.0, float(body.get("high_pct", 99.8))))
+    gamma    = max(0.1,  min(3.0,   float(body.get("gamma",    0.5))))
+    noise    = max(0,    min(5,     int(body.get("noise",  0))))
+    width    = max(200,  min(900,   int(body.get("width",  640))))
+
+    try:
+        from astropy.io import fits as _fits
+        _BAYER = {
+            "BGGR": _cv2.COLOR_BayerBG2RGB, "GBRG": _cv2.COLOR_BayerGB2RGB,
+            "GRBG": _cv2.COLOR_BayerGR2RGB, "RGGB": _cv2.COLOR_BayerRG2RGB,
+        }
+        with _fits.open(path, memmap=False) as hdul:
+            hdr = hdul[0].header
+            raw = hdul[0].data
+        bscale = float(hdr.get("BSCALE", 1))
+        bzero  = float(hdr.get("BZERO",  0))
+        bayer  = hdr.get("BAYERPAT", "")
+
+        if raw.ndim == 2 and bayer:
+            code = _BAYER.get(bayer.upper(), _cv2.COLOR_BayerGR2RGB)
+            rgb  = _cv2.cvtColor(raw.astype(_np.uint16), code).astype(_np.float32) * bscale + bzero
+        elif raw.ndim == 3 and raw.shape[0] == 3:
+            rgb = _np.transpose(raw, (1, 2, 0)).astype(_np.float32) * bscale + bzero
+        else:
+            mono = raw.astype(_np.float32) * bscale + bzero
+            rgb  = _np.stack([mono, mono, mono], axis=2)
+
+        # Stretch
+        out = rgb.copy()
+        for c in range(3):
+            sky = _np.percentile(out[..., c], sky_pct)
+            out[..., c] = out[..., c] - sky
+        lum      = 0.299*out[..., 0] + 0.587*out[..., 1] + 0.114*out[..., 2]
+        high_val = _np.percentile(lum[lum > 0], high_pct) if _np.any(lum > 0) else 1.0
+        if high_val > 0:
+            out = out / high_val
+        out = _np.power(_np.clip(out, 0, 1), gamma)
+        out = _np.clip(out, 0, 1)
+
+        # Resize
+        h_px, w_px = out.shape[:2]
+        th  = int(h_px * width / w_px)
+        bgr = _cv2.cvtColor((out * 255).astype(_np.uint8), _cv2.COLOR_RGB2BGR)
+        bgr = _cv2.resize(bgr, (width, th), interpolation=_cv2.INTER_LANCZOS4)
+
+        # Noise reduction
+        if noise > 0:
+            sigma = float(10 + noise * 10)
+            bgr = _cv2.bilateralFilter(bgr, 9, sigmaColor=sigma, sigmaSpace=sigma)
+
+        ok, buf = _cv2.imencode(".jpg", bgr, [_cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            raise RuntimeError("JPEG encode failed")
+        return Response(bytes(buf), mimetype="image/jpeg")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/comet")
+def comet_wizard() -> str:
+    return render_template("comet.html", data_dir=DATA_DIR)
+
+
+@app.route("/comet/results")
+def comet_results() -> str:
+    return render_template("comet_results.html")
+
+
+@app.route("/api/comet/scan", methods=["POST"])
+def api_comet_scan():
+    body      = request.get_json(silent=True) or {}
+    directory = body.get("directory", "").strip()
+    if not directory or not os.path.isdir(directory):
+        return jsonify({"error": f"Directory not found: {directory}"}), 400
+
+    from astropy.io import fits as _fits
+
+    files = []
+    for f in sorted(_Path(directory).glob("*.fit")):
+        try:
+            with _fits.open(str(f), memmap=False) as hdul:
+                hdr = hdul[0].header
+            stem  = f.stem
+            parts = stem.split("_")
+            nsubs = 1
+            if parts[0].lower() == "stacked":
+                try:
+                    nsubs = int(parts[1])
+                except (IndexError, ValueError):
+                    pass
+            files.append({
+                "path":      str(f),
+                "filename":  f.name,
+                "date_obs":  hdr.get("DATE-OBS", ""),
+                "exptime":   float(hdr.get("EXPTIME", 0)),
+                "nsubs":     nsubs,
+                "thumb_url": f"/api/comet/thumb?path={urllib.parse.quote(str(f))}",
+            })
+        except Exception:
+            continue
+
+    files.sort(key=lambda x: x["date_obs"])
+    return jsonify({"directory": directory, "count": len(files), "files": files})
+
+
+@app.route("/api/comet/thumb")
+def api_comet_thumb():
+    path = request.args.get("path", "")
+    if not path or not os.path.isfile(path):
+        abort(404)
+    width = min(int(request.args.get("width", 240)), 800)
+    key   = hashlib.md5(f"{path}:{width}".encode()).hexdigest()
+    cache = os.path.join(_COMET_THUMB_DIR, key + ".jpg")
+    if not os.path.isfile(cache):
+        try:
+            data = _comet_thumb_bytes(path, width=width)
+            with open(cache, "wb") as fh:
+                fh.write(data)
+        except Exception as e:
+            return str(e), 500
+    return send_file(cache, mimetype="image/jpeg")
+
+
+@app.route("/api/comet/render", methods=["POST"])
+def api_comet_render():
+    body      = request.get_json(silent=True) or {}
+    directory = body.get("directory", "").strip()
+    sel_files = body.get("files", [])
+    if not directory or not sel_files:
+        return jsonify({"error": "directory and files required"}), 400
+
+    job_id = hashlib.md5(f"{directory}:{datetime.utcnow().isoformat()}".encode()).hexdigest()[:12]
+    with _comet_jobs_lock:
+        _comet_jobs[job_id] = {
+            "id": job_id, "status": "running", "pct": 0,
+            "message": "Starting…", "log": [], "error": None, "outputs": {},
+        }
+
+    cmd = [
+        sys.executable, "-u",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "comet_processor.py"),
+        directory,
+        "--files-json", json.dumps(sel_files),
+        "--fps",        str(body.get("fps",        10)),
+        "--gamma",      str(body.get("gamma",       0.5)),
+        "--crop",       str(body.get("crop",        700)),
+        "--max-frames", str(body.get("max_frames",  300)),
+        "--sky-pct",    str(body.get("sky_pct",     25.0)),
+        "--high-pct",   str(body.get("high_pct",    99.8)),
+        "--noise",        str(body.get("noise",         0)),
+        "--width",        str(body.get("width",         1080)),
+        "--max-gap-mult", str(body.get("max_gap_mult",  4.0)),
+    ]
+    if body.get("no_vfr"):
+        cmd.append("--no-vfr")
+    if body.get("no_cache"):
+        cmd.append("--no-cache")
+    if body.get("redetect_nucleus"):
+        cmd.append("--redetect-nucleus")
+    hx = body.get("nucleus_hint_x")
+    hy = body.get("nucleus_hint_y")
+    if hx is not None and hy is not None:
+        try:
+            hx_f, hy_f = float(hx), float(hy)
+            if 0.0 <= hx_f <= 1.0 and 0.0 <= hy_f <= 1.0:
+                cmd += ["--nucleus-hint-x", str(hx_f),
+                        "--nucleus-hint-y", str(hy_f)]
+        except (TypeError, ValueError):
+            pass
+
+    threading.Thread(target=_run_comet_job, args=(job_id, cmd, directory),
+                     daemon=True, name=f"comet-{job_id}").start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/comet/status")
+def api_comet_status():
+    job_id = request.args.get("job_id", "")
+    with _comet_jobs_lock:
+        job = _comet_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(dict(job))
+
+
+@app.route("/api/comet/output")
+def api_comet_output():
+    """Serve a comet output file (mp4 / jpg) by absolute path."""
+    path = request.args.get("path", "")
+    if not path or not os.path.isfile(path):
+        abort(404)
+    ext  = os.path.splitext(path)[1].lower()
+    mime = {".mp4": "video/mp4", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext)
+    if not mime:
+        abort(400)
+    return send_file(path, mimetype=mime, conditional=True)
+
+
+@app.route("/api/comet/check")
+def api_comet_check():
+    """Check whether comet outputs already exist for a given directory."""
+    directory = request.args.get("dir", "").strip()
+    if not directory or not os.path.isdir(directory):
+        return jsonify({"error": "Directory not found"}), 400
+    frames_dir  = os.path.join(directory, "_frames")
+    frame_count = 0
+    if os.path.isdir(frames_dir):
+        frame_count = sum(1 for f in os.listdir(frames_dir)
+                          if f.lower().endswith(".jpg"))
+    outputs = {
+        "stars_mp4":         _comet_output_exists(directory, "comet_stars_fixed.mp4"),
+        "nucleus_mp4":       _comet_output_exists(directory, "comet_nucleus_fixed.mp4"),
+        "track_jpg":         _comet_output_exists(directory, "comet_track.jpg"),
+        "stack_jpg":         _comet_output_exists(directory, "comet_stack.jpg"),
+        "nucleus_stack_jpg": _comet_output_exists(directory, "comet_nucleus_stack.jpg"),
+        "ls_jpg":            _comet_output_exists(directory, "comet_ls.jpg"),
+        "portrait_jpg":      _comet_output_exists(directory, "comet_portrait.jpg"),
+        "frame_count":       frame_count,
+        "frame_dir":         directory if frame_count > 0 else None,
+    }
+    return jsonify({"directory": directory, "outputs": outputs})
+
+
+@app.route("/api/comet/frames")
+def api_comet_frames():
+    """List annotated frame JPEGs saved in {dir}/_frames/ with basic metadata."""
+    directory = request.args.get("dir", "").strip()
+    if not directory or not os.path.isdir(directory):
+        return jsonify({"error": "Directory not found"}), 400
+    frames_dir = os.path.join(directory, "_frames")
+    if not os.path.isdir(frames_dir):
+        return jsonify({"frames": []}), 200
+    frames = []
+    for fname in sorted(os.listdir(frames_dir)):
+        if fname.lower().endswith(".jpg"):
+            frames.append({
+                "path": os.path.join(frames_dir, fname),
+                "name": fname,
+            })
+    return jsonify({"directory": directory, "frames": frames})
+
+
+@app.route("/api/comet/rejections")
+def api_comet_rejections():
+    """Return the rejected_indices list stored in comet_alignment.json."""
+    directory = request.args.get("dir", "").strip()
+    if not directory or not os.path.isdir(directory):
+        return jsonify({"error": "Directory not found"}), 400
+    cache_json = os.path.join(directory, "comet_alignment.json")
+    rejected_indices = []
+    if os.path.isfile(cache_json):
+        try:
+            with open(cache_json) as fh:
+                cache = json.load(fh)
+            rejected_indices = cache.get("rejected_indices", [])
+        except Exception:
+            pass
+    return jsonify({"rejected_indices": rejected_indices})
+
+
+@app.route("/api/comet/set_rejections", methods=["POST"])
+def api_comet_set_rejections():
+    """Persist a frame rejection list into comet_alignment.json."""
+    data      = request.get_json(force=True) or {}
+    directory = data.get("dir", "").strip()
+    indices   = [int(x) for x in data.get("rejected_indices", [])]
+    if not directory or not os.path.isdir(directory):
+        return jsonify({"error": "Directory not found"}), 400
+    cache_json = os.path.join(directory, "comet_alignment.json")
+    cache = {}
+    if os.path.isfile(cache_json):
+        try:
+            with open(cache_json) as fh:
+                cache = json.load(fh)
+        except Exception:
+            pass
+    cache["rejected_indices"] = sorted(indices)
+    with open(cache_json, "w") as fh:
+        json.dump(cache, fh, indent=2)
+    return jsonify({"ok": True, "count": len(indices)})
+
+
+@app.route("/api/comet/cancel", methods=["POST"])
+def api_comet_cancel():
+    job_id = (request.get_json(silent=True) or {}).get("job_id", "")
+    with _comet_jobs_lock:
+        job = _comet_jobs.get(job_id)
+        if job and job["status"] == "running":
+            job["status"] = "cancelled"
+    return jsonify({"ok": True})
+
+
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
     body  = request.get_json(silent=True) or {}
@@ -778,6 +1630,13 @@ def _backfill_video_durations() -> None:
             print(f"[startup] Backfilled video durations for {count} session(s).")
     except Exception as exc:
         print(f"[startup] Duration backfill error: {exc}")
+
+
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    """Gracefully stop the server without killing the shell."""
+    threading.Timer(0.3, lambda: os._exit(0)).start()
+    return jsonify({"status": "shutting down"})
 
 
 if __name__ == "__main__":
@@ -834,6 +1693,21 @@ if __name__ == "__main__":
     if pending_jobs:
         print(f"[startup] Re-queued {len(pending_jobs)} interrupted transit job(s).")
 
+    # Keyboard listener: type 'x' + Enter at the terminal to exit cleanly.
+    def _kbd_listener():
+        import sys
+        try:
+            while True:
+                line = sys.stdin.readline()
+                if not line or line.strip().lower() in ("x", "q", "exit", "quit"):
+                    print("\n[shutdown] Keyboard exit — stopping server.")
+                    os._exit(0)
+        except Exception:
+            pass
+    _kbd = threading.Thread(target=_kbd_listener, daemon=True, name="kbd-listener")
+    _kbd.start()
+
     # Kick off a differential scan right away; it will be fast if nothing changed.
     start_scan(force=False)
+    print("Type 'x' + Enter to stop the server.")
     app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)

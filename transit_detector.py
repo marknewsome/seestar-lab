@@ -91,6 +91,7 @@ DRIFT_STRIDE = 5    # re-estimate drift every N frames; hold correction in betwe
 VIDEO_TIMEZONE    = "America/Los_Angeles"
 
 
+
 # ── Result type ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -116,6 +117,27 @@ class TransitEvent:
     track_xs:             list = field(default_factory=list)
     track_ys:             list = field(default_factory=list)
     track_frames:         list = field(default_factory=list)
+
+
+# ── Impact event type ─────────────────────────────────────────────────────────
+
+@dataclass
+class ImpactEvent:
+    frame_start:     int
+    frame_end:       int
+    duration_s:      float
+    cx:              float          # flash centroid X (pixels)
+    cy:              float          # flash centroid Y (pixels)
+    peak_diff:       float          # peak positive brightness increase (DN)
+    fps:             float
+    width:           int
+    height:          int
+    disk_center:     list           # [cx, cy]
+    disk_radius:     int
+    frame_utc_start: Optional[str] = None   # ISO-8601 UTC of frame_start
+    clip_path:       Optional[str] = None
+    meta_path:       Optional[str] = None
+    thumb_path:      Optional[str] = None
 
 
 # ── Detector ──────────────────────────────────────────────────────────────────
@@ -158,6 +180,8 @@ class TransitDetector:
 
         # Parsed recording start (UTC) — parse from original filename, not temp copy
         self._video_start_utc: Optional[datetime] = _parse_video_start_utc(self._source_path)
+
+        # Set during detect(); empty for solar or when dark side not visible
 
         # Per-type detection parameters.
         # Lunar: the moon is dimmer than the sun, producing lower-contrast
@@ -217,7 +241,7 @@ class TransitDetector:
         _cb(12, "Scanning frames…")
         tracks = self._track_blobs(background, mask, progress_cb, cancel_cb)
 
-        _cb(92, "Scoring tracks…")
+        _cb(90, "Scoring tracks…")
         events = self._score_tracks(tracks)
 
         # Safety cap: if we got an absurd number of events the shake filter
@@ -227,21 +251,25 @@ class TransitDetector:
                      " — likely false positives; no clips written")
             return []
 
-        # Attach UTC timestamps
+        # Attach UTC timestamps to transit events
         if self._video_start_utc is not None:
             for ev in events:
                 ev_utc = self._video_start_utc + timedelta(seconds=ev.frame_start / self.fps)
                 ev.frame_utc_start = ev_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         if events:
-            _cb(95, f"Writing {len(events)} clip(s)…")
+            _cb(95, f"Writing {len(events)} transit clip(s)…")
             self._write_clips(events, output_dir, pad_secs)
 
             if yolo_validator.is_available():
-                _cb(98, "Running YOLO validation…")
+                _cb(97, "Running YOLO validation…")
                 for ev in events:
                     if ev.thumb_path:
                         ev.yolo_label, ev.yolo_confidence = yolo_validator.validate(ev.thumb_path)
+                        # If YOLO positively identifies an airplane, override any
+                        # velocity-based ISS/unknown label — YOLO wins.
+                        if ev.yolo_label == "airplane" and ev.label in ("iss", "unknown"):
+                            ev.label = "plane"
                         # Patch YOLO results into the sidecar that _write_clips() already wrote
                         if ev.meta_path and os.path.exists(ev.meta_path):
                             try:
@@ -249,12 +277,13 @@ class TransitDetector:
                                     _sidecar = json.load(_f)
                                 _sidecar["yolo_label"]      = ev.yolo_label
                                 _sidecar["yolo_confidence"] = ev.yolo_confidence
+                                _sidecar["label"]           = ev.label
                                 with open(ev.meta_path, "w") as _f:
                                     json.dump(_sidecar, _f, indent=2)
                             except Exception:
                                 pass  # sidecar patch is best-effort
 
-        _cb(100, f"Done — {len(events)} event(s) found")
+        _cb(100, f"Done — {len(events)} transit(s) found")
         return events
 
     # ── Background model ──────────────────────────────────────────────────────
@@ -370,6 +399,7 @@ class TransitDetector:
         disk_px    = float(cv2.countNonZero(mask))   # pixels inside disk
         disk_area  = max(1.0, np.pi * self._disk_radius ** 2)
         max_blob   = disk_area * self._max_blob_frac
+
         # Secondary dominance floor: a blob must exceed this many pixels to be
         # treated as a large aircraft (rules out random large seeing-noise blobs).
         # 0.3 % of the disk area ≈ a circle of radius ~0.055 × disk_radius.
@@ -416,14 +446,14 @@ class TransitDetector:
             _dy = max(-DRIFT_MAX, min(DRIFT_MAX, _dy))
             if abs(_dx) >= DRIFT_MIN or abs(_dy) >= DRIFT_MIN:
                 _M  = np.float32([[1, 0, _dx], [0, 1, _dy]])
-                _bg = cv2.warpAffine(
+                bg_aligned = cv2.warpAffine(
                     background, _M, (self.width, self.height),
                     flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_REPLICATE,
                 )
-                diff = cv2.absdiff(gray, _bg)
             else:
-                diff = cv2.absdiff(gray, background)
+                bg_aligned = background
+            diff = cv2.absdiff(gray, bg_aligned)
 
             _, th = cv2.threshold(diff, self._diff_thresh, 255, cv2.THRESH_BINARY)
             th    = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
@@ -555,6 +585,7 @@ class TransitDetector:
         cap.release()
         for t in active.values():
             completed.append(t)
+
         return completed
 
     # ── Scoring and classification ────────────────────────────────────────────
@@ -611,7 +642,7 @@ class TransitDetector:
             # exempt so a genuine satellite transit isn't silently discarded even
             # if the track is short.  For everything else, low-R² tracks are
             # almost always atmospheric seeing shimmer; reject them early.
-            _iss_candidate = velocity_pct > 40 and linearity > 0.95
+            _iss_candidate = velocity_pct > 130 and linearity > 0.95
             if linearity < self._min_linearity and not _iss_candidate:
                 continue
 
@@ -754,6 +785,8 @@ class TransitDetector:
                 concurrent.futures.wait(futures)
 
 
+
+
 # ── Pure-function helpers ─────────────────────────────────────────────────────
 
 def _embed_thumbnail(clip_path: str, thumb_path: str) -> None:
@@ -860,7 +893,9 @@ def _linearity_r2(xs: np.ndarray, ys: np.ndarray) -> float:
 
 
 def _classify(velocity_pct: float, linearity: float, duration_s: float) -> str:
-    if velocity_pct > 40 and linearity > 0.97:
+    # ISS crosses the solar disk in ~0.5 s → ~200 %Ø/s from the ground.
+    # Fast commercial jets top out around 110 %Ø/s; use 130 as the dividing line.
+    if velocity_pct > 130 and linearity > 0.97:
         return "iss"
     if linearity >= 0.90 and velocity_pct >= 3:
         return "plane"

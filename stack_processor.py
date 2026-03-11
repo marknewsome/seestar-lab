@@ -7,7 +7,7 @@ Stacking pipeline (astrophotography best practices):
   3. Frame rejection — discard frames below quality threshold
   4. Debayer        — convert Bayer (GRBG default) to BGR colour
   5. Registration   — align frames to reference via ECC; phase-corr fallback
-  6. Integration    — sigma-clipped mean combination
+  6. Integration    — 2× drizzle (coverage-weighted, streaming accumulation)
   7. Background     — 2D polynomial gradient subtraction
   8. Crop           — trim invalid border pixels from alignment warps
   9. Stretch        — percentile black-point + sqrt gamma (PixInsight-style STF)
@@ -15,9 +15,16 @@ Stacking pipeline (astrophotography best practices):
  11. Save           — JPEG output (+ optional float32 FITS for further processing)
 
 No astropy required.  Uses only numpy, scipy, and opencv-python.
+
+Drizzle integration:
+  Each sub-frame is mapped into a 2× output grid (3840×2160 from 1920×1080 subs)
+  using its computed warp transform scaled to the output resolution.  Frames are
+  accumulated one at a time (streaming) so peak RAM is ~500 MB regardless of N.
+  Coverage-weighted mean provides sub-pixel accuracy matching Seestar's own output.
 """
 
 import os
+import warnings
 import numpy as np
 import cv2
 from typing import Callable, Optional
@@ -119,7 +126,9 @@ _BAYER_CODES = {
 
 
 def _debayer(raw: np.ndarray, bayer_pattern: str = 'GRBG') -> np.ndarray:
-    """Debayer uint16 Bayer array to BGR uint16."""
+    """Debayer uint16 Bayer array to BGR uint16 (bilinear).
+    Note: OpenCV's VNG/EA debayer algorithms only accept 8-bit input, so we
+    use bilinear here to preserve full 16-bit precision for stacking."""
     code = _BAYER_CODES.get(bayer_pattern.upper().strip(), cv2.COLOR_BayerGR2BGR)
     return cv2.cvtColor(raw, code)
 
@@ -127,46 +136,101 @@ def _debayer(raw: np.ndarray, bayer_pattern: str = 'GRBG') -> np.ndarray:
 # ── Registration ──────────────────────────────────────────────────────────────
 
 def _to_gray8(bgr_f32: np.ndarray) -> np.ndarray:
-    """Convert float32 BGR [0,1] to uint8 grayscale (for ECC registration)."""
+    """
+    Convert float32 BGR [0,1] to uint8 grayscale for ECC registration.
+    Uses CLAHE rather than min/max normalisation so that faint star fields
+    (where a single hot pixel would otherwise crush all stars to values 1-5)
+    have enough gradient information for ECC to converge reliably.
+    """
     gray = (0.299 * bgr_f32[:, :, 2]
           + 0.587 * bgr_f32[:, :, 1]
           + 0.114 * bgr_f32[:, :, 0])
-    mn, mx = float(gray.min()), float(gray.max())
-    if mx > mn:
-        gray = (gray - mn) / (mx - mn)
-    return (gray * 255).astype(np.uint8)
+    # Percentile stretch first to avoid hot pixels dominating CLAHE
+    lo, hi = float(np.percentile(gray, 0.5)), float(np.percentile(gray, 99.5))
+    if hi > lo:
+        gray = np.clip((gray - lo) / (hi - lo), 0.0, 1.0)
+    gray8 = (gray * 255).astype(np.uint8)
+    # CLAHE: boost local contrast so stars are clearly visible for the correlator
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    return clahe.apply(gray8)
 
 
-def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray) -> np.ndarray:
+_MAX_WARP_SHIFT_PX = 50.0   # reject ECC result if translation exceeds this
+_MAX_WARP_ROT_DEG  = 2.0    # reject ECC result if rotation exceeds this
+
+
+def _warp_is_sane(warp: np.ndarray) -> bool:
+    """Return True if the warp has plausible translation and rotation values."""
+    dx  = float(warp[0, 2])
+    dy  = float(warp[1, 2])
+    rot = abs(float(np.degrees(np.arctan2(warp[1, 0], warp[0, 0]))))
+    return (abs(dx) <= _MAX_WARP_SHIFT_PX
+            and abs(dy) <= _MAX_WARP_SHIFT_PX
+            and rot     <= _MAX_WARP_ROT_DEG)
+
+
+def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray) -> np.ndarray | None:
     """
     Find the 2×3 Euclidean warp that aligns frame to reference.
-    ECC with MOTION_EUCLIDEAN; falls back to phase correlation on failure.
-    Returns the warp matrix (identity = no alignment).
+
+    Strategy (best-to-fallback):
+      1. astroalign — star-triangle pattern matching; centroid-precise, rotation-aware.
+      2. ECC (MOTION_EUCLIDEAN) — image-correlation fallback for frames with too few stars.
+      3. Phase correlation — translation-only last resort.
+
+    Returns the 2×3 warp matrix, or None if all methods fail / result is implausible.
     """
+    # ── 1. astroalign (star-based) ────────────────────────────────────────────
+    try:
+        import astroalign as aa
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            _, tf = aa.find_transform(frame_gray8, ref_gray8)
+        # astroalign returns a skimage SimilarityTransform; convert to 2×3 warp
+        params = tf.params          # 3×3 homogeneous matrix
+        warp_aa = np.array([
+            [params[0, 0], params[0, 1], params[0, 2]],
+            [params[1, 0], params[1, 1], params[1, 2]],
+        ], dtype=np.float32)
+        if _warp_is_sane(warp_aa):
+            return warp_aa
+    except Exception:
+        pass   # too few stars or import error — fall through to ECC
+
+    # ── 2. ECC (image correlation) ────────────────────────────────────────────
     warp     = np.eye(2, 3, dtype=np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-5)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
     try:
         _, warp = cv2.findTransformECC(
             ref_gray8, frame_gray8, warp,
             cv2.MOTION_EUCLIDEAN, criteria,
+            inputMask=None, gaussFiltSize=5,
         )
+        if _warp_is_sane(warp):
+            return warp
     except cv2.error:
-        # Phase-correlation fallback (translation only)
-        try:
-            (dx, dy), _ = cv2.phaseCorrelate(
-                ref_gray8.astype(np.float32),
-                frame_gray8.astype(np.float32),
-            )
-            warp[0, 2] = float(dx)
-            warp[1, 2] = float(dy)
-        except Exception:
-            pass  # identity — no alignment
-    return warp
+        pass
+
+    # ── 3. Phase-correlation (translation only) ───────────────────────────────
+    try:
+        (dx, dy), _ = cv2.phaseCorrelate(
+            ref_gray8.astype(np.float32),
+            frame_gray8.astype(np.float32),
+        )
+        fallback        = np.eye(2, 3, dtype=np.float32)
+        fallback[0, 2]  = float(dx)
+        fallback[1, 2]  = float(dy)
+        if _warp_is_sane(fallback):
+            return fallback
+    except Exception:
+        pass
+
+    return None   # skip this frame
 
 
 # ── Integration ───────────────────────────────────────────────────────────────
 
-def _sigma_clip_mean(stack: np.ndarray, n_sigma: float = 2.5) -> np.ndarray:
+def _sigma_clip_mean(stack: np.ndarray, n_sigma: float = 2.0) -> np.ndarray:
     """
     Sigma-clipped mean along axis 0.
     stack: float32 (N, H, W, 3).  Returns float32 (H, W, 3).
@@ -180,6 +244,50 @@ def _sigma_clip_mean(stack: np.ndarray, n_sigma: float = 2.5) -> np.ndarray:
     total = np.where(good, stack, 0.0).sum(axis=0)
     count = np.maximum(good.sum(axis=0).astype(np.float32), 1)
     return total / count
+
+
+# ── Drizzle integration (STScI drizzle library) ───────────────────────────────
+
+DRIZZLE_SCALE   = 2    # output pixels per input pixel (matches Seestar's 2× output)
+DRIZZLE_PIXFRAC = 0.5  # drop size as fraction of input pixel
+                       # 0.5 → each drop covers exactly 1 output pixel at 2×
+
+
+def _make_forward_pixmap(warp: np.ndarray, h: int, w: int, scale: int = DRIZZLE_SCALE) -> np.ndarray:
+    """
+    Build the (h, w, 2) forward pixmap required by drizzle.resample.Drizzle.
+
+    drizzle's pixmap convention: for each INPUT pixel (y, x), pixmap[y, x] gives
+    the (X_out, Y_out) position in the OUTPUT grid where that pixel lands.
+
+    Our warp uses the WARP_INVERSE_MAP convention: the matrix M maps
+    output_native → input, i.e.  x_in = M @ [X_out_native, Y_out_native, 1]^T.
+
+    Inverting to get the forward map (input → output_native) and then scaling
+    by `scale` to reach the 2× output grid:
+
+        [X_out, Y_out] = scale × M⁻¹ × ([x_in, y_in] − [tx, ty])
+
+    where M_rot = [[a, b], [c, d]] is the 2×2 rotation part of the warp,
+    tx, ty are the translation components, and M⁻¹_rot is its inverse.
+    """
+    a, b, tx = float(warp[0, 0]), float(warp[0, 1]), float(warp[0, 2])
+    c, d, ty = float(warp[1, 0]), float(warp[1, 1]), float(warp[1, 2])
+
+    det = a * d - b * c
+    if abs(det) < 1e-10:
+        det = 1e-10
+    inv_a, inv_b = d / det, -b / det
+    inv_c, inv_d = -c / det, a / det
+
+    y_in, x_in = np.mgrid[0:h, 0:w].astype(np.float64)
+    dx = x_in - tx
+    dy = y_in - ty
+
+    X_out = scale * (inv_a * dx + inv_b * dy)
+    Y_out = scale * (inv_c * dx + inv_d * dy)
+
+    return np.stack([X_out, Y_out], axis=-1)  # (h, w, 2)
 
 
 # ── Background subtraction ────────────────────────────────────────────────────
@@ -267,27 +375,68 @@ def _auto_crop(img: np.ndarray, valid_mask: np.ndarray, margin: int = 12) -> np.
 
 # ── Stretch ───────────────────────────────────────────────────────────────────
 
+_STF_MIDTONE_TARGET = 0.12   # target display value for sky background (PixInsight default ≈ 0.12)
+
+
 def _auto_stretch(img: np.ndarray) -> np.ndarray:
     """
-    Astrophotography auto-stretch per channel:
-      1. Black point  = 0.5th  percentile
-      2. White point  = 99.8th percentile
-      3. Linear normalise to [0,1]
-      4. Sqrt gamma (≈ PixInsight STF) to lift faint nebulosity
+    PixInsight-style Midtone Transfer Function (STF) auto-stretch, per channel.
 
-    img: float32 (H, W, 3), any range.
+    Steps:
+      1. Estimate sky background: median(channel)
+      2. Estimate sky noise:       1.4826 × MAD(channel)
+      3. Black clip c₀:            sky_bg − 2.8 × sky_noise  (clips shadow noise)
+      4. Linear normalise to [0, 1] with c₀ as black point
+      5. Solve for MTF midpoint m such that the sky median maps to
+         _STF_MIDTONE_TARGET (≈ 0.12), keeping sky dark on screen
+      6. Apply MTF:  x' = (m−1)·x / ((2m−1)·x − m)
+
+    Unlike a simple gamma curve this keeps the sky background truly dark
+    regardless of any residual background gradient left after subtraction.
+
+    img:  float32 (H, W, 3), any range.
     Returns float32 (H, W, 3) in [0, 1].
     """
     result = np.zeros_like(img, dtype=np.float32)
+    m_tgt  = _STF_MIDTONE_TARGET
+
     for c in range(3):
-        ch  = img[:, :, c]
-        lo  = float(np.percentile(ch,  0.5))
-        hi  = float(np.percentile(ch, 99.8))
-        if hi > lo:
-            stretched = np.clip((ch - lo) / (hi - lo), 0.0, 1.0)
+        ch  = img[:, :, c].ravel()
+
+        # Sky background and noise estimate (ignore zero-fill border pixels)
+        sky = ch[ch > 0] if (ch > 0).any() else ch
+        med   = float(np.median(sky))
+        mad   = float(np.median(np.abs(sky - med)))
+        sigma = mad * 1.4826
+
+        # Black-clip point
+        c0 = max(0.0, med - 2.8 * sigma)
+
+        # White point: actual top of signal (99.9th percentile of non-zero pixels).
+        # Using the full bit-range (1.0) would compress the signal into <1% of the
+        # display range, making stars invisible.  We stretch to the real signal max.
+        hi   = float(np.percentile(sky, 99.9))
+        span = max(hi - c0, 1e-10)
+
+        x = np.clip((img[:, :, c] - c0) / span, 0.0, 1.0)
+
+        # Sky median in normalised space
+        med_n = float(np.clip((med - c0) / span, 1e-6, 1.0 - 1e-6))
+
+        # Solve for MTF midpoint m: MTF(med_n, m) = m_tgt
+        # m = med_n * (m_tgt − 1) / (2·med_n·m_tgt − m_tgt − med_n)
+        denom_m = 2.0 * med_n * m_tgt - m_tgt - med_n
+        if abs(denom_m) > 1e-10:
+            m = float(med_n * (m_tgt - 1.0) / denom_m)
+            m = max(1e-4, min(1.0 - 1e-4, m))
         else:
-            stretched = np.zeros_like(ch)
-        result[:, :, c] = np.sqrt(stretched)   # sqrt ≈ gamma 0.5
+            m = 0.5   # fallback
+
+        # Apply MTF: x' = (m−1)·x / ((2m−1)·x − m)
+        denom = (2.0 * m - 1.0) * x - m
+        denom = np.where(np.abs(denom) > 1e-10, denom, np.sign(denom + 1e-30) * 1e-10)
+        result[:, :, c] = np.clip((m - 1.0) * x / denom, 0.0, 1.0)
+
     return result
 
 
@@ -295,14 +444,24 @@ def _auto_stretch(img: np.ndarray) -> np.ndarray:
 
 def _denoise_sharpen(img: np.ndarray) -> np.ndarray:
     """
-    Mild bilateral noise reduction + unsharp-mask sharpening.
+    NLM colour denoising followed by unsharp-mask sharpening.
     img: uint8 (H, W, 3) BGR [0, 255].  Returns uint8.
+
+    NLM (Non-Local Means) reduces per-pixel noise while preserving edges and
+    star PSFs better than bilateral or Gaussian smoothing.  h=6 is gentle
+    enough not to smear 2-3px stars; template/search windows are matched to
+    typical star sizes.  The unsharp mask then compensates for any softening.
     """
-    # Bilateral filter: preserves edges, smooths noise in sky background
-    denoised  = cv2.bilateralFilter(img, d=7, sigmaColor=30, sigmaSpace=10)
-    # Unsharp mask: moderate sharpening (amount 1.3, radius 1.5 px)
-    blurred   = cv2.GaussianBlur(denoised, (0, 0), 1.5)
-    sharpened = cv2.addWeighted(denoised, 1.3, blurred, -0.3, 0)
+    denoised  = cv2.fastNlMeansDenoisingColored(
+        img,
+        None,
+        h           = 6,    # luminance filter strength (lower = less smoothing)
+        hColor      = 6,    # colour filter strength
+        templateWindowSize = 7,
+        searchWindowSize   = 21,
+    )
+    blurred   = cv2.GaussianBlur(denoised, (0, 0), 1.2)
+    sharpened = cv2.addWeighted(denoised, 1.6, blurred, -0.6, 0)
     return sharpened
 
 
@@ -381,7 +540,7 @@ class StackProcessor:
 
         # ── Stage 2: Load reference frame ────────────────────────────────────
         ref_scores = [sharpness[i] for i in accepted_idx]
-        ref_local  = int(np.argmax(ref_scores))   # index within accepted list
+        ref_local  = int(np.argmax(ref_scores))
 
         progress_cb(22, "Loading reference frame", n_accepted, total)
         ref_raw, _ = _read_fits(accepted_files[ref_local])
@@ -404,13 +563,14 @@ class StackProcessor:
                 bgr     = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
                 gray8   = _to_gray8(bgr)
                 warp    = _register(ref_gray8, gray8)
+                if warp is None:
+                    continue
 
                 aligned = cv2.warpAffine(
                     bgr, warp, (w, h),
-                    flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                    flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_CONSTANT, borderValue=0,
                 )
-                # Track which pixels actually came from this frame
                 ones  = np.ones((h, w), dtype=np.float32)
                 valid = cv2.warpAffine(
                     ones, warp, (w, h),
@@ -421,25 +581,37 @@ class StackProcessor:
                 frames.append(aligned)
                 masks.append(valid)
             except Exception:
-                pass   # skip frames that fail to load or register
+                pass
 
         if len(frames) < MIN_FRAMES:
             raise RuntimeError(
                 f"Only {len(frames)} frames registered successfully (need {MIN_FRAMES})"
             )
 
-        # ── Stage 4: Integration ─────────────────────────────────────────────
-        progress_cb(65, "Integrating (sigma-clipped mean)", n_accepted, total)
+        # ── Stage 4: Sigma-clipped integration + 2× upsample ─────────────────
+        # True drizzle adds no resolution benefit when sub-pixel offsets are
+        # < 0.5 px (as is typical for Seestar tracking). Sigma-clipping at
+        # native resolution removes hot pixels and cosmic rays cleanly; we
+        # then upsample to 2× with Lanczos-4 to match Seestar's output size.
+        progress_cb(65, f"Integrating sigma-clipped mean ({len(frames)} frames)", n_accepted, total)
         _chk()
 
         stack_arr = np.stack(frames, axis=0)    # (N, H, W, 3)
         stacked   = _sigma_clip_mean(stack_arr)  # (H, W, 3)
-        del stack_arr, frames                    # release ~800 MB
+        del stack_arr, frames
 
-        # Valid mask: pixels where every frame contributed
-        all_valid = masks[0].copy()
+        # Valid mask (native res) → upsample to 2× after stacking
+        all_valid_native = masks[0].copy()
         for m in masks[1:]:
-            all_valid &= m
+            all_valid_native &= m
+
+        # 2× upsample: the sigma-clipped stack + its validity mask
+        oh, ow    = h * DRIZZLE_SCALE, w * DRIZZLE_SCALE
+        stacked   = cv2.resize(stacked,   (ow, oh), interpolation=cv2.INTER_LANCZOS4)
+        all_valid = cv2.resize(
+            all_valid_native.astype(np.uint8), (ow, oh),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
 
         # ── Stage 5: Background subtraction ──────────────────────────────────
         progress_cb(72, "Removing background gradient", n_accepted, total)

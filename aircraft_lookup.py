@@ -13,8 +13,9 @@ OPENSKY_PASSWORD  OpenSky account password
 
 Notes
 -----
-* Free OpenSky accounts can access historical state vectors up to 30 days old.
-* Each state-vector query costs 1 API credit; free accounts get 400/day.
+* Registered accounts can query historical state vectors up to 1 hour in the past.
+* Anonymous (no credentials) can only query live data, not historical.
+* Each state-vector query costs 1 API credit; registered accounts get 4,000/day.
 * Requests older than 30 days return 403 — the function returns [] gracefully.
 """
 
@@ -33,7 +34,7 @@ BBOX_DEG     = float(os.environ.get("OPENSKY_BBOX_DEG", "1.5"))
 
 MAX_ALT_M    = 15_000   # ignore objects above 15 km (satellites / ISS)
 _OPENSKY_URL = "https://opensky-network.org/api/states/all"
-_TIMEOUT     = 10       # seconds per request
+_TIMEOUT     = 6        # seconds per request
 
 
 def lookup_aircraft(

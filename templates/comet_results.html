@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Comet Results — Seestar Lab</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+  <header id="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link active" href="/comet">Comet</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="cr-main">
+
+    <div class="cr-toolbar">
+      <div class="cr-title-group">
+        <span class="cr-comet-icon">☄</span>
+        <h1 class="cr-title" id="cr-title">Loading…</h1>
+      </div>
+      <div class="cr-actions">
+        <a class="btn btn-sm" id="cr-wizard-link" href="/comet">← Back to Wizard</a>
+        <button class="btn btn-sm" id="cr-present-btn">⛶ Present</button>
+      </div>
+    </div>
+
+    <div id="cr-loading" class="cr-loading">Loading results…</div>
+    <div id="cr-error"   class="cr-error" style="display:none"></div>
+    <div id="cr-body"    style="display:none">
+
+      <!-- Animations -->
+      <section class="cr-section" id="cr-animations-section" style="display:none">
+        <h2 class="cr-section-title">Animations</h2>
+        <div class="cr-animations-grid" id="cr-animations-grid"></div>
+      </section>
+
+      <!-- Stacked images -->
+      <section class="cr-section" id="cr-stacks-section" style="display:none">
+        <h2 class="cr-section-title">Stacked Images</h2>
+        <div class="cr-stacks-grid" id="cr-stacks-grid"></div>
+      </section>
+
+      <!-- Frame browser -->
+      <section class="cr-section" id="cr-frames-section" style="display:none">
+        <div class="frame-browser-card">
+          <div class="frame-browser-title" id="cr-frames-title">
+            <span id="cr-frames-label">🎞 Annotated frames</span>
+            <span class="frame-collapse-arrow">▾</span>
+          </div>
+          <div class="frame-browser-body" id="cr-frames-body">
+            <div class="frame-viewer" id="cr-viewer" style="display:none">
+              <div class="frame-viewer-img-wrap">
+                <img class="frame-viewer-img" id="cr-viewer-img" alt="" />
+              </div>
+              <div class="frame-viewer-caption" id="cr-viewer-caption"></div>
+              <div class="frame-viewer-nav">
+                <button class="btn btn-sm" id="cr-prev">← Prev</button>
+                <span id="cr-counter"></span>
+                <button class="btn btn-sm" id="cr-next">Next →</button>
+              </div>
+            </div>
+            <div class="frame-strip" id="cr-strip"></div>
+          </div>
+        </div>
+      </section>
+
+    </div><!-- #cr-body -->
+
+  </main>
+
+  <!-- Floating exit-presentation button (visible only in present mode) -->
+  <button class="cr-exit-present" id="cr-exit-present" onclick="exitPresent()">✕ Exit</button>
+
+  <script src="/static/js/comet_results.js"></script>
+</body>
+</html>

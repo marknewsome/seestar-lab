@@ -77,6 +77,24 @@ CREATE TABLE IF NOT EXISTS stack_jobs (
     finished_at     TEXT
 );
 
+-- Meteor-impact detection: one row per confirmed dark-side flash
+CREATE TABLE IF NOT EXISTS meteor_impacts (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_path       TEXT NOT NULL,
+    session_name     TEXT NOT NULL,
+    frame_start      INTEGER,
+    frame_end        INTEGER,
+    duration_s       REAL,
+    cx               REAL,
+    cy               REAL,
+    peak_diff        REAL,
+    clip_path        TEXT,
+    meta_path        TEXT,
+    thumb_path       TEXT,
+    frame_utc_start  TEXT,
+    detected_at      TEXT
+);
+
 -- Transit detection: one row per detected event
 CREATE TABLE IF NOT EXISTS transit_events (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +158,25 @@ def init_db() -> None:
             conn.execute("ALTER TABLE transit_events ADD COLUMN yolo_label TEXT")
         if "yolo_confidence" not in te_cols:
             conn.execute("ALTER TABLE transit_events ADD COLUMN yolo_confidence REAL")
+        # meteor_impacts table (added for dark-side flash detection)
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS meteor_impacts ("
+            "  id               INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  video_path       TEXT NOT NULL,"
+            "  session_name     TEXT NOT NULL,"
+            "  frame_start      INTEGER,"
+            "  frame_end        INTEGER,"
+            "  duration_s       REAL,"
+            "  cx               REAL,"
+            "  cy               REAL,"
+            "  peak_diff        REAL,"
+            "  clip_path        TEXT,"
+            "  meta_path        TEXT,"
+            "  thumb_path       TEXT,"
+            "  frame_utc_start  TEXT,"
+            "  detected_at      TEXT"
+            ");"
+        )
         # stack_jobs table (added in later schema revision)
         conn.executescript(
             "CREATE TABLE IF NOT EXISTS stack_jobs ("
@@ -421,6 +458,15 @@ def delete_transit_events_for_video(video_path: str) -> int:
         return cur.rowcount
 
 
+def delete_impact_events_for_video(video_path: str) -> int:
+    """Delete all meteor_impacts rows for *video_path*. Returns deleted count."""
+    with _db() as conn:
+        cur = conn.execute(
+            "DELETE FROM meteor_impacts WHERE video_path=?", (video_path,)
+        )
+        return cur.rowcount
+
+
 def purge_resource_fork_jobs() -> int:
     """
     Remove macOS resource-fork pseudo-files (basename starting with '._')
@@ -437,7 +483,49 @@ def purge_resource_fork_jobs() -> int:
         conn.execute(
             "DELETE FROM transit_events WHERE video_path LIKE '%/._%%'"
         )
+        conn.execute(
+            "DELETE FROM meteor_impacts WHERE video_path LIKE '%/._%%'"
+        )
         return cur.rowcount
+
+
+def insert_impact_event(ev: dict) -> int:
+    """Insert one meteor_impact row and return its new id."""
+    with _db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO meteor_impacts
+                (video_path, session_name, frame_start, frame_end, duration_s,
+                 cx, cy, peak_diff, clip_path, meta_path, thumb_path,
+                 frame_utc_start, detected_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+            """,
+            (
+                ev["video_path"], ev["session_name"],
+                ev.get("frame_start"), ev.get("frame_end"), ev.get("duration_s"),
+                ev.get("cx"), ev.get("cy"), ev.get("peak_diff"),
+                ev.get("clip_path"), ev.get("meta_path"), ev.get("thumb_path"),
+                ev.get("frame_utc_start"),
+            ),
+        )
+    return cur.lastrowid
+
+
+def get_impact_event(event_id: int) -> Optional[dict]:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM meteor_impacts WHERE id=?", (event_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_impact_gallery() -> list[dict]:
+    """Return all impact events ordered by detected_at descending."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM meteor_impacts ORDER BY detected_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def insert_transit_event(ev: dict) -> int:

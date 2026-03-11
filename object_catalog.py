@@ -20,9 +20,11 @@ SOLAR_KEYWORDS = {"sun", "solar"}
 LUNAR_KEYWORDS = {"moon", "lunar"}
 
 # Comets: C/YYYY or C-YYYY or CYYYY (4-digit year distinguishes from Caldwell C1–C109)
+# Also matches periodic comets: 12P, 24P, 45D, etc.
 _COMET_RE = re.compile(
     r"\bC[-/]?\s*\d{4}\b"     # C/2024, C-2024, C2024
     r"|\bP/\s*\d{4}\b"        # P/2024 style
+    r"|\b\d+[PD]\b"           # 24P, 12P, 45D (periodic / defunct)
     r"|\bcomet\b",
     re.IGNORECASE,
 )

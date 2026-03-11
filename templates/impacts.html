@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meteor Impacts — Seestar Lab</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <style>
+    /* ── Amber accent overrides for this page ─────────────────────────────── */
+    :root {
+      --impact: #f59e0b;
+      --impact-dim: rgba(245, 158, 11, 0.15);
+      --impact-border: rgba(245, 158, 11, 0.35);
+    }
+
+    .impacts-wrap {
+      max-width: 1100px;
+      margin: 2rem auto;
+      padding: 0 1.5rem;
+    }
+
+    /* ── Page header ──────────────────────────────────────────────────────── */
+    .impacts-header {
+      margin-bottom: 2rem;
+    }
+    .impacts-header h1 {
+      font-size: 1.6rem;
+      font-weight: 600;
+      color: var(--impact);
+      margin: 0 0 0.4rem;
+    }
+    .impacts-header p {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin: 0;
+      max-width: 640px;
+      line-height: 1.5;
+    }
+
+    /* ── Stats bar ────────────────────────────────────────────────────────── */
+    .imp-stats {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-bottom: 2rem;
+    }
+    .imp-stat {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.9rem 1.4rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+      min-width: 120px;
+    }
+    .imp-stat-value {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: var(--impact);
+      line-height: 1;
+    }
+    .imp-stat-label {
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Empty state ──────────────────────────────────────────────────────── */
+    .empty-state {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: var(--muted);
+    }
+    .empty-state .empty-icon {
+      font-size: 3rem;
+      margin-bottom: 1rem;
+      opacity: 0.4;
+    }
+    .empty-state h2 {
+      font-size: 1.1rem;
+      font-weight: 500;
+      margin: 0 0 0.5rem;
+      color: var(--fg);
+    }
+    .empty-state p {
+      font-size: 0.87rem;
+      margin: 0;
+      max-width: 400px;
+      margin-inline: auto;
+      line-height: 1.5;
+    }
+
+    /* ── Card grid ────────────────────────────────────────────────────────── */
+    .impact-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 1.25rem;
+    }
+
+    .impact-card {
+      background: var(--card);
+      border: 1px solid var(--impact-border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      transition: border-color 0.15s;
+    }
+    .impact-card:hover {
+      border-color: var(--impact);
+    }
+
+    /* ── Thumbnail ────────────────────────────────────────────────────────── */
+    .impact-thumb-wrap {
+      position: relative;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      overflow: hidden;
+    }
+    .impact-thumb-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+    .impact-thumb-wrap .no-thumb {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      height: 100%;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .impact-badge {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      background: var(--impact);
+      color: #000;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      padding: 0.2em 0.55em;
+      border-radius: 3px;
+    }
+
+    /* ── Card body ────────────────────────────────────────────────────────── */
+    .impact-body {
+      padding: 0.9rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      flex: 1;
+    }
+    .impact-session {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--fg);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .impact-time {
+      font-size: 0.8rem;
+      color: var(--muted);
+      font-family: monospace;
+    }
+    .impact-metrics {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .impact-metric {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .impact-metric strong {
+      color: var(--impact);
+      font-weight: 600;
+    }
+
+    /* ── Video player ─────────────────────────────────────────────────────── */
+    .impact-video-wrap {
+      padding: 0 1rem 1rem;
+    }
+    .impact-video-wrap video {
+      width: 100%;
+      border-radius: 4px;
+      background: #000;
+      max-height: 200px;
+    }
+
+    /* ── Loading / error ──────────────────────────────────────────────────── */
+    #load-msg {
+      text-align: center;
+      padding: 3rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link active" href="/impacts">Impacts</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link" href="/comet">Comet</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="impacts-wrap">
+
+      <div class="impacts-header">
+        <h1>Meteor Impacts</h1>
+        <p>
+          Confirmed dark-side flash detections from lunar videos — brief
+          stationary brightenings on the unilluminated limb caused by
+          meteoroid impacts. Each event appears in at least 2 consecutive
+          frames and is localised to the dark portion of the Moon.
+        </p>
+      </div>
+
+      <div class="imp-stats" id="stats-bar" style="display:none">
+        <div class="imp-stat">
+          <span class="imp-stat-value" id="stat-total">0</span>
+          <span class="imp-stat-label">Total impacts</span>
+        </div>
+        <div class="imp-stat">
+          <span class="imp-stat-value" id="stat-sessions">0</span>
+          <span class="imp-stat-label">Sessions</span>
+        </div>
+        <div class="imp-stat">
+          <span class="imp-stat-value" id="stat-brightest">—</span>
+          <span class="imp-stat-label">Brightest (DN)</span>
+        </div>
+        <div class="imp-stat">
+          <span class="imp-stat-value" id="stat-longest">—</span>
+          <span class="imp-stat-label">Longest (ms)</span>
+        </div>
+      </div>
+
+      <div id="load-msg">Loading…</div>
+      <div class="impact-grid" id="grid" style="display:none"></div>
+
+    </div>
+  </main>
+
+  <script>
+    function fmtTime(utcStr) {
+      if (!utcStr) return '—';
+      // "2025-08-05T03:47:22Z" → "2025-08-05  03:47:22 UTC"
+      return utcStr.replace('T', '  ').replace('Z', ' UTC');
+    }
+
+    function fmtDuration(s) {
+      if (s == null) return '—';
+      const ms = Math.round(s * 1000);
+      return ms + ' ms';
+    }
+
+    function buildCard(ev) {
+      const card = document.createElement('div');
+      card.className = 'impact-card';
+
+      const thumbWrap = document.createElement('div');
+      thumbWrap.className = 'impact-thumb-wrap';
+
+      const badge = document.createElement('span');
+      badge.className = 'impact-badge';
+      badge.textContent = 'IMPACT';
+      thumbWrap.appendChild(badge);
+
+      if (ev.thumb_path) {
+        const img = document.createElement('img');
+        img.src = `/api/impact/thumb/${ev.id}`;
+        img.alt = 'Impact thumbnail';
+        img.loading = 'lazy';
+        thumbWrap.appendChild(img);
+      } else {
+        const noThumb = document.createElement('div');
+        noThumb.className = 'no-thumb';
+        noThumb.textContent = 'No thumbnail';
+        thumbWrap.appendChild(noThumb);
+      }
+      card.appendChild(thumbWrap);
+
+      const body = document.createElement('div');
+      body.className = 'impact-body';
+
+      const session = document.createElement('div');
+      session.className = 'impact-session';
+      session.textContent = ev.session_name || '—';
+      session.title = ev.session_name || '';
+      body.appendChild(session);
+
+      const time = document.createElement('div');
+      time.className = 'impact-time';
+      time.textContent = fmtTime(ev.frame_utc_start) || ('Detected ' + (ev.detected_at || '').slice(0, 16));
+      body.appendChild(time);
+
+      const metrics = document.createElement('div');
+      metrics.className = 'impact-metrics';
+
+      const dur = document.createElement('span');
+      dur.className = 'impact-metric';
+      dur.innerHTML = `Duration: <strong>${fmtDuration(ev.duration_s)}</strong>`;
+      metrics.appendChild(dur);
+
+      if (ev.peak_diff != null) {
+        const pk = document.createElement('span');
+        pk.className = 'impact-metric';
+        pk.innerHTML = `Peak: <strong>${Math.round(ev.peak_diff)} DN</strong>`;
+        metrics.appendChild(pk);
+      }
+
+      body.appendChild(metrics);
+      card.appendChild(body);
+
+      if (ev.clip_path) {
+        const vw = document.createElement('div');
+        vw.className = 'impact-video-wrap';
+        const video = document.createElement('video');
+        video.controls = true;
+        video.preload = 'none';
+        video.src = `/api/impact/clip/${ev.id}`;
+        vw.appendChild(video);
+        card.appendChild(vw);
+      }
+
+      return card;
+    }
+
+    async function load() {
+      const loadMsg = document.getElementById('load-msg');
+      const grid    = document.getElementById('grid');
+      const statsBar = document.getElementById('stats-bar');
+
+      try {
+        const resp = await fetch('/api/impacts');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const events = await resp.json();
+
+        loadMsg.style.display = 'none';
+
+        if (!events.length) {
+          loadMsg.style.display = '';
+          loadMsg.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">☽</div>
+              <h2>No impacts detected yet</h2>
+              <p>Run transit detection on lunar videos. The dark-side flash
+                 scanner activates automatically whenever the unilluminated
+                 limb is visible.</p>
+            </div>`;
+          return;
+        }
+
+        // Stats
+        const sessions = new Set(events.map(e => e.session_name)).size;
+        const brightest = Math.round(Math.max(...events.map(e => e.peak_diff || 0)));
+        const longestMs = Math.round(Math.max(...events.map(e => (e.duration_s || 0) * 1000)));
+        document.getElementById('stat-total').textContent    = events.length;
+        document.getElementById('stat-sessions').textContent = sessions;
+        document.getElementById('stat-brightest').textContent = brightest;
+        document.getElementById('stat-longest').textContent   = longestMs + ' ms';
+        statsBar.style.display = '';
+
+        // Cards
+        grid.style.display = '';
+        for (const ev of events) {
+          grid.appendChild(buildCard(ev));
+        }
+
+      } catch (err) {
+        loadMsg.textContent = 'Failed to load impacts: ' + err.message;
+      }
+    }
+
+    load();
+  </script>
+
+</body>
+</html>

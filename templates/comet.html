@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Comet Wizard — Seestar Lab</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link active" href="/comet">Comet</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="comet-wizard">
+
+    <!-- ── Comet hero ──────────────────────────────────────────────────── -->
+    <div class="comet-hero" aria-hidden="true">
+      <svg class="comet-svg" viewBox="0 0 420 120" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <radialGradient id="comaGrad" cx="85%" cy="50%" r="55%">
+            <stop offset="0%"   stop-color="#a8f0ff" stop-opacity="0.95"/>
+            <stop offset="40%"  stop-color="#4ecdc4" stop-opacity="0.6"/>
+            <stop offset="100%" stop-color="#1a6b6b" stop-opacity="0"/>
+          </radialGradient>
+          <radialGradient id="nucleusGrad" cx="40%" cy="35%" r="60%">
+            <stop offset="0%"   stop-color="#ffffff"/>
+            <stop offset="50%"  stop-color="#c8f8ff"/>
+            <stop offset="100%" stop-color="#4ecdc4"/>
+          </radialGradient>
+          <filter id="glow">
+            <feGaussianBlur stdDeviation="3.5" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+          <filter id="soften">
+            <feGaussianBlur stdDeviation="1.5"/>
+          </filter>
+        </defs>
+
+        <!-- Ion tail (narrow, straight, blue-white) -->
+        <path d="M 338 60 Q 180 54 10 42" stroke="#a8f0ff" stroke-width="1.2"
+              fill="none" stroke-opacity="0.55" stroke-linecap="round"/>
+        <path d="M 338 60 Q 170 57 8 52" stroke="#c8f8ff" stroke-width="0.6"
+              fill="none" stroke-opacity="0.35" stroke-linecap="round"/>
+
+        <!-- Dust tail (broader, curved, warm tint) -->
+        <path d="M 335 63 Q 200 80 30 108" stroke="#ffe8a0" stroke-width="2.5"
+              fill="none" stroke-opacity="0.22" stroke-linecap="round"/>
+        <path d="M 334 62 Q 210 74 55 100" stroke="#ffd060" stroke-width="1.5"
+              fill="none" stroke-opacity="0.18" stroke-linecap="round"/>
+
+        <!-- Coma (fuzzy glow around nucleus) -->
+        <ellipse cx="348" cy="60" rx="48" ry="38" fill="url(#comaGrad)" filter="url(#soften)"/>
+
+        <!-- Nucleus -->
+        <circle cx="350" cy="60" r="9" fill="url(#nucleusGrad)" filter="url(#glow)"/>
+
+        <!-- Star field -->
+        <g fill="#ffffff" opacity="0.7">
+          <circle cx="30"  cy="20"  r="0.8"/>
+          <circle cx="80"  cy="95"  r="1.0"/>
+          <circle cx="130" cy="30"  r="0.6"/>
+          <circle cx="160" cy="80"  r="0.9"/>
+          <circle cx="220" cy="15"  r="0.7"/>
+          <circle cx="260" cy="100" r="0.8"/>
+          <circle cx="290" cy="38"  r="1.1"/>
+          <circle cx="55"  cy="70"  r="0.5"/>
+          <circle cx="190" cy="95"  r="0.6"/>
+          <circle cx="310" cy="90"  r="0.7"/>
+        </g>
+      </svg>
+      <div class="comet-hero-label">
+        <span class="comet-hero-title">Comet Wizard</span>
+        <span class="comet-hero-sub">animation · nucleus tracking · frame review</span>
+      </div>
+    </div>
+
+    <!-- ── Step indicator ──────────────────────────────────────────────── -->
+    <div class="wizard-steps">
+      <div class="wizard-step active" id="step-dot-1">
+        <div class="step-circle">1</div>
+        <div class="step-label">Select Subs</div>
+      </div>
+      <div class="wizard-connector"></div>
+      <div class="wizard-step" id="step-dot-2">
+        <div class="step-circle">2</div>
+        <div class="step-label">Parameters</div>
+      </div>
+      <div class="wizard-connector"></div>
+      <div class="wizard-step" id="step-dot-3">
+        <div class="step-circle">3</div>
+        <div class="step-label">Render</div>
+      </div>
+    </div>
+
+    <!-- ── Step 1: Sub selection ───────────────────────────────────────── -->
+    <section class="wizard-section active" id="step-1">
+      <h2 class="section-title">Step 1 — Select Subs</h2>
+
+      <!-- Comet discovery browser -->
+      <div class="discover-bar">
+        <input id="discover-root" class="dir-input discover-root-input" type="text"
+               placeholder="{{ data_dir }}"
+               value="{{ data_dir }}" />
+        <button class="btn btn-sm" id="discover-btn">Find comets</button>
+      </div>
+      <div class="comet-picker" id="comet-picker" style="display:none;"></div>
+
+      <!-- Manual directory + scan -->
+      <div class="dir-row">
+        <input id="comet-dir" class="dir-input" type="text"
+               placeholder="select a comet above, or type a path" />
+        <button class="btn btn-primary" id="scan-btn">Scan</button>
+      </div>
+
+      <div id="scan-status" class="scan-status" style="display:none;"></div>
+
+      <!-- Bulk controls (hidden until scan completes) -->
+      <div class="bulk-controls" id="bulk-controls" style="display:none;">
+        <button class="btn btn-sm" id="keep-all-btn">Keep All</button>
+        <button class="btn btn-sm" id="reject-all-btn">Reject All</button>
+        <span class="bulk-hint">Shift+click to select a range</span>
+        <span class="bulk-summary" id="bulk-summary"></span>
+      </div>
+
+      <!-- Session filter bar (rendered by JS) -->
+      <div class="session-bar" id="session-bar" style="display:none;"></div>
+
+      <!-- Thumbnail grid -->
+      <div class="comet-thumb-grid" id="thumb-grid"></div>
+
+      <div class="wizard-nav">
+        <span></span>
+        <button class="btn btn-primary" id="to-step-2" disabled>
+          Parameters →
+        </button>
+      </div>
+    </section>
+
+    <!-- ── Step 2: Parameters ──────────────────────────────────────────── -->
+    <section class="wizard-section" id="step-2">
+      <h2 class="section-title">Step 2 — Animation Parameters</h2>
+
+      <div class="param-grid">
+
+        <div class="param-row">
+          <label class="param-label" for="p-fps">Frame rate (FPS)</label>
+          <input class="param-range" type="range" id="p-fps"
+                 min="5" max="30" step="1" value="10" />
+          <span class="param-val" id="p-fps-val">10</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-gamma">Stretch gamma</label>
+          <input class="param-range" type="range" id="p-gamma"
+                 min="0.2" max="1.0" step="0.05" value="0.5" />
+          <span class="param-val" id="p-gamma-val">0.50</span>
+          <span class="param-hint">lower = brighter coma/tail</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-crop">Nucleus crop (px)</label>
+          <input class="param-range" type="range" id="p-crop"
+                 min="200" max="1200" step="50" value="700" />
+          <span class="param-val" id="p-crop-val">700</span>
+          <span class="param-hint">width of comet-fixed window</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-maxframes">Max frames</label>
+          <input class="param-range" type="range" id="p-maxframes"
+                 min="20" max="500" step="10" value="300" />
+          <span class="param-val" id="p-maxframes-val">300</span>
+          <span class="param-hint">subsample if more subs than this</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-sky">Sky background (%ile)</label>
+          <input class="param-range" type="range" id="p-sky"
+                 min="5" max="40" step="1" value="25" />
+          <span class="param-val" id="p-sky-val">25</span>
+          <span class="param-hint">lower keeps more sky flux</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-high">White point (%ile)</label>
+          <input class="param-range" type="range" id="p-high"
+                 min="99.0" max="100.0" step="0.1" value="99.8" />
+          <span class="param-val" id="p-high-val">99.8</span>
+          <span class="param-hint">lower = brighter overall</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-noise">Noise reduction</label>
+          <input class="param-range" type="range" id="p-noise"
+                 min="0" max="5" step="1" value="0" />
+          <span class="param-val" id="p-noise-val">0</span>
+          <span class="param-hint">bilateral filter strength (0 = off)</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-width">Output width</label>
+          <select class="param-select" id="p-width">
+            <option value="720">720 px — fast preview</option>
+            <option value="1080" selected>1080 px — HD (default)</option>
+            <option value="1440">1440 px — QHD</option>
+            <option value="2160">2160 px — 4K</option>
+          </select>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-maxgap">Gap cap</label>
+          <select class="param-select" id="p-maxgap">
+            <option value="2">2× median — tight pacing</option>
+            <option value="4" selected>4× median — default</option>
+            <option value="8">8× median — relaxed</option>
+            <option value="0">None — exact proportions</option>
+          </select>
+          <span class="param-hint">max pause length at timeline gaps</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-redetect">Re-detect nucleus</label>
+          <input type="checkbox" id="p-redetect" />
+          <span class="param-hint">re-run nucleus detection, keep cached star alignment</span>
+        </div>
+
+        <div class="param-row">
+          <label class="param-label" for="p-nocache">Force re-align</label>
+          <input type="checkbox" id="p-nocache" />
+          <span class="param-hint">ignore cached star alignment (slow)</span>
+        </div>
+
+      </div>
+
+      <!-- Live preview -->
+      <div class="preview-pane" id="preview-pane" style="display:none;">
+        <div class="preview-header">
+          <span class="preview-label">Reference frame preview</span>
+          <span class="preview-spinner" id="preview-spinner" style="display:none;">Updating…</span>
+        </div>
+        <img class="preview-img" id="preview-img" alt="preview" />
+      </div>
+
+      <div class="wizard-nav">
+        <button class="btn btn-secondary" id="back-to-1">← Back</button>
+        <button class="btn btn-primary" id="to-step-3">Render →</button>
+      </div>
+    </section>
+
+    <!-- ── Step 3: Render ─────────────────────────────────────────────── -->
+    <section class="wizard-section" id="step-3">
+      <h2 class="section-title">Step 3 — Render</h2>
+
+      <div class="render-summary" id="render-summary"></div>
+
+      <!-- Progress bar -->
+      <div class="progress-bar-wrap" id="render-progress-wrap" style="display:none;">
+        <div class="progress-bar-fill" id="render-progress-fill" style="width:0%"></div>
+      </div>
+      <div class="render-status-row">
+        <div class="render-message" id="render-message"></div>
+        <div class="render-elapsed" id="render-elapsed" style="display:none;"></div>
+      </div>
+
+      <!-- Log console -->
+      <div class="render-log-wrap" id="render-log-wrap" style="display:none;">
+        <pre class="render-log" id="render-log"></pre>
+      </div>
+
+      <!-- Results (shown when done) -->
+      <div class="render-results" id="render-results" style="display:none;">
+        <h3 class="results-title">Done!</h3>
+        <div class="result-links" id="result-links"></div>
+      </div>
+
+      <div class="wizard-nav">
+        <button class="btn btn-secondary" id="back-to-2">← Back</button>
+        <button class="btn btn-danger" id="cancel-render-btn" style="display:none;">
+          Cancel
+        </button>
+        <button class="btn btn-primary" id="start-render-btn">
+          ▶ Start Render
+        </button>
+        <a class="btn btn-accent" id="view-results-btn" href="#" target="_blank"
+           style="display:none;">
+          View Results →
+        </a>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/js/comet_wizard.js"></script>
+</body>
+</html>
