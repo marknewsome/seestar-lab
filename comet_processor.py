@@ -84,9 +84,12 @@ Pass 2 — Nucleus detection
   detected pixel position is transformed into reference-frame coordinates.
 
   Detection algorithm (_find_nucleus_in_frame):
-    1. Restrict the search to a circular region of radius ~40 % of frame size
-       around either the user hint offset or the previous frame's result
-       (rolling hint), or the frame centre for the first frame.
+    1. Restrict the search to a circular region around a hint position:
+         • User hint provided → radius 120 px (tight; user has identified the
+           nucleus location, so a wide search would only risk picking up a
+           nearby bright star instead).
+         • Rolling hint (previous frame's detection) → radius ~40 % of frame.
+         • No hint (first frame, auto-detect) → radius ~40 % of frame.
     2. Subtract a large-σ Gaussian (σ=60 px) background estimate from the
        search region to remove the sky gradient and sensor amp glow.
     3. Compute a diffuseness score:  large_blur² / (small_blur + ε)
@@ -104,7 +107,9 @@ Pass 2 — Nucleus detection
     centre and applied uniformly to every frame's search origin.  This works
     because the Seestar re-centres on the comet each session, so the nucleus
     is always near raw-frame centre; a fixed offset from centre is the right
-    model for correcting systematic detection error.
+    model for correcting systematic detection error.  The tight 120-px search
+    radius when a hint is active prevents a nearby bright star from outscoring
+    the coma even if it has a higher diffuseness value.
 
   Position smoothing:
     Raw centroid detections jitter a few pixels frame-to-frame due to seeing
