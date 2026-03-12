@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Seestar Lab — Astro Club Presentation</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <style>
+    :root {
+      --accent:   #6ee7b7;
+      --accent2:  #67e8f9;
+      --warn:     #fcd34d;
+      --dim:      #94a3b8;
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --border:   #30363d;
+    }
+
+    .reveal { font-family: 'Segoe UI', system-ui, sans-serif; }
+
+    /* Override reveal black theme bg */
+    .reveal-viewport { background: var(--bg); }
+    .reveal .slides section { text-align: left; }
+
+    /* Title slide centred */
+    .reveal .slides section.title-slide { text-align: center; }
+
+    h1, h2, h3 { font-weight: 700; letter-spacing: -0.01em; }
+
+    .reveal h1 { font-size: 2.2em; color: var(--accent); }
+    .reveal h2 { font-size: 1.5em; color: var(--accent2); border-bottom: 1px solid var(--border);
+                 padding-bottom: 0.3em; margin-bottom: 0.6em; }
+    .reveal h3 { font-size: 1.1em; color: var(--warn); margin-bottom: 0.3em; }
+
+    .reveal p, .reveal li { font-size: 0.82em; color: #e2e8f0; line-height: 1.6; }
+    .reveal ul { margin-left: 1.2em; }
+    .reveal li { margin-bottom: 0.3em; }
+
+    .reveal .subtitle { font-size: 1em; color: var(--dim); margin-top: 0.5em; }
+    .reveal .byline   { font-size: 0.7em; color: #4b5563; margin-top: 2em; }
+
+    /* Two-column layout */
+    .cols { display: grid; gap: 2em; }
+    .cols-2 { grid-template-columns: 1fr 1fr; }
+    .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+
+    /* Output / feature cards */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.8em 1em;
+    }
+    .card h3 { margin-bottom: 0.4em; }
+    .card p  { margin: 0; color: var(--dim); font-size: 0.75em; }
+
+    /* Pipeline step badges */
+    .pass {
+      display: inline-block;
+      background: #1e3a2f;
+      color: var(--accent);
+      border: 1px solid #2d6a4f;
+      border-radius: 4px;
+      padding: 0.1em 0.5em;
+      font-size: 0.65em;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      vertical-align: middle;
+      margin-right: 0.4em;
+    }
+    .pass.p2 { background: #1e2a3a; color: var(--accent2); border-color: #2d4a6a; }
+    .pass.p3 { background: #2a1e3a; color: #c4b5fd; border-color: #5b3d8a; }
+    .pass.p4 { background: #3a1e1e; color: #fca5a5; border-color: #8a3d3d; }
+    .pass.p5 { background: #3a2a1e; color: var(--warn); border-color: #8a6a3d; }
+
+    /* Highlight box */
+    .hl {
+      background: #1a2e24;
+      border-left: 3px solid var(--accent);
+      padding: 0.6em 1em;
+      border-radius: 0 6px 6px 0;
+      margin: 0.6em 0;
+      font-size: 0.78em;
+      color: #d1fae5;
+    }
+    .hl.blue  { background: #1a2535; border-color: var(--accent2); color: #e0f2fe; }
+    .hl.amber { background: #2a2014; border-color: var(--warn);    color: #fef3c7; }
+
+    /* Code-like mono text */
+    .mono { font-family: 'Cascadia Code', 'Fira Code', monospace; color: var(--warn);
+            font-size: 0.85em; }
+
+    /* Comet icon decoration */
+    .comet-icon { font-size: 3em; display: block; margin-bottom: 0.2em; }
+
+    /* Step flow diagram */
+    .steps { display: flex; align-items: center; gap: 0.4em; flex-wrap: wrap; margin: 0.8em 0; }
+    .step  {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.5em 0.9em;
+      font-size: 0.72em;
+      color: #e2e8f0;
+      text-align: center;
+    }
+    .step strong { display: block; color: var(--accent2); font-size: 1.1em; }
+    .step-arrow { color: var(--dim); font-size: 1.2em; }
+
+    /* Muted footer on slides */
+    .slide-footer { position: absolute; bottom: 0.6em; right: 1em;
+                    font-size: 0.5em; color: #374151; }
+
+    .dim { color: var(--dim); }
+    .accent  { color: var(--accent); }
+    .accent2 { color: var(--accent2); }
+    .warn    { color: var(--warn); }
+
+    /* Bigger emoji icons inline */
+    .icon { font-size: 1.3em; vertical-align: middle; margin-right: 0.3em; }
+  </style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+
+<!-- ─── 1. TITLE ─────────────────────────────────────────────────────────── -->
+<section class="title-slide">
+  <span class="comet-icon">☄</span>
+  <h1>Seestar Lab</h1>
+  <p class="subtitle">A browser-based companion for comet imaging<br>with the ZWO Seestar S50</p>
+  <p class="byline">Astro Club · 2026</p>
+</section>
+
+
+<!-- ─── 2. THE PROBLEM ───────────────────────────────────────────────────── -->
+<section>
+  <h2>The Challenge</h2>
+  <div class="cols cols-2">
+    <div>
+      <h3>What the Seestar gives you</h3>
+      <ul>
+        <li>Hundreds of individual <span class="mono">.fit</span> stacks per session</li>
+        <li>Typically 1–10 subs each, taken over days or weeks</li>
+        <li>No built-in workflow for combining comet sessions</li>
+        <li>Comet moves between sessions — can't simply stack</li>
+      </ul>
+    </div>
+    <div>
+      <h3>What you really want</h3>
+      <ul>
+        <li>Stars-fixed animation showing comet's sky motion</li>
+        <li>Nucleus-fixed animation showing coma evolution</li>
+        <li>Deep stack locked to the nucleus</li>
+        <li>Larson–Sekanina filter revealing jets &amp; shells</li>
+        <li>A <em>portrait</em> image with tail oriented correctly</li>
+      </ul>
+    </div>
+  </div>
+  <div class="hl amber" style="margin-top:1em">
+    Seestar Lab automates the entire pipeline from raw <span class="mono">.fit</span> files
+    to publication-ready animations and stacks — in a single web UI.
+  </div>
+</section>
+
+
+<!-- ─── 3. WHAT IS SEESTAR LAB ───────────────────────────────────────────── -->
+<section>
+  <h2>What is Seestar Lab?</h2>
+  <div class="cols cols-2">
+    <div>
+      <ul>
+        <li>Local Flask web app — runs on your PC, opens in any browser</li>
+        <li>Points at your Seestar data directory and auto-scans sessions</li>
+        <li>Messier &amp; Caldwell catalog matching</li>
+        <li>Transit and impact event detection</li>
+        <li class="accent"><strong>Comet Wizard</strong> — the star of the show</li>
+      </ul>
+      <div class="hl" style="margin-top:1em">
+        No cloud, no subscription, no upload.<br>
+        Your data stays on your machine.
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:0.7em">
+        <h3>✦ Sessions</h3>
+        <p>Browse every night's data, view thumbnails, filter by object or date</p>
+      </div>
+      <div class="card" style="margin-bottom:0.7em">
+        <h3>🔭 Catalog</h3>
+        <p>Auto-matched to Messier / Caldwell with completion tracking</p>
+      </div>
+      <div class="card">
+        <h3>☄ Comet Wizard</h3>
+        <p>End-to-end comet animation pipeline with interactive frame review</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 4. COMET WIZARD OVERVIEW ─────────────────────────────────────────── -->
+<section>
+  <h2>The Comet Wizard — Three Steps</h2>
+  <div class="steps">
+    <div class="step">
+      <strong>① Select Subs</strong>
+      Choose a directory of <span class="mono">.fit</span> files
+    </div>
+    <span class="step-arrow">→</span>
+    <div class="step">
+      <strong>② Parameters</strong>
+      FPS · gamma · crop · noise reduction
+    </div>
+    <span class="step-arrow">→</span>
+    <div class="step">
+      <strong>③ Render</strong>
+      Watch progress · review frames · fix nucleus
+    </div>
+  </div>
+  <div class="cols cols-2" style="margin-top:0.8em">
+    <div>
+      <h3>Smart caching</h3>
+      <p>Star alignment results are saved to <span class="mono">comet_alignment.json</span>.
+      Subsequent re-renders (different stretch, different crop) reuse the alignment —
+      skipping the slowest step entirely.</p>
+    </div>
+    <div>
+      <h3>Re-render without re-aligning</h3>
+      <p>Adjust gamma, crop, or noise reduction and re-render in seconds.
+      Even nucleus corrections use the cached star transforms.</p>
+    </div>
+  </div>
+  <div class="hl blue" style="margin-top:0.8em">
+    Typical first render on 186 frames: ~4 minutes.<br>
+    Re-render with different parameters: ~30 seconds.
+  </div>
+</section>
+
+
+<!-- ─── 5. PASS 1 — STAR ALIGNMENT ───────────────────────────────────────── -->
+<section>
+  <h2>Pipeline — Pass 1: Star Alignment</h2>
+  <span class="pass">PASS 1</span><span style="font-size:0.8em; color:var(--dim)">every frame → reference frame similarity transform</span>
+  <div class="cols cols-2" style="margin-top:0.8em">
+    <div>
+      <h3>Two-stage approach</h3>
+      <ul>
+        <li><strong class="accent">Primary:</strong> <span class="mono">astroalign</span> — triangle-invariant hashing + RANSAC. Robust even with 30 % field overlap between sessions.</li>
+        <li><strong class="accent">Fallback:</strong> OpenCV ORB features (2,000 BRIEF descriptors) with affine-partial RANSAC. Catches frames where astroalign finds too few triangles.</li>
+        <li>Unaligned frames are flagged (not dropped) — still usable for nucleus tracking</li>
+      </ul>
+    </div>
+    <div>
+      <h3>What the transform captures</h3>
+      <div class="card" style="margin-bottom:0.5em">
+        <h3>Translation</h3>
+        <p>Seestar re-points slightly between sessions</p>
+      </div>
+      <div class="card" style="margin-bottom:0.5em">
+        <h3>Rotation</h3>
+        <p>Camera angle varies with alt/az mount</p>
+      </div>
+      <div class="card">
+        <h3>Scale</h3>
+        <p>Minor plate-scale variation between nights</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 6. PASS 2 — NUCLEUS DETECTION ────────────────────────────────────── -->
+<section>
+  <h2>Pipeline — Pass 2: Nucleus Detection</h2>
+  <span class="pass p2">PASS 2</span><span style="font-size:0.8em; color:var(--dim)">locate the comet head in every frame</span>
+  <div class="cols cols-2" style="margin-top:0.8em">
+    <div>
+      <h3>The diffuseness score</h3>
+      <p>Stars are <em>sharp</em>. Comae are <em>fuzzy</em>.</p>
+      <div class="hl" style="font-family:monospace; font-size:0.9em; text-align:center; padding:0.8em">
+        score = large_blur² ÷ (small_blur + ε)
+      </div>
+      <p>σ=25 px blurs retain the coma; σ=4 px blurs retain stars.
+      The ratio rewards extended fuzzy blobs and penalises point sources.</p>
+      <p>Sub-pixel centroid within a 40 px window around the peak reduces per-frame jitter.</p>
+    </div>
+    <div>
+      <h3>User correction</h3>
+      <ul>
+        <li>Auto-detection can land on a nearby bright star</li>
+        <li>Click the actual nucleus in the frame browser → hint saved to JSON</li>
+        <li>Re-render uses a <strong class="warn">120 px tight search radius</strong> around the hint — nearby stars can't steal the detection</li>
+        <li>Gaussian temporal smoothing (σ = 3 frames) removes remaining jitter</li>
+      </ul>
+      <div class="hl amber">
+        The hint is a fractional canvas coordinate — it works correctly even when frames are different sizes or shifted between sessions.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 7. STARS-FIXED ANIMATION ─────────────────────────────────────────── -->
+<section>
+  <h2>Output 1 — Stars-Fixed Animation</h2>
+  <span class="pass p3">PASS 3</span><span style="font-size:0.8em; color:var(--dim)">union canvas · fill composite · blend</span>
+  <div class="cols cols-2" style="margin-top:0.8em">
+    <div>
+      <ul>
+        <li>All frames warped onto a <strong>union canvas</strong> large enough to hold every aligned frame</li>
+        <li>Regions not covered by a given frame are filled from a <strong>mean composite</strong> of all frames — no black borders</li>
+        <li>Blend: <span class="mono">pixel = frame × α + composite × (1−α)</span></li>
+        <li>VFR (variable frame rate) pacing — real timestamp gaps are preserved, so you <em>feel</em> cloud gaps and multi-night jumps</li>
+      </ul>
+    </div>
+    <div>
+      <div class="hl">
+        <strong>What you see:</strong> Stars hold rock-steady. The comet nucleus drifts steadily across the field over days or weeks — its real motion across the sky made visible.
+      </div>
+      <div class="hl blue" style="margin-top:0.6em">
+        <strong>Great for:</strong> Showing the comet's speed, direction, and any trajectory changes. Striking for audiences.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 8. NUCLEUS-FIXED ANIMATION ───────────────────────────────────────── -->
+<section>
+  <h2>Output 2 — Nucleus-Fixed Animation</h2>
+  <span class="pass p4">PASS 4</span><span style="font-size:0.8em; color:var(--dim)">nucleus re-centred · deep stack · trail removal</span>
+  <div class="cols cols-2" style="margin-top:0.8em">
+    <div>
+      <ul>
+        <li>A <strong>composite transform</strong> applies both star-alignment and nucleus re-centring in a single warp</li>
+        <li>Result: nucleus locked to the same pixel in every frame; background stars trail behind it</li>
+        <li>Satellite and aircraft trail pixels are detected and removed before stacking</li>
+        <li>Sky background subtracted per-frame using only covered pixels</li>
+      </ul>
+    </div>
+    <div>
+      <div class="hl">
+        <strong>What you see:</strong> The comet head stays fixed. Stars draw arcs behind it. Coma structure, brightness changes, and tail development are easy to compare frame-to-frame.
+      </div>
+      <div class="hl blue" style="margin-top:0.6em">
+        <strong>Great for:</strong> Coma morphology, brightness evolution, jet activity. The deep stack from this pass rivals multi-hour dedicated imaging.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 9. STACKS & SPECIAL OUTPUTS ──────────────────────────────────────── -->
+<section>
+  <h2>Additional Outputs</h2>
+  <div class="cols cols-3">
+    <div class="card">
+      <h3>🖼 Deep Stack</h3>
+      <p>Mean composite of nucleus-aligned frames. Satellite trails removed. Shows faint tail structure invisible in single frames.</p>
+    </div>
+    <div class="card">
+      <h3>🔬 Larson–Sekanina</h3>
+      <p>Rotational-gradient filter (image minus rotated copy). Cancels the smooth coma gradient, revealing jets, shells, and asymmetric structures.</p>
+    </div>
+    <div class="card">
+      <h3>🎨 Portrait</h3>
+      <p>Auto-cropped and auto-oriented: tail points upward, nucleus sits at lower-centre third. Comet name and date range overlaid.</p>
+    </div>
+  </div>
+  <div class="cols cols-2" style="margin-top:0.8em">
+    <div class="card">
+      <h3>📍 Track Composite</h3>
+      <p>Reference frame with the smoothed nucleus trajectory drawn as a colour-graduated polyline — early frames blue, late frames red.</p>
+    </div>
+    <div class="card">
+      <h3>🎞 Frame Browser</h3>
+      <p>All 186 annotated frames browsable in the UI. Click to reject cloud-out or satellite-ruined frames. Changes take effect on the next re-render.</p>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 10. DISPLAY STRETCH ───────────────────────────────────────────────── -->
+<section>
+  <h2>Display Stretch Pipeline</h2>
+  <p class="dim" style="margin-bottom:0.8em">Applied to every output frame — tunable via the Parameters page</p>
+  <div class="steps">
+    <div class="step"><strong>Sky subtract</strong>25th percentile per channel</div>
+    <span class="step-arrow">→</span>
+    <div class="step"><strong>Normalise</strong>99.8th percentile luminance = 1.0</div>
+    <span class="step-arrow">→</span>
+    <div class="step"><strong>Gamma</strong>output = input ^ γ<br><span class="dim">(default γ = 0.5)</span></div>
+    <span class="step-arrow">→</span>
+    <div class="step"><strong>Clip</strong>[0, 1]</div>
+    <span class="step-arrow">→</span>
+    <div class="step"><strong>Noise reduce</strong>optional median filter</div>
+  </div>
+  <div class="cols cols-2" style="margin-top:0.8em">
+    <div>
+      <h3>Key controls</h3>
+      <ul>
+        <li><strong class="accent">Gamma (γ):</strong> &lt;1 boosts faint coma and tail, &gt;1 suppresses background noise</li>
+        <li><strong class="accent">Sky %:</strong> sets the background zero-point (raise for bright skies)</li>
+        <li><strong class="accent">White %:</strong> controls highlight clipping (lower = brighter result)</li>
+        <li><strong class="accent">Width:</strong> output pixel width (640–1920 px)</li>
+      </ul>
+    </div>
+    <div>
+      <div class="hl amber">
+        All parameters are saved between sessions — re-opening the same comet directory restores your last settings automatically.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 11. FRAME REVIEW WORKFLOW ─────────────────────────────────────────── -->
+<section>
+  <h2>Frame Review Workflow</h2>
+  <div class="cols cols-2">
+    <div>
+      <h3>What you can do</h3>
+      <ul>
+        <li><strong class="accent2">Browse</strong> — scroll the thumbnail strip; click any frame to view full-size</li>
+        <li><strong class="accent2">Reject</strong> — click a frame to flag it; rejected frames are excluded from the render but kept in the strip so you can restore them</li>
+        <li><strong class="accent2">Fix nucleus</strong> — click "⊕ Fix Nucleus" then click the actual comet head in the image; the hint is saved and used on the next re-render</li>
+      </ul>
+    </div>
+    <div>
+      <div class="hl" style="margin-bottom:0.6em">
+        <strong>Nucleus correction is persistent.</strong> The hint is stored in <span class="mono">comet_alignment.json</span> alongside the frame transforms — it survives page reloads and is automatically restored when you reopen the directory.
+      </div>
+      <div class="hl blue">
+        <strong>Re-render is fast.</strong> Hitting "Re-render →" after fixing the nucleus skips all star-alignment work and only re-runs nucleus detection and rendering — typically under a minute.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 12. TECH STACK ────────────────────────────────────────────────────── -->
+<section>
+  <h2>Under the Hood</h2>
+  <div class="cols cols-3">
+    <div class="card">
+      <h3>🐍 Python backend</h3>
+      <p>Flask · NumPy · OpenCV · astroalign · Astropy FITS · scikit-image · FFmpeg</p>
+    </div>
+    <div class="card">
+      <h3>🌐 Browser frontend</h3>
+      <p>Vanilla JS · no frameworks · dark CSS design system · real-time log streaming via SSE</p>
+    </div>
+    <div class="card">
+      <h3>🗄 Persistence</h3>
+      <p>SQLite for session catalogue · JSON cache per comet directory · no external services</p>
+    </div>
+  </div>
+  <div class="hl" style="margin-top:0.8em">
+    The processor runs as a subprocess — the UI stays responsive during long renders and can poll progress, show live logs, and survive a browser refresh mid-render.
+  </div>
+  <div class="cols cols-2" style="margin-top:0.6em">
+    <div>
+      <h3>FITS compatibility</h3>
+      <p>Bayer mono subs (auto-debayered) · pre-debayered stacks · BZERO/BSCALE · Seestar filename sub-count parsing</p>
+    </div>
+    <div>
+      <h3>VFR video output</h3>
+      <p>Frame durations proportional to real capture timestamps — a 3-day cloud gap plays slightly faster, making the time axis honest.</p>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 13. EXAMPLE RESULTS ───────────────────────────────────────────────── -->
+<section>
+  <h2>Example — C/2025 A6 (Lemmon)</h2>
+  <div class="cols cols-2">
+    <div>
+      <ul>
+        <li><strong class="accent">186 frames</strong> spanning Oct 29 – 30, 2025</li>
+        <li>1 sub × 10 s per frame</li>
+        <li>Full pipeline: ~4 minutes first run</li>
+        <li>Re-render after nucleus correction: ~35 seconds</li>
+      </ul>
+      <div class="hl" style="margin-top:0.8em">
+        Stars-fixed: clear motion of comet heading NNW across 2 degrees of sky in ~24 hours
+      </div>
+      <div class="hl blue" style="margin-top:0.5em">
+        Nucleus-fixed: brightening coma and elongating ion tail visible frame-to-frame
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:0.5em">
+        <h3>Challenge</h3>
+        <p>Bright field star within 80 px of nucleus — auto-detection landed on the star.</p>
+      </div>
+      <div class="card">
+        <h3>Solution</h3>
+        <p>Clicked the actual nucleus in the frame browser. Re-render with 120 px tight search radius locked onto the coma correctly for all 186 frames.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 14. LIVE DEMO ─────────────────────────────────────────────────────── -->
+<section class="title-slide">
+  <span class="comet-icon">🖥</span>
+  <h1 style="color: var(--accent2);">Live Demo</h1>
+  <p class="subtitle" style="margin-top:0.5em">
+    C/2025 A6 (Lemmon) · Oct 2025<br>
+    <span class="dim">186 frames · Comet Wizard · Frame review</span>
+  </p>
+  <div style="margin-top:1.5em; font-size:0.7em; color:#374151">
+    <span class="mono">localhost:5000/comet</span>
+  </div>
+</section>
+
+
+<!-- ─── 15. WHAT'S NEXT ────────────────────────────────────────────────────── -->
+<section>
+  <h2>Ideas &amp; Future Work</h2>
+  <div class="cols cols-2">
+    <div>
+      <h3>Planned improvements</h3>
+      <ul>
+        <li>Satellite trail inpainting in nucleus-fixed frames (not just stacks)</li>
+        <li>Edge pixel masking — zero out low-coverage border regions in the stars-fixed canvas</li>
+        <li>Ephemeris overlay — plot predicted vs detected nucleus track</li>
+        <li>Export to standard FITS format for further processing in PixInsight / Siril</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Community ideas welcome</h3>
+      <ul>
+        <li>Other telescope brands? (Dwarf III, Unistellar…)</li>
+        <li>Comet brightness lightcurve from frame photometry</li>
+        <li>Automatic coma size measurement over time</li>
+        <li>Batch processing multiple comets in one session</li>
+      </ul>
+      <div class="hl amber" style="margin-top:0.8em">
+        Open to feature requests and pull requests!
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 16. CLOSING ───────────────────────────────────────────────────────── -->
+<section class="title-slide">
+  <span class="comet-icon">☄</span>
+  <h1>Thank you</h1>
+  <p class="subtitle">Questions?</p>
+  <div style="margin-top:1.5em">
+    <p style="font-size:0.75em; color:var(--dim)">
+      Seestar Lab runs locally on Windows / macOS / Linux<br>
+      Python 3.11+ · Flask · OpenCV · astroalign
+    </p>
+  </div>
+</section>
+
+
+</div><!-- .slides -->
+</div><!-- .reveal -->
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>
+  Reveal.initialize({
+    hash:        true,
+    slideNumber: 'c/t',
+    transition:  'fade',
+    transitionSpeed: 'fast',
+    controls:    true,
+    progress:    true,
+    center:      false,
+    width:       1280,
+    height:      720,
+    margin:      0.06,
+  });
+</script>
+</body>
+</html>
