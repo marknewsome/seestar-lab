@@ -784,7 +784,7 @@ def api_image():
     path = request.args.get("path", "").strip()
     if not path or not os.path.isfile(path):
         abort(404)
-    ext = Path(path).suffix.lower()
+    ext = _Path(path).suffix.lower()
     if ext not in {".jpg", ".jpeg", ".png", ".tif", ".tiff"}:
         abort(400)
     try:
@@ -1768,4 +1768,4 @@ if __name__ == "__main__":
     # Kick off a differential scan right away; it will be fast if nothing changed.
     start_scan(force=False)
     print("Type 'x' + Enter to stop the server.")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
