@@ -1929,7 +1929,11 @@ main {
   max-height: 540px;
   object-fit: contain;
   display: block;
+  cursor: pointer;
+  transition: outline var(--transition);
+  outline: 2px solid transparent;
 }
+.frame-viewer-img:hover { outline-color: rgba(255,255,255,.12); }
 .nucleus-hint-marker {
   position: absolute;
   width: 22px;
@@ -2008,7 +2012,7 @@ main {
 /* Nucleus correction mode */
 .nucleus-correct-mode {
   cursor: crosshair !important;
-  outline: 2px solid #f59e0b;
+  outline: 2px solid #f59e0b !important;
 }
 
 /* Nucleus hint banner */

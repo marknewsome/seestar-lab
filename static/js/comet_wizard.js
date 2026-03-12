@@ -688,9 +688,7 @@ function showResults(outputs) {
       `<span id="fv-counter"></span>` +
       `<button class="btn btn-sm" id="fv-next">Next →</button>` +
       `<button class="btn btn-sm btn-warning" id="fv-fix-nucleus" title="Click the actual nucleus position on the image">` +
-        `⊕ Fix nucleus</button>` +
-      `<button class="btn btn-sm fv-reject-btn" id="fv-reject-frame" title="Exclude this frame from animations and stacks">` +
-        `✕ Reject</button>`;
+        `⊕ Fix nucleus</button>`;
 
     viewer.append(imgWrap, viewerCaption, viewerNav);
 
@@ -718,6 +716,7 @@ function showResults(outputs) {
 
   document.getElementById("rerender-btn")?.addEventListener("click", () => {
     $("render-results").style.display = "none";
+    $("p-redetect").checked = true;   // nucleus hint is set — always re-detect
     startRender();
   });
   document.getElementById("clear-hint-btn")?.addEventListener("click", () => {
@@ -796,8 +795,7 @@ function openFrameViewer(idx) {
   img.classList.remove("nucleus-correct-mode");
   const isRejected = state.frameRejections.has(idx);
   viewer.classList.toggle("frame-viewer-rejected", isRejected);
-  const rejLabel = isRejected ? "  ✕ REJECTED" : "";
-  caption.textContent = f.name.replace(/^frame_\d+\.jpg$/, `Frame ${idx + 1} of ${_frameList.length}`) + rejLabel;
+  caption.textContent = _frameCaption(idx);
   counter.textContent = `${idx + 1} / ${_frameList.length}`;
   viewer.style.display = "block";
 
@@ -816,58 +814,53 @@ function openFrameViewer(idx) {
   $("fv-fix-nucleus").onclick = () => {
     _nucleusCorrectMode = true;
     img.classList.add("nucleus-correct-mode");
-    $("frame-viewer-caption").textContent = "☞ Click on the actual comet nucleus…  (Esc to cancel)";
+    caption.textContent = "☞ Click on the actual comet nucleus…  (Esc to cancel)";
   };
 
-  // Reject/restore button — toggles this frame in state.frameRejections
-  _updateRejectBtn(idx);
-  $("fv-reject-frame").onclick = () => {
-    if (state.frameRejections.has(idx)) {
-      state.frameRejections.delete(idx);
-    } else {
-      state.frameRejections.add(idx);
-    }
-    // Refresh the viewer overlay + caption immediately
-    const nowRej = state.frameRejections.has(idx);
-    viewer.classList.toggle("frame-viewer-rejected", nowRej);
-    const rejLabel = nowRej ? "  ✕ REJECTED" : "";
-    caption.textContent =
-      f.name.replace(/^frame_\d+\.jpg$/, `Frame ${idx + 1} of ${_frameList.length}`) + rejLabel;
-    _updateRejectBtn(idx);
-    _syncRejectThumb(idx);
-    _saveFrameRejections();
-    _updateNucleusHintBanner();
-  };
-
-  // Click-to-correct on the frame image
+  // Image click: reject/restore when idle, set nucleus when in correct-mode
   img._nucleusClickHandler && img.removeEventListener("click", img._nucleusClickHandler);
   img._nucleusClickHandler = (e) => {
-    if (!_nucleusCorrectMode) return;
-    const rect = img.getBoundingClientRect();
-    const fx   = (e.clientX - rect.left)  / rect.width;
-    const fy   = (e.clientY - rect.top)   / rect.height;
-    state.nucleusHint = {x: fx, y: fy};
-    _nucleusCorrectMode = false;
-    img.classList.remove("nucleus-correct-mode");
-    caption.textContent = `✓ Nucleus correction set at (${(fx*100).toFixed(1)}%, ${(fy*100).toFixed(1)}%)  — re-render to apply`;
-    _updateNucleusHintBanner();
-    // Show marker at click position
-    const marker = $("nucleus-hint-marker");
-    if (marker) {
-      marker.style.left    = (fx * 100) + "%";
-      marker.style.top     = (fy * 100) + "%";
-      marker.style.display = "block";
+    if (_nucleusCorrectMode) {
+      // ── Nucleus correction ─────────────────────────────────────────────
+      const rect = img.getBoundingClientRect();
+      const fx   = (e.clientX - rect.left)  / rect.width;
+      const fy   = (e.clientY - rect.top)   / rect.height;
+      state.nucleusHint = {x: fx, y: fy};
+      _nucleusCorrectMode = false;
+      img.classList.remove("nucleus-correct-mode");
+      caption.textContent = `✓ Nucleus set at (${(fx*100).toFixed(1)}%, ${(fy*100).toFixed(1)}%)  — re-render to apply`;
+      _updateNucleusHintBanner();
+      const marker = $("nucleus-hint-marker");
+      if (marker) {
+        marker.style.left    = (fx * 100) + "%";
+        marker.style.top     = (fy * 100) + "%";
+        marker.style.display = "block";
+      }
+    } else {
+      // ── Reject / restore toggle ────────────────────────────────────────
+      if (state.frameRejections.has(idx)) {
+        state.frameRejections.delete(idx);
+      } else {
+        state.frameRejections.add(idx);
+      }
+      const nowRej = state.frameRejections.has(idx);
+      viewer.classList.toggle("frame-viewer-rejected", nowRej);
+      caption.textContent = _frameCaption(idx);
+      _syncRejectThumb(idx);
+      _saveFrameRejections();
+      _updateNucleusHintBanner();
     }
   };
   img.addEventListener("click", img._nucleusClickHandler);
 }
 
-function _updateRejectBtn(idx) {
-  const btn = $("fv-reject-frame");
-  if (!btn) return;
-  const isRej = state.frameRejections.has(idx);
-  btn.textContent = isRej ? "↺ Restore" : "✕ Reject";
-  btn.classList.toggle("fv-reject-active", isRej);
+function _frameCaption(idx) {
+  const f = _frameList[idx];
+  if (!f) return "";
+  const base = f.name.replace(/^frame_\d+\.jpg$/, `Frame ${idx + 1} of ${_frameList.length}`);
+  return state.frameRejections.has(idx)
+    ? `${base}  ✕ REJECTED — click to restore`
+    : `${base}  · click to reject`;
 }
 
 function _syncRejectThumb(idx) {

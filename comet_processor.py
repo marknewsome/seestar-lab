@@ -334,7 +334,8 @@ def _luminance(rgb: np.ndarray) -> np.ndarray:
 def _stretch(rgb: np.ndarray,
              sky_pct:  Optional[float] = None,
              high_pct: Optional[float] = None,
-             gamma:    Optional[float] = None) -> np.ndarray:
+             gamma:    Optional[float] = None,
+             stat_mask: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Per-frame display stretch:
       1. Subtract per-channel sky background (low percentile).
@@ -343,6 +344,11 @@ def _stretch(rgb: np.ndarray,
       4. Clip to [0, 1].
 
     sky_pct/high_pct/gamma override the module globals when provided.
+    stat_mask — optional boolean (H,W) array; when given, sky and high
+      percentiles are computed only from masked pixels.  Use this when
+      the image contains composite-fill areas with different brightness
+      (e.g. the stars-fixed canvas), so only the real frame pixels drive
+      the calibration.
     """
     s_pct = sky_pct  if sky_pct  is not None else STRETCH_SKY_PCT
     h_pct = high_pct if high_pct is not None else STRETCH_HIGH_PCT
@@ -350,11 +356,16 @@ def _stretch(rgb: np.ndarray,
 
     out = rgb.copy()
     for c in range(3):
-        sky = np.percentile(out[..., c], s_pct)
+        vals = out[..., c][stat_mask] if stat_mask is not None else out[..., c].ravel()
+        sky  = np.percentile(vals, s_pct)
         out[..., c] = out[..., c] - sky
 
-    lum  = _luminance(out)
-    high = np.percentile(lum[lum > 0], h_pct) if np.any(lum > 0) else 1.0
+    lum = _luminance(out)
+    if stat_mask is not None:
+        lum_vals = lum[stat_mask]
+    else:
+        lum_vals = lum[lum > 0]
+    high = np.percentile(lum_vals[lum_vals > 0], h_pct) if np.any(lum_vals > 0) else 1.0
     if high > 0:
         out = out / high
 
@@ -1077,7 +1088,7 @@ def _comet_portrait(
 
     # Portrait crop: width = crop_w, height = crop_h = 1.5 × crop_w
     # Nucleus sits at the lower-centre third (vertically 2/3 down)
-    crop_w = min(pw, ph * 2 // 3)
+    crop_w = min(w, h * 2 // 3)
     crop_h = crop_w * 3 // 2
 
     # Nucleus x-centre, nucleus placed at 2/3 height from top
@@ -1332,18 +1343,53 @@ def main() -> None:
         print("[Pass 1] Star alignment (astroalign) …")
         transforms = _align_stars(files, ref_idx)
 
+    # Reference frame dimensions (needed for canvas computation and warpAffine)
+    ref_data, _ = _load_fits(files[ref_idx])
+    ref_h, ref_w = _luminance(ref_data).shape
+    del ref_data
+
+    # Compute canvas offset now (only depends on transforms + file dims).
+    # Needed to correctly convert the user's canvas-space hint click to
+    # raw-frame coordinates before Pass 2.
+    _all_cx: list[float] = [0.0, float(ref_w), 0.0, float(ref_w)]
+    _all_cy: list[float] = [0.0, 0.0, float(ref_h), float(ref_h)]
+    for _i, _f in enumerate(files):
+        if _i == ref_idx:
+            continue
+        _t = transforms[_i]
+        _fh, _fw = _fits_dims(_f)
+        _src_corners = [(0.0, 0.0), (float(_fw), 0.0),
+                        (0.0, float(_fh)), (float(_fw), float(_fh))]
+        if _t is None:
+            for _cx_s, _cy_s in _src_corners:
+                _all_cx.append(_cx_s); _all_cy.append(_cy_s)
+        else:
+            _tx, _ty, _rot_deg, _scale = _t
+            _rad = np.radians(_rot_deg)
+            _c, _s = np.cos(_rad), np.sin(_rad)
+            for _cx_s, _cy_s in _src_corners:
+                _all_cx.append(_scale * _c * _cx_s - _scale * _s * _cy_s + _tx)
+                _all_cy.append(_scale * _s * _cx_s + _scale * _c * _cy_s + _ty)
+    _canvas_off_x = int(np.floor(min(_all_cx)))
+    _canvas_off_y = int(np.floor(min(_all_cy)))
+    _canvas_w     = int(np.ceil(max(_all_cx))) - _canvas_off_x
+    _canvas_h     = int(np.ceil(max(_all_cy))) - _canvas_off_y
+
     # ── Pass 2: Nucleus detection ──────────────────────────────────────────────
     if not nucleus_pos:   # empty when cache missed or user hint supplied
-        # Build hint in reference-frame pixel coords from user fractional input
+        # Build hint in reference-frame pixel coords from user fractional input.
+        # The user clicked at fraction (fx, fy) of the canvas-space annotated JPEG.
+        # Canvas pixel = (fx * canvas_w, fy * canvas_h).
+        # Reference-frame pixel = canvas pixel + (off_x, off_y)
+        # (the ref frame is shifted by (-off_x, -off_y) into the canvas).
         nucleus_hint_aligned = None
         ref_dims_for_hint    = None
         if nucleus_hint_provided:
-            _ref_lum = _luminance(_load_fits(files[ref_idx])[0])
-            _rh, _rw = _ref_lum.shape
-            del _ref_lum
-            nucleus_hint_aligned = (args.nucleus_hint_x * _rw,
-                                    args.nucleus_hint_y * _rh)
-            ref_dims_for_hint    = (_rw, _rh)
+            hx_canvas = args.nucleus_hint_x * _canvas_w
+            hy_canvas = args.nucleus_hint_y * _canvas_h
+            nucleus_hint_aligned = (hx_canvas + _canvas_off_x,
+                                    hy_canvas + _canvas_off_y)
+            ref_dims_for_hint    = (ref_w, ref_h)
             print(f"\n[Pass 2] Detecting nucleus (user hint: "
                   f"{nucleus_hint_aligned[0]:.0f}, {nucleus_hint_aligned[1]:.0f}) …")
         else:
@@ -1360,8 +1406,9 @@ def main() -> None:
 
         with open(cache_json, "w") as fh:
             json.dump({
-                "transforms":  [list(t) if t else None for t in transforms],
-                "nucleus_pos": [list(p) if p else None for p in nucleus_pos],
+                "transforms":       [list(t) if t else None for t in transforms],
+                "nucleus_pos":      [list(p) if p else None for p in nucleus_pos],
+                "rejected_indices": sorted(rejected_indices),
             }, fh, indent=2)
         print(f"  Alignment cached → {cache_json}")
 
@@ -1372,11 +1419,6 @@ def main() -> None:
     # the crop-window placement (nucleus-fixed) and the frame annotations.
     nucleus_pos = _smooth_nucleus_positions(nucleus_pos, sigma=3.0)
     print("  Nucleus positions smoothed (σ=3 frames)")
-
-    # Reference frame dimensions (needed for warpAffine output size)
-    ref_data, _ = _load_fits(files[ref_idx])
-    ref_h, ref_w = _luminance(ref_data).shape
-    del ref_data
 
     # ── Pass 3: Stars-fixed animation ─────────────────────────────────────────
     print("\n[Pass 3] Building stars-fixed animation …")
@@ -1436,6 +1478,7 @@ def main() -> None:
     print("  [3b] Building fill composite …")
     comp_sum   = np.zeros((canvas_h, canvas_w, 3), dtype=np.float64)
     comp_count = np.zeros((canvas_h, canvas_w),    dtype=np.int32)
+    raw_count  = np.zeros((canvas_h, canvas_w),    dtype=np.int32)  # unmasked, for static_alpha
     for i, f in enumerate(files):
         if rejected[i]:
             print(f"    [{i+1:2d}/{n}]  REJECTED — skipped", flush=True)
@@ -1450,6 +1493,7 @@ def main() -> None:
         good    = covered & ~trail
         comp_sum[good]   += warped[good].astype(np.float64)
         comp_count[good] += 1
+        raw_count[covered] += 1
         n_trail = int(trail[covered].sum())
         del warped
         suffix = f"  trail: {n_trail} px masked" if n_trail else ""
@@ -1492,10 +1536,10 @@ def main() -> None:
     #
     # Gaussian blur on the coverage fraction softens the transition zone so the
     # edge fades smoothly rather than stepping from real data to composite.
-    coverage_frac = comp_count.astype(np.float32) / float(max(n - n_rejected, 1))
+    coverage_frac = raw_count.astype(np.float32) / float(max(n - n_rejected, 1))
     static_alpha_2d = cv2.GaussianBlur(coverage_frac, (0, 0), sigmaX=40.0)
     static_alpha = np.clip(static_alpha_2d, 0.0, 1.0)[:, :, np.newaxis]
-    del comp_count, coverage_frac, static_alpha_2d
+    del comp_count, raw_count, coverage_frac, static_alpha_2d
 
     # ── 3c: Build output frames ────────────────────────────────────────────────
     print("  [3c] Building frames …")
@@ -1511,8 +1555,9 @@ def main() -> None:
         del src_data
 
         # Blend with composite so canvas-edge vignette is stable every frame.
+        covered_mask = warped.sum(axis=2) > 0
         blended  = warped * static_alpha + composite * (1.0 - static_alpha)
-        stretched = _stretch(blended)
+        stretched = _stretch(blended, stat_mask=covered_mask)
         bgr       = _apply_noise(_to_bgr8(stretched, OUTPUT_WIDTH), NOISE_LEVEL)
 
         dt   = meta["date_obs"][:16].replace("T", "  ")
