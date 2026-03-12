@@ -235,6 +235,20 @@ OUTPUT_DIR = os.environ.get("SEESTAR_OUTPUT_DIR", "/mnt/d/seestar-lab")
 
 _catalog = ObjectCatalog()
 
+_STATIC_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def _static_ver(rel_path: str) -> str:
+    """Return a versioned static URL: /static/<path>?v=<mtime> for cache-busting."""
+    full = os.path.join(_STATIC_ROOT, rel_path.lstrip("/"))
+    try:
+        mtime = int(os.path.getmtime(full))
+    except OSError:
+        mtime = 0
+    return f"/static/{rel_path.lstrip('/')}?v={mtime}"
+
+app.jinja_env.globals["static_ver"] = _static_ver
+
 # ── Pub / sub ─────────────────────────────────────────────────────────────────
 
 _subscribers: list[queue.Queue] = []
@@ -1460,6 +1474,9 @@ def api_comet_render():
         except (TypeError, ValueError):
             pass
 
+    # Persist render parameters so they can be restored on next visit
+    _save_render_params(directory, body)
+
     threading.Thread(target=_run_comet_job, args=(job_id, cmd, directory),
                      daemon=True, name=f"comet-{job_id}").start()
     return jsonify({"job_id": job_id})
@@ -1525,34 +1542,68 @@ def api_comet_frames():
     frames = []
     for fname in sorted(os.listdir(frames_dir)):
         if fname.lower().endswith(".jpg"):
+            fpath = os.path.join(frames_dir, fname)
+            try:
+                mtime = int(os.path.getmtime(fpath))
+            except OSError:
+                mtime = 0
             frames.append({
-                "path": os.path.join(frames_dir, fname),
-                "name": fname,
+                "path":  fpath,
+                "name":  fname,
+                "mtime": mtime,
             })
     return jsonify({"directory": directory, "frames": frames})
 
 
+_RENDER_PARAM_KEYS = ("fps", "gamma", "crop", "max_frames",
+                      "sky_pct", "high_pct", "noise", "width", "max_gap_mult")
+
+
+def _save_render_params(directory, body):
+    """Write render parameters from a render request body into comet_alignment.json."""
+    cache_json = os.path.join(directory, "comet_alignment.json")
+    cache = {}
+    if os.path.isfile(cache_json):
+        try:
+            with open(cache_json) as fh:
+                cache = json.load(fh)
+        except Exception:
+            pass
+    cache["render_params"] = {k: body[k] for k in _RENDER_PARAM_KEYS if k in body}
+    try:
+        with open(cache_json, "w") as fh:
+            json.dump(cache, fh, indent=2)
+    except Exception:
+        pass
+
+
 @app.route("/api/comet/rejections")
 def api_comet_rejections():
-    """Return the rejected_indices list stored in comet_alignment.json."""
+    """Return the rejected_indices and nucleus_hint stored in comet_alignment.json."""
     directory = request.args.get("dir", "").strip()
     if not directory or not os.path.isdir(directory):
         return jsonify({"error": "Directory not found"}), 400
     cache_json = os.path.join(directory, "comet_alignment.json")
     rejected_indices = []
+    nucleus_hint  = None
+    render_params = None
     if os.path.isfile(cache_json):
         try:
             with open(cache_json) as fh:
                 cache = json.load(fh)
             rejected_indices = cache.get("rejected_indices", [])
+            nucleus_hint     = cache.get("nucleus_hint", None)
+            render_params    = cache.get("render_params", None)
         except Exception:
             pass
-    return jsonify({"rejected_indices": rejected_indices})
+    return jsonify({"rejected_indices": rejected_indices,
+                    "nucleus_hint":     nucleus_hint,
+                    "render_params":    render_params})
 
 
 @app.route("/api/comet/set_rejections", methods=["POST"])
 def api_comet_set_rejections():
-    """Persist a frame rejection list into comet_alignment.json."""
+    """Persist frame rejections and optional nucleus_hint into comet_alignment.json."""
     data      = request.get_json(force=True) or {}
     directory = data.get("dir", "").strip()
     indices   = [int(x) for x in data.get("rejected_indices", [])]
@@ -1567,6 +1618,13 @@ def api_comet_set_rejections():
         except Exception:
             pass
     cache["rejected_indices"] = sorted(indices)
+    # nucleus_hint: {x, y} or null — persist if key present in request
+    if "nucleus_hint" in data:
+        hint = data["nucleus_hint"]
+        if hint is None:
+            cache.pop("nucleus_hint", None)
+        elif isinstance(hint, dict) and "x" in hint and "y" in hint:
+            cache["nucleus_hint"] = {"x": float(hint["x"]), "y": float(hint["y"])}
     with open(cache_json, "w") as fh:
         json.dump(cache, fh, indent=2)
     return jsonify({"ok": True, "count": len(indices)})

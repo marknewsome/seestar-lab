@@ -542,7 +542,8 @@ async function pollStatus() {
       stopElapsed();
       $("cancel-render-btn").style.display = "none";
       $("start-render-btn").style.display  = "inline-flex";
-      state.nucleusHint = null;   // hint was applied; clear it
+      // Keep nucleusHint — it's persisted to comet_alignment.json and
+      // should remain active for future re-renders until explicitly cleared.
       // Show "View Results" button linking to the dedicated results page
       const resultsUrl = `/comet/results?dir=${encodeURIComponent(state.directory)}`;
       const vrbtn = $("view-results-btn");
@@ -564,27 +565,42 @@ function showResults(outputs) {
   const container = $("result-links");
   container.innerHTML = "";
 
-  // "View full results page" shortcut at top when directory is known
+  // ── Top bar: full-results link ─────────────────────────────────────────────
   if (state.directory) {
     const topBar = document.createElement("div");
     topBar.className = "results-topbar";
     const resultsUrl = `/comet/results?dir=${encodeURIComponent(state.directory)}`;
     topBar.innerHTML =
-      `<span class="results-topbar-hint">Click a frame below to fix the nucleus or reject it from the render.</span>` +
       `<a class="btn btn-sm" href="${resultsUrl}" target="_blank">⛶ Full results page</a>`;
     container.appendChild(topBar);
   }
 
-  const addVideo = (label, path) => {
-    if (!path) return;
-    const url  = `/api/comet/output?path=${encodeURIComponent(path)}`;
-    const wrap = document.createElement("div");
+  const makeCard = (label) => {
+    const wrap  = document.createElement("div");
     wrap.className = "result-card";
-
     const title = document.createElement("div");
     title.className = "result-card-title";
     title.textContent = label;
+    wrap.appendChild(title);
+    return wrap;
+  };
+  const makeDl = (url, path) => {
+    const dl = document.createElement("a");
+    dl.className   = "result-dl-link";
+    dl.href        = url;
+    dl.download    = path.split("/").pop();
+    dl.textContent = "⬇ Download";
+    return dl;
+  };
 
+  // ── Animations row (2 equal columns) ──────────────────────────────────────
+  const animRow = document.createElement("div");
+  animRow.className = "result-animations-row";
+
+  const addVideo = (label, path) => {
+    if (!path) return;
+    const url   = `/api/comet/output?path=${encodeURIComponent(path)}`;
+    const wrap  = makeCard(label);
     const video = document.createElement("video");
     video.className = "result-video";
     video.src      = url;
@@ -592,54 +608,48 @@ function showResults(outputs) {
     video.loop     = true;
     video.muted    = true;
     video.preload  = "metadata";
-
-    const dl = document.createElement("a");
-    dl.className  = "result-dl-link";
-    dl.href       = url;
-    dl.download   = path.split("/").pop();
-    dl.textContent = "⬇ Download";
-
-    wrap.append(title, video, dl);
-    container.appendChild(wrap);
+    wrap.append(video, makeDl(url, path));
+    animRow.appendChild(wrap);
   };
+
+  addVideo("⭐ Stars-fixed animation",   outputs.stars_mp4);
+  addVideo("☄ Nucleus-fixed animation", outputs.nucleus_mp4);
+  if (animRow.children.length) container.appendChild(animRow);
+
+  // ── Images row (auto-fill) ─────────────────────────────────────────────────
+  const imgRow = document.createElement("div");
+  imgRow.className = "result-images-row";
 
   const addImage = (label, path) => {
     if (!path) return;
     const url  = `/api/comet/output?path=${encodeURIComponent(path)}`;
-    const wrap = document.createElement("div");
-    wrap.className = "result-card";
-
-    const title = document.createElement("div");
-    title.className = "result-card-title";
-    title.textContent = label;
-
-    const img = document.createElement("img");
+    const wrap = makeCard(label);
+    const img  = document.createElement("img");
     img.className = "result-img";
     img.src = url;
     img.alt = label;
-
-    const dl = document.createElement("a");
-    dl.className  = "result-dl-link";
-    dl.href       = url;
-    dl.download   = path.split("/").pop();
-    dl.textContent = "⬇ Download";
-
-    wrap.append(title, img, dl);
-    container.appendChild(wrap);
+    wrap.append(img, makeDl(url, path));
+    imgRow.appendChild(wrap);
   };
 
-  addVideo("⭐ Stars-fixed animation",    outputs.stars_mp4);
-  addVideo("☄ Nucleus-fixed animation",  outputs.nucleus_mp4);
+  addImage("🎨 Comet portrait",          outputs.portrait_jpg);
+  addImage("🖼 Composite stack",         outputs.stack_jpg);
+  addImage("☄ Nucleus-aligned stack",   outputs.nucleus_stack_jpg);
+  addImage("🔬 Larson-Sekanina filter",  outputs.ls_jpg);
+  addImage("📍 Track composite",         outputs.track_jpg);
+  if (imgRow.children.length) container.appendChild(imgRow);
 
-
-  addImage("🎨 Comet portrait",            outputs.portrait_jpg);
-  addImage("🖼 Composite stack",           outputs.stack_jpg);
-  addImage("☄ Nucleus-aligned stack",    outputs.nucleus_stack_jpg);
-  addImage("🔬 Larson-Sekanina filter",   outputs.ls_jpg);
-  addImage("📍 Track composite",          outputs.track_jpg);
-
-  // Frame browser
+  // ── Frame section (full width) ─────────────────────────────────────────────
   if (outputs.frame_count > 0 && outputs.frame_dir) {
+    const frameSection = document.createElement("div");
+    frameSection.className = "result-frame-section";
+
+    const frameHint = document.createElement("div");
+    frameHint.className = "result-frame-hint";
+    frameHint.textContent =
+      "Click a frame to review it. Use ⊕ Fix Nucleus to correct the detected head position, or click a frame to reject/restore it from the render.";
+    frameSection.appendChild(frameHint);
+
     const fbCard = document.createElement("div");
     fbCard.className = "result-card frame-browser-card";
 
@@ -698,21 +708,33 @@ function showResults(outputs) {
 
     fbBody.append(viewer, strip);
     fbCard.append(fbTitle, fbBody);
-    container.appendChild(fbCard);
+    frameSection.appendChild(fbCard);
 
+    // Nucleus correction banner — lives below the frame browser
+    const hintBanner = document.createElement("div");
+    hintBanner.id = "nucleus-hint-banner";
+    hintBanner.className = "nucleus-hint-banner";
+    hintBanner.style.display = "none";
+    hintBanner.innerHTML =
+      `<span id="hint-banner-text">⊕ Nucleus correction set.</span>` +
+      `<button class="btn btn-sm btn-primary" id="rerender-btn">Re-render →</button>` +
+      `<button class="btn btn-sm" id="clear-hint-btn">Clear correction</button>`;
+    frameSection.appendChild(hintBanner);
+
+    container.appendChild(frameSection);
     loadFrameStrip(outputs.frame_dir);
+  } else {
+    // No frames — still need the hint banner somewhere
+    const hintBanner = document.createElement("div");
+    hintBanner.id = "nucleus-hint-banner";
+    hintBanner.className = "nucleus-hint-banner";
+    hintBanner.style.display = "none";
+    hintBanner.innerHTML =
+      `<span id="hint-banner-text">⊕ Nucleus correction set.</span>` +
+      `<button class="btn btn-sm btn-primary" id="rerender-btn">Re-render →</button>` +
+      `<button class="btn btn-sm" id="clear-hint-btn">Clear correction</button>`;
+    container.appendChild(hintBanner);
   }
-
-  // Nucleus correction banner (shown when a hint has been set)
-  const hintBanner = document.createElement("div");
-  hintBanner.id = "nucleus-hint-banner";
-  hintBanner.className = "nucleus-hint-banner";
-  hintBanner.style.display = "none";
-  hintBanner.innerHTML =
-    `<span id="hint-banner-text">⊕ Nucleus correction set.</span>` +
-    `<button class="btn btn-sm btn-primary" id="rerender-btn">Re-render →</button>` +
-    `<button class="btn btn-sm" id="clear-hint-btn">Clear correction</button>`;
-  container.appendChild(hintBanner);
 
   document.getElementById("rerender-btn")?.addEventListener("click", () => {
     $("render-results").style.display = "none";
@@ -762,7 +784,7 @@ async function loadFrameStrip(dir) {
     _frameList = data.frames || [];
     strip.innerHTML = "";
     _frameList.forEach((f, i) => {
-      const url = `/api/comet/output?path=${encodeURIComponent(f.path)}`;
+      const url = `/api/comet/output?path=${encodeURIComponent(f.path)}&v=${f.mtime || 0}`;
       const img = document.createElement("img");
       img.className = "frame-strip-thumb";
       img.loading   = "lazy";
@@ -791,7 +813,7 @@ function openFrameViewer(idx) {
   const f = _frameList[idx];
   if (!f) return;
 
-  img.src       = `/api/comet/output?path=${encodeURIComponent(f.path)}`;
+  img.src       = `/api/comet/output?path=${encodeURIComponent(f.path)}&v=${f.mtime || 0}`;
   img.classList.remove("nucleus-correct-mode");
   const isRejected = state.frameRejections.has(idx);
   viewer.classList.toggle("frame-viewer-rejected", isRejected);
@@ -829,6 +851,7 @@ function openFrameViewer(idx) {
       _nucleusCorrectMode = false;
       img.classList.remove("nucleus-correct-mode");
       caption.textContent = `✓ Nucleus set at (${(fx*100).toFixed(1)}%, ${(fy*100).toFixed(1)}%)  — re-render to apply`;
+      _saveFrameRejections();   // persists hint to comet_alignment.json
       _updateNucleusHintBanner();
       const marker = $("nucleus-hint-marker");
       if (marker) {
@@ -868,12 +891,38 @@ function _syncRejectThumb(idx) {
   if (thumb) thumb.classList.toggle("frame-rejected", state.frameRejections.has(idx));
 }
 
+function _restoreRenderParams(params) {
+  if (!params) return;
+  const setRange = (id, valId, val, fmt) => {
+    const el = $(id), out = $(valId);
+    if (!el || val == null) return;
+    el.value = val;
+    if (out) out.textContent = fmt ? fmt(String(val)) : String(val);
+  };
+  setRange("p-fps",       "p-fps-val",       params.fps,          v => v);
+  setRange("p-gamma",     "p-gamma-val",     params.gamma,        v => parseFloat(v).toFixed(2));
+  setRange("p-crop",      "p-crop-val",      params.crop,         v => v);
+  setRange("p-maxframes", "p-maxframes-val", params.max_frames,   v => v);
+  setRange("p-sky",       "p-sky-val",       params.sky_pct,      v => v);
+  setRange("p-high",      "p-high-val",      params.high_pct,     v => parseFloat(v).toFixed(1));
+  setRange("p-noise",     "p-noise-val",     params.noise,        v => v);
+  const pw = $("p-width"), pm = $("p-maxgap");
+  if (pw && params.width     != null) pw.value = String(params.width);
+  if (pm && params.max_gap_mult != null) pm.value = String(params.max_gap_mult);
+}
+
 async function _loadFrameRejections() {
   if (!state.frameDir) return;
   try {
     const res  = await fetch(`/api/comet/rejections?dir=${encodeURIComponent(state.frameDir)}`);
     const data = await res.json();
     state.frameRejections = new Set((data.rejected_indices || []).map(Number));
+    // Restore persisted nucleus hint if not already set in memory
+    if (!state.nucleusHint && data.nucleus_hint) {
+      state.nucleusHint = data.nucleus_hint;
+    }
+    // Restore render parameters into Step 2 form elements
+    _restoreRenderParams(data.render_params);
     // Apply to any strip thumbs already in the DOM
     document.querySelectorAll(".frame-strip-thumb").forEach(t => {
       const i = parseInt(t.dataset.idx);
@@ -892,6 +941,7 @@ async function _saveFrameRejections() {
       body:    JSON.stringify({
         dir:              state.frameDir,
         rejected_indices: [...state.frameRejections],
+        nucleus_hint:     state.nucleusHint || null,
       }),
     });
   } catch (_) {}

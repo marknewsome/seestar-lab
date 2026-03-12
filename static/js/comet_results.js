@@ -54,8 +54,9 @@ async function loadResults() {
   }
 }
 
-function outputUrl(path) {
-  return `/api/comet/output?path=${encodeURIComponent(path)}`;
+function outputUrl(path, mtime) {
+  const v = mtime ? `&v=${mtime}` : '';
+  return `/api/comet/output?path=${encodeURIComponent(path)}${v}`;
 }
 
 function render(o) {
@@ -162,7 +163,7 @@ async function loadFrameStrip(dir) {
       const img = document.createElement('img');
       img.className     = 'frame-strip-thumb';
       img.loading       = 'lazy';
-      img.src           = outputUrl(f.path);
+      img.src           = outputUrl(f.path, f.mtime);
       img.title         = f.name;
       img.dataset.idx   = i;
       img.addEventListener('click', () => openFrame(i));
@@ -183,7 +184,7 @@ function openFrame(idx) {
   const caption = document.getElementById('cr-viewer-caption');
   const counter = document.getElementById('cr-counter');
 
-  img.src           = outputUrl(f.path);
+  img.src           = outputUrl(f.path, f.mtime);
   caption.textContent = `Frame ${idx + 1} of ${_frameList.length}`;
   counter.textContent = `${idx + 1} / ${_frameList.length}`;
   viewer.style.display = 'block';

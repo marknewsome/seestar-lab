@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Comet Results — Seestar Lab</title>
-  <link rel="stylesheet" href="/static/css/style.css" />
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
 </head>
 <body>
 
@@ -85,6 +85,6 @@
   <!-- Floating exit-presentation button (visible only in present mode) -->
   <button class="cr-exit-present" id="cr-exit-present" onclick="exitPresent()">✕ Exit</button>
 
-  <script src="/static/js/comet_results.js"></script>
+  <script src="{{ static_ver('js/comet_results.js') }}"></script>
 </body>
 </html>

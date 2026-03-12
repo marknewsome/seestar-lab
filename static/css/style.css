@@ -1632,10 +1632,41 @@ main {
 
 /* Comet result cards */
 .result-links {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 1rem;
 }
+
+/* Animations — 2 equal columns, stretch to same height */
+.result-animations-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  align-items: stretch;
+}
+@media (max-width: 600px) {
+  .result-animations-row { grid-template-columns: 1fr; }
+}
+
+/* Images — auto-fill */
+.result-images-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+}
+
+/* Frame section — full width, instruction + browser + banner */
+.result-frame-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.result-frame-hint {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  padding: 0.1rem 0.2rem;
+}
+
 .result-card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -1656,9 +1687,12 @@ main {
   width: 100%;
   display: block;
   background: #000;
+  flex: 1;          /* fills card height so download pins to bottom */
+  min-height: 0;
+  object-fit: contain;
 }
-.result-video { max-height: 360px; }
-.result-img   { max-height: 360px; object-fit: contain; }
+.result-video { max-height: 70vh; }
+.result-img   { max-height: 360px; }
 .result-dl-link {
   display: block;
   padding: 0.45rem 0.8rem;
@@ -1667,6 +1701,7 @@ main {
   text-decoration: none;
   border-top: 1px solid var(--border);
   text-align: right;
+  margin-top: auto;
 }
 .result-dl-link:hover { color: var(--accent); }
 
@@ -2015,20 +2050,17 @@ main {
   outline: 2px solid #f59e0b !important;
 }
 
-/* Nucleus hint banner */
-/* Results top bar — hint + full results link */
+/* Results top bar — just the "Full results page" link, right-aligned */
 .results-topbar {
   display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.5rem 0.75rem;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  margin-bottom: 1rem;
-  font-size: 0.82rem;
+  justify-content: flex-end;
 }
-.results-topbar-hint { flex: 1; color: var(--text-muted); }
+.results-topbar .btn {
+  font-size: 0.95rem;
+  padding: 0.45rem 1rem;
+}
+
+/* Nucleus hint banner */
 
 .nucleus-hint-banner {
   display: flex;
@@ -2185,6 +2217,8 @@ main {
   background: #000;
   flex: 1;
   min-height: 0;
+  max-height: 70vh;
+  object-fit: contain;
 }
 
 .cr-img {

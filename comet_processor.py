@@ -601,18 +601,20 @@ def _find_nucleus(
         src_data, _ = _load_fits(f)
         src_lum = _luminance(src_data)
         h, w = src_lum.shape
-        search_r = int(min(h, w) * 0.4)
-
         # ── Determine search hint ─────────────────────────────────────────────
         if raw_hint_offset is not None:
             # Same offset from centre applied to every frame.
+            # Tight radius: user told us exactly where the nucleus is.
             dx, dy = raw_hint_offset
             hx, hy = w / 2.0 + dx, h / 2.0 + dy
+            search_r = 120
         elif last_orig_pos is not None:
             # Rolling hint: previous frame's detected raw position (no user hint).
             hx, hy = last_orig_pos
+            search_r = int(min(h, w) * 0.4)
         else:
             hx, hy = float(w // 2), float(h // 2)
+            search_r = int(min(h, w) * 0.4)
 
         pos_orig = _find_nucleus_in_frame(src_lum, hint_x=hx, hint_y=hy,
                                           search_r=search_r)
@@ -671,7 +673,7 @@ def _make_title_frame(w: int, h: int,
         cv2.putText(frame, text, (x, cy), font, fs_s, color, th, cv2.LINE_AA)
 
     # Comet name — large, accent cyan
-    _put(comet_name, int(h * 0.33), 1.0, (100, 220, 255), 2)
+    _put(comet_name, int(h * 0.33), 1.2, (100, 220, 255), 2)
 
     # Thin divider line
     lw = int(w * 0.36)
@@ -680,10 +682,10 @@ def _make_title_frame(w: int, h: int,
              (40, 90, 60), max(1, round(scale)))
 
     # Animation type — medium, light
-    _put(anim_label, int(h * 0.57), 0.78, (210, 210, 210), 1)
+    _put(anim_label, int(h * 0.57), 0.95, (210, 210, 210), 1)
 
     # Date range — small, muted
-    _put(date_range, int(h * 0.70), 0.52, (115, 115, 115), 1)
+    _put(date_range, int(h * 0.70), 0.65, (115, 115, 115), 1)
 
     # Bottom-right watermark
     wm    = "Seestar Lab"
@@ -842,11 +844,17 @@ def _write_video(frames_bgr: list[np.ndarray], path: str,
 
 
 def _overlay_label(img: np.ndarray, text: str) -> np.ndarray:
-    out = img.copy()
-    cv2.putText(out, text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(out, text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (255, 255, 255), 1, cv2.LINE_AA)
+    out  = img.copy()
+    h, w = out.shape[:2]
+    scale = w / 640.0          # reference width 640 px → font scale 1.0
+    fs    = max(0.5, 0.9 * scale)
+    th    = max(1, round(1.5 * scale))
+    margin = max(8, int(12 * scale))
+    y      = max(20, int(28 * scale))
+    cv2.putText(out, text, (margin, y), cv2.FONT_HERSHEY_SIMPLEX,
+                fs, (0, 0, 0), th + 2, cv2.LINE_AA)
+    cv2.putText(out, text, (margin, y), cv2.FONT_HERSHEY_SIMPLEX,
+                fs, (255, 255, 255), th, cv2.LINE_AA)
     return out
 
 
