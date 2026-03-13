@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tonight's Planner — Seestar Lab</title>
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
+</head>
+<body>
+
+  <header id="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link" href="/comet">Comet</a>
+        <a class="nav-link" href="/solar">Solar</a>
+        <a class="nav-link" href="/lunar">Lunar</a>
+        <a class="nav-link active" href="/planner">Planner</a>
+        <a class="nav-link" href="/capture">Capture</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="planner-page">
+
+    <!-- ── Planner hero ───────────────────────────────────────────────────── -->
+    <div class="planner-hero" aria-hidden="true">
+      <div class="planner-hero-stars" id="planner-hero-stars">
+        <!-- dots injected by JS -->
+      </div>
+      <div class="planner-hero-text">
+        <h1 class="planner-hero-title">Tonight's Planner</h1>
+        <p class="planner-hero-sub">Messier &amp; Caldwell visibility · cross-referenced with your sessions</p>
+      </div>
+    </div>
+
+    <!-- ── Location setup ─────────────────────────────────────────────────── -->
+    <section class="planner-location-bar" id="planner-location-bar">
+      <div class="planner-loc-fields">
+        <label class="planner-loc-field">
+          <span class="planner-loc-lbl">Latitude</span>
+          <input class="planner-loc-input" id="pl-lat" type="number" step="0.0001"
+                 placeholder="e.g. 51.5074" />
+        </label>
+        <label class="planner-loc-field">
+          <span class="planner-loc-lbl">Longitude</span>
+          <input class="planner-loc-input" id="pl-lon" type="number" step="0.0001"
+                 placeholder="e.g. -0.1278" />
+        </label>
+        <label class="planner-loc-field planner-loc-field-sm">
+          <span class="planner-loc-lbl">Elevation (m)</span>
+          <input class="planner-loc-input" id="pl-elevation" type="number"
+                 step="1" value="50" min="0" max="5000" />
+        </label>
+        <label class="planner-loc-field planner-loc-field-md">
+          <span class="planner-loc-lbl">Site name</span>
+          <input class="planner-loc-input" id="pl-name" type="text"
+                 placeholder="My backyard" />
+        </label>
+        <button class="btn btn-sm" id="pl-gps-btn" title="Use browser geolocation">
+          ⌖ GPS
+        </button>
+      </div>
+      <div class="planner-loc-actions">
+        <label class="planner-loc-field planner-loc-field-sm">
+          <span class="planner-loc-lbl">Date</span>
+          <input class="planner-loc-input" id="pl-date" type="date" />
+        </label>
+        <button class="btn" id="pl-plan-btn">✦ Plan Tonight</button>
+      </div>
+      <div class="planner-loc-status" id="pl-loc-status"></div>
+    </section>
+
+    <!-- ── Spinner / progress ─────────────────────────────────────────────── -->
+    <div class="planner-spinner-wrap" id="planner-spinner-wrap" style="display:none">
+      <div class="planner-spinner"></div>
+      <p class="planner-spinner-msg" id="planner-spinner-msg">Computing visibility…</p>
+    </div>
+
+    <!-- ── Error ─────────────────────────────────────────────────────────── -->
+    <div class="planner-error" id="planner-error" style="display:none"></div>
+
+    <!-- ── Results ───────────────────────────────────────────────────────── -->
+    <div id="planner-results" style="display:none">
+
+      <!-- Moon + dark window cards -->
+      <div class="planner-sky-row" id="planner-sky-row">
+        <div class="planner-sky-card" id="pl-moon-card">
+          <div class="planner-sky-icon" id="pl-moon-icon">☾</div>
+          <div class="planner-sky-body">
+            <div class="planner-sky-title" id="pl-moon-phase">—</div>
+            <div class="planner-sky-detail" id="pl-moon-detail">—</div>
+          </div>
+        </div>
+        <div class="planner-sky-card" id="pl-dark-card">
+          <div class="planner-sky-icon">★</div>
+          <div class="planner-sky-body">
+            <div class="planner-sky-title" id="pl-dark-title">Astro darkness</div>
+            <div class="planner-sky-detail" id="pl-dark-detail">—</div>
+          </div>
+        </div>
+        <div class="planner-sky-card" id="pl-counts-card">
+          <div class="planner-sky-icon">◎</div>
+          <div class="planner-sky-body">
+            <div class="planner-sky-title" id="pl-counts-title">Objects visible</div>
+            <div class="planner-sky-detail" id="pl-counts-detail">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Filter + sort bar -->
+      <div class="planner-filter-bar">
+        <div class="planner-filter-group">
+          <button class="planner-filter-btn active" data-cat="all">All</button>
+          <button class="planner-filter-btn" data-cat="messier">Messier</button>
+          <button class="planner-filter-btn" data-cat="caldwell">Caldwell</button>
+          <button class="planner-filter-btn planner-filter-btn-new" data-cat="new">
+            ★ New
+          </button>
+        </div>
+        <div class="planner-sort-group">
+          <label class="planner-sort-lbl">Sort:</label>
+          <select class="planner-sort-select" id="pl-sort">
+            <option value="rating">Rating ↓</option>
+            <option value="alt">Peak altitude ↓</option>
+            <option value="rise">Rises earliest</option>
+            <option value="name">Name A→Z</option>
+          </select>
+        </div>
+        <div class="planner-min-alt-group">
+          <label class="planner-sort-lbl" for="pl-min-alt">Min alt:</label>
+          <input class="planner-min-alt-input" id="pl-min-alt" type="number"
+                 value="20" min="5" max="60" step="5" />°
+        </div>
+      </div>
+
+      <!-- Object table -->
+      <div class="planner-table-wrap">
+        <table class="planner-table" id="planner-table">
+          <thead>
+            <tr>
+              <th class="pl-col-id">Object</th>
+              <th class="pl-col-name">Name</th>
+              <th class="pl-col-type">Type</th>
+              <th class="pl-col-con">Const.</th>
+              <th class="pl-col-size">Size</th>
+              <th class="pl-col-alt">Peak Alt</th>
+              <th class="pl-col-transit">Transit (UTC)</th>
+              <th class="pl-col-moon">☾ Sep</th>
+              <th class="pl-col-rating">Rating</th>
+              <th class="pl-col-have">Imaged</th>
+            </tr>
+          </thead>
+          <tbody id="planner-tbody"></tbody>
+        </table>
+      </div>
+
+    </div><!-- #planner-results -->
+
+  </main>
+
+  <script>
+    const PL_OBS_LOCATION = {{ obs_location | safe }};
+  </script>
+  <script src="{{ static_ver('js/planner.js') }}"></script>
+</body>
+</html>

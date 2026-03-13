@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Capture — Seestar Lab</title>
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
+</head>
+<body>
+
+  <header id="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link" href="/comet">Comet</a>
+        <a class="nav-link" href="/solar">Solar</a>
+        <a class="nav-link" href="/lunar">Lunar</a>
+        <a class="nav-link" href="/planner">Planner</a>
+        <a class="nav-link active" href="/capture">Capture</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="capture-page">
+
+    <div class="capture-hero">
+      <svg class="capture-hero-icon" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <rect x="4" y="14" width="42" height="30" rx="4" ry="4" fill="none" stroke="#5599ff" stroke-width="2.5"/>
+        <circle cx="25" cy="29" r="9" fill="none" stroke="#5599ff" stroke-width="2.5"/>
+        <circle cx="25" cy="29" r="4" fill="#5599ff" opacity="0.5"/>
+        <polygon points="46,20 60,14 60,44 46,38" fill="none" stroke="#5599ff" stroke-width="2.5" stroke-linejoin="round"/>
+        <circle cx="39" cy="20" r="2" fill="#5599ff"/>
+      </svg>
+      <div class="capture-hero-text">
+        <h1 class="capture-hero-title">Live Capture</h1>
+        <p class="capture-hero-sub">View and record Seestar RTSP streams</p>
+      </div>
+    </div>
+
+    <div class="capture-toolbar">
+      <span class="capture-output-note">Recordings saved to: <code id="cap-output-dir"></code></span>
+      <button class="btn btn-sm" id="cap-add-btn">+ Add Stream</button>
+    </div>
+
+    <div class="capture-grid" id="cap-grid">
+      <!-- stream cards injected by JS -->
+    </div>
+
+    <div class="capture-recordings-section" id="cap-recordings-section" style="display:none">
+      <h3 class="capture-section-title">Recent Recordings</h3>
+      <div id="cap-recordings-list"></div>
+    </div>
+
+  </main>
+
+  <script>const CAP_DATA_DIR = {{ data_dir | tojson }};</script>
+  <script src="{{ static_ver('js/capture.js') }}"></script>
+</body>
+</html>

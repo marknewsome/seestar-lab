@@ -20,6 +20,52 @@ const state = {
   frameDir:        null,      // dir used by the frame browser (for saving rejections)
 };
 
+// ── localStorage job persistence ──────────────────────────────────────────────
+
+const _CW_STORE_KEY = 'seestar_comet_job';
+
+function _cwSaveJob(jobId, directory) {
+  try { localStorage.setItem(_CW_STORE_KEY, JSON.stringify({jobId, directory, t: Date.now()})); } catch (_) {}
+}
+function _cwClearJob() {
+  try { localStorage.removeItem(_CW_STORE_KEY); } catch (_) {}
+}
+
+(async function _cwMaybeReconnect() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(_CW_STORE_KEY) || 'null'); } catch (_) { return; }
+  if (!saved || !saved.jobId) return;
+  if (Date.now() - (saved.t || 0) > 4 * 3600 * 1000) { _cwClearJob(); return; }
+
+  try {
+    const res  = await fetch(`/api/comet/status?job_id=${saved.jobId}`);
+    const data = await res.json();
+    if (data.error || data.status === 'error' || data.status === 'cancelled') { _cwClearJob(); return; }
+
+    state.jobId     = saved.jobId;
+    state.directory = saved.directory || '';
+    showSection(3);
+    $("render-progress-wrap").style.display = "block";
+    $("render-log-wrap").style.display      = "block";
+    $("cancel-render-btn").style.display    = "inline-flex";
+    $("start-render-btn").style.display     = "none";
+
+    if (data.status === 'done') {
+      _cwClearJob();
+      $("cancel-render-btn").style.display = "none";
+      $("start-render-btn").style.display  = "inline-flex";
+      const resultsUrl = `/comet/results?dir=${encodeURIComponent(state.directory)}`;
+      const vrbtn = $("view-results-btn");
+      if (vrbtn) { vrbtn.href = resultsUrl; vrbtn.style.display = "inline-flex"; }
+      showResults(data.outputs || {});
+      return;
+    }
+    state.renderStartTime = saved.t;
+    startElapsed();
+    startPolling();
+  } catch (_) {}
+})();
+
 // ── Session detection ─────────────────────────────────────────────────────────
 
 const SESSION_GAP_MS = 5 * 3600 * 1000;   // 5-hour gap = new session
@@ -417,6 +463,7 @@ $("cancel-render-btn").addEventListener("click", async () => {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({job_id: state.jobId}),
   });
+  _cwClearJob();
   stopPolling();
   $("render-message").textContent = "Cancelled.";
   $("cancel-render-btn").style.display = "none";
@@ -478,6 +525,7 @@ async function startRender() {
       return;
     }
     state.jobId = data.job_id;
+    _cwSaveJob(state.jobId, state.directory);
     startPolling();
   } catch (err) {
     setProgress(0, `Network error: ${err}`);
@@ -538,6 +586,7 @@ async function pollStatus() {
     }
 
     if (data.status === "done") {
+      _cwClearJob();
       stopPolling();
       stopElapsed();
       $("cancel-render-btn").style.display = "none";
@@ -550,6 +599,7 @@ async function pollStatus() {
       if (vrbtn) { vrbtn.href = resultsUrl; vrbtn.style.display = "inline-flex"; }
       showResults(data.outputs || {});
     } else if (data.status === "error" || data.status === "cancelled") {
+      _cwClearJob();
       stopPolling();
       stopElapsed();
       $("cancel-render-btn").style.display = "none";

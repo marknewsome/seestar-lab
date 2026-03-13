@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Solar Timelapse — Seestar Lab</title>
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
+</head>
+<body>
+
+  <header id="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link" href="/comet">Comet</a>
+        <a class="nav-link active" href="/solar">Solar</a>
+        <a class="nav-link" href="/lunar">Lunar</a>
+        <a class="nav-link" href="/planner">Planner</a>
+        <a class="nav-link" href="/capture">Capture</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="solar-wizard">
+
+    <!-- ── Solar hero ─────────────────────────────────────────────────────── -->
+    <div class="solar-hero" aria-hidden="true">
+      <svg class="solar-svg" viewBox="0 0 420 100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <radialGradient id="solarGrad" cx="50%" cy="50%" r="50%">
+            <stop offset="0%"   stop-color="#fff7aa" stop-opacity="1"/>
+            <stop offset="35%"  stop-color="#ffcc44" stop-opacity="0.9"/>
+            <stop offset="70%"  stop-color="#ff8800" stop-opacity="0.6"/>
+            <stop offset="100%" stop-color="#cc4400" stop-opacity="0"/>
+          </radialGradient>
+          <radialGradient id="coronaGrad" cx="50%" cy="50%" r="50%">
+            <stop offset="60%"  stop-color="transparent"/>
+            <stop offset="75%"  stop-color="#ffeeaa" stop-opacity="0.15"/>
+            <stop offset="100%" stop-color="transparent"/>
+          </radialGradient>
+        </defs>
+        <!-- Corona glow -->
+        <circle cx="210" cy="50" r="46" fill="url(#coronaGrad)" />
+        <!-- Disk -->
+        <circle cx="210" cy="50" r="38" fill="url(#solarGrad)" />
+        <!-- Corona rays -->
+        <g stroke="#ffdd88" stroke-opacity="0.4" stroke-width="1">
+          <line x1="210" y1="4"  x2="210" y2="0"  />
+          <line x1="210" y1="96" x2="210" y2="100" />
+          <line x1="164" y1="50" x2="160" y2="50"  />
+          <line x1="256" y1="50" x2="260" y2="50"  />
+          <line x1="177" y1="17" x2="174" y2="14"  />
+          <line x1="243" y1="83" x2="246" y2="86"  />
+          <line x1="177" y1="83" x2="174" y2="86"  />
+          <line x1="243" y1="17" x2="246" y2="14"  />
+        </g>
+      </svg>
+      <div class="solar-hero-text">
+        <h1 class="solar-hero-title">Solar Timelapse</h1>
+        <p class="solar-hero-sub">Disk-normalised timelapse from Seestar solar sessions</p>
+      </div>
+    </div>
+
+    <!-- ── Step indicator ─────────────────────────────────────────────────── -->
+    <div class="wizard-steps" id="sw-steps">
+      <div class="wizard-step active" id="sw-step-1">
+        <span class="step-num">1</span><span class="step-lbl">Select Videos</span>
+      </div>
+      <div class="wizard-step" id="sw-step-2">
+        <span class="step-num">2</span><span class="step-lbl">Parameters</span>
+      </div>
+      <div class="wizard-step" id="sw-step-3">
+        <span class="step-num">3</span><span class="step-lbl">Render</span>
+      </div>
+    </div>
+
+    <!-- ──────────────────────────────────────────────────────────────────── -->
+    <!-- Step 1 — Select data                                                  -->
+    <!-- ──────────────────────────────────────────────────────────────────── -->
+    <section class="wizard-panel" id="sw-panel-1">
+      <h2 class="panel-title">Step 1 — Select Solar Videos</h2>
+
+      <div class="sw-dir-row">
+        <label class="sw-label" for="sw-dir-input">Directory</label>
+        <div class="sw-dir-input-wrap">
+          <input class="sw-dir-input" id="sw-dir-input"
+                 placeholder="/mnt/d/xfer/Solar" autocomplete="off" spellcheck="false" />
+          <button class="btn btn-sm" id="sw-scan-btn">Scan</button>
+        </div>
+      </div>
+
+      <!-- Solar sessions quick-pick -->
+      <div class="sw-sessions-hint" id="sw-sessions-hint" style="display:none">
+        <span class="sw-sessions-label">Solar sessions detected:</span>
+        <div class="sw-sessions-list" id="sw-sessions-list"></div>
+      </div>
+
+      <div id="sw-scan-status" class="sw-scan-status"></div>
+
+      <!-- File list table -->
+      <div id="sw-files-wrap" style="display:none">
+        <div class="sw-file-header-row">
+          <span class="sw-file-count" id="sw-file-count"></span>
+          <label class="sw-toggle-all">
+            <input type="checkbox" id="sw-select-all" checked /> Select all
+          </label>
+        </div>
+        <div class="sw-file-table-wrap">
+          <table class="sw-file-table" id="sw-file-table">
+            <thead>
+              <tr>
+                <th class="col-check"></th>
+                <th class="col-name">Filename</th>
+                <th class="col-date">Date</th>
+                <th class="col-dur">Duration</th>
+              </tr>
+            </thead>
+            <tbody id="sw-file-tbody"></tbody>
+          </table>
+        </div>
+        <div class="sw-prev-render-notice" id="sw-prev-render-notice" style="display:none">
+          <span>A completed render exists for this directory.</span>
+          <button class="btn btn-sm" id="sw-prev-render-show-btn">↩ Show results</button>
+          <button class="btn btn-secondary btn-sm" id="sw-prev-render-dismiss-btn">Dismiss</button>
+        </div>
+
+        <div class="sw-step-nav">
+          <button class="btn" id="sw-to-step2-btn" disabled>Next: Parameters →</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ──────────────────────────────────────────────────────────────────── -->
+    <!-- Step 2 — Parameters                                                   -->
+    <!-- ──────────────────────────────────────────────────────────────────── -->
+    <section class="wizard-panel" id="sw-panel-2" style="display:none">
+      <h2 class="panel-title">Step 2 — Timelapse Parameters</h2>
+
+      <div class="sw-params-grid">
+
+        <div class="sw-param-group">
+          <h3 class="sw-param-group-title">Sampling</h3>
+
+          <label class="sw-param-row">
+            <span class="sw-param-lbl">Sample interval
+              <span class="sw-param-hint">Seconds between extracted frames</span>
+            </span>
+            <input class="sw-param-input" type="number" id="sw-sample-interval"
+                   value="1.0" min="0.2" max="30" step="0.5" />
+          </label>
+
+          <label class="sw-param-row">
+            <span class="sw-param-lbl">Speedup factor
+              <span class="sw-param-hint">1 real second → 1/speedup second of video (1800 = 30 min/sec)</span>
+            </span>
+            <input class="sw-param-input" type="number" id="sw-speedup"
+                   value="1800" min="60" max="86400" step="60" />
+          </label>
+        </div>
+
+        <div class="sw-param-group">
+          <h3 class="sw-param-group-title">Display Stretch</h3>
+
+          <label class="sw-param-row">
+            <span class="sw-param-lbl">Gamma
+              <span class="sw-param-hint">0.3 = bright / contrasty · 1.0 = linear</span>
+            </span>
+            <div class="sw-slider-row">
+              <input type="range" class="sw-slider" id="sw-gamma-range"
+                     min="0.2" max="1.5" step="0.05" value="0.7" />
+              <input class="sw-param-input sw-param-input-sm" type="number"
+                     id="sw-gamma" value="0.7" min="0.2" max="1.5" step="0.05" />
+            </div>
+          </label>
+
+          <label class="sw-param-row">
+            <span class="sw-param-lbl">White point %
+              <span class="sw-param-hint">Percentile mapped to white (98–100)</span>
+            </span>
+            <div class="sw-slider-row">
+              <input type="range" class="sw-slider" id="sw-high-pct-range"
+                     min="90" max="100" step="0.1" value="99.5" />
+              <input class="sw-param-input sw-param-input-sm" type="number"
+                     id="sw-high-pct" value="99.5" min="90" max="100" step="0.1" />
+            </div>
+          </label>
+
+          <label class="sw-param-row">
+            <span class="sw-param-lbl">Sky percentile
+              <span class="sw-param-hint">Background sample percentile (corners, outside disk)</span>
+            </span>
+            <div class="sw-slider-row">
+              <input type="range" class="sw-slider" id="sw-sky-pct-range"
+                     min="1" max="30" step="0.5" value="5" />
+              <input class="sw-param-input sw-param-input-sm" type="number"
+                     id="sw-sky-pct" value="5.0" min="1" max="30" step="0.5" />
+            </div>
+          </label>
+        </div>
+
+        <div class="sw-param-group">
+          <h3 class="sw-param-group-title">Output</h3>
+
+          <label class="sw-param-row">
+            <span class="sw-param-lbl">Output size (px)
+              <span class="sw-param-hint">Square canvas — disk fills ~86 %</span>
+            </span>
+            <select class="sw-param-input" id="sw-size">
+              <option value="720">720 × 720</option>
+              <option value="1080" selected>1080 × 1080</option>
+              <option value="1440">1440 × 1440</option>
+            </select>
+          </label>
+
+          <label class="sw-param-row sw-param-row-checkbox">
+            <input type="checkbox" id="sw-no-cache" />
+            <span class="sw-param-lbl">Force re-detect
+              <span class="sw-param-hint">Re-run disk detection (ignore cache)</span>
+            </span>
+          </label>
+
+          <label class="sw-param-row">
+            <span class="sw-param-lbl">Stabilise (frames)
+              <span class="sw-param-hint">Smooth disk-center jitter from wind (0 = off, 7 = good for breezy)</span>
+            </span>
+            <input class="sw-param-input" type="number" id="sw-stab-window"
+                   value="0" min="0" max="31" step="2" />
+          </label>
+        </div>
+
+        <div class="sw-param-group">
+          <h3 class="sw-param-group-title">Filtering</h3>
+
+          <label class="sw-param-row">
+            <span class="sw-param-lbl">Min quality
+              <span class="sw-param-hint">Minimum sharpness score to keep a frame (default 5 — raise to reject blurry or partially-blocked frames)</span>
+            </span>
+            <input class="sw-param-input" type="number" id="sw-min-quality"
+                   value="5" min="1" max="200" step="1" />
+          </label>
+        </div>
+
+      </div><!-- .sw-params-grid -->
+
+      <details class="sw-tips">
+        <summary class="sw-tips-summary">Tips &amp; Troubleshooting</summary>
+        <div class="sw-tips-body">
+
+          <div class="sw-tip">
+            <span class="sw-tip-label">Re-rendering is fast</span>
+            The slow part (Pass 1 — disk detection) is cached in
+            <code>solar_alignment.json</code>. Changing any parameter and
+            clicking Re-render only re-runs Pass 2 &amp; 3, usually a matter of
+            seconds. Use it freely to tune the look.
+          </div>
+
+          <div class="sw-tip">
+            <span class="sw-tip-label">Trees &amp; cloud occlusion</span>
+            Frames where trees or clouds block the disk are usually rejected
+            automatically — the radius-drift check discards frames where
+            HoughCircles returns a wrong disk size, and the sharpness check
+            discards frames where the limb is blurred by partial obstruction.
+            If blocked frames still appear in your timelapse, raise
+            <em>Min Quality</em> and re-render.
+          </div>
+
+          <div class="sw-tip">
+            <span class="sw-tip-label">Min quality tuning</span>
+            The default of 5 is permissive. On a session with good seeing you
+            can raise it to 20–50 to keep only the sharpest frames. On a hazy
+            or high-altitude session you may need to lower it if too many frames
+            are being rejected. Check the render log — it reports how many
+            frames were accepted vs. rejected per video.
+          </div>
+
+          <div class="sw-tip">
+            <span class="sw-tip-label">Stabilise (wind jitter)</span>
+            Applies a Gaussian rolling smooth to the detected disk-center
+            positions before normalisation. Try <strong>7</strong> for a light
+            breeze, up to <strong>15</strong> for gustier conditions. Leave at 0
+            on calm days — it has no effect and adds no cost.
+          </div>
+
+          <div class="sw-tip">
+            <span class="sw-tip-label">Speedup &amp; pacing</span>
+            At the default 1800×, 30 real minutes of solar session becomes
+            1 second of timelapse. Halve it to 900 for slower, more
+            dramatic-feeling movement; double it to 3600 for a very
+            compressed summary of a long session.
+          </div>
+
+        </div>
+      </details>
+
+      <div class="sw-step-nav">
+        <button class="btn btn-secondary" id="sw-back-to-1-btn">← Back</button>
+        <button class="btn" id="sw-render-btn">☀ Start Render</button>
+      </div>
+    </section>
+
+    <!-- ──────────────────────────────────────────────────────────────────── -->
+    <!-- Step 3 — Render                                                        -->
+    <!-- ──────────────────────────────────────────────────────────────────── -->
+    <section class="wizard-panel" id="sw-panel-3" style="display:none">
+      <h2 class="panel-title">Step 3 — Rendering</h2>
+
+      <div class="sw-progress-wrap" id="sw-progress-wrap">
+        <div class="sw-progress-bar-bg">
+          <div class="sw-progress-bar" id="sw-progress-bar" style="width:0%"></div>
+        </div>
+        <div class="sw-progress-msg" id="sw-progress-msg">Starting…</div>
+      </div>
+
+      <div class="sw-log-header" id="sw-log-header" style="display:none">
+        <span class="sw-log-label">Log</span>
+        <span class="sw-elapsed" id="sw-elapsed"></span>
+      </div>
+      <div class="sw-log-wrap" id="sw-log-wrap" style="display:none">
+        <pre class="sw-log" id="sw-log"></pre>
+      </div>
+
+      <div class="sw-render-actions" id="sw-render-actions">
+        <button class="btn btn-secondary btn-sm" id="sw-back-to-params-btn">← Back to Parameters</button>
+        <button class="btn btn-danger btn-sm"    id="sw-cancel-btn">✕ Cancel</button>
+      </div>
+
+      <div id="sw-results" style="display:none">
+        <div class="sw-result-topbar">
+          <span class="sw-result-label" id="sw-result-label"></span>
+        </div>
+
+        <div class="sw-result-grid" id="sw-result-grid">
+          <!-- Cards injected by JS -->
+        </div>
+
+        <div class="sw-step-nav">
+          <button class="btn btn-secondary" id="sw-rerender-btn">↺ Re-render</button>
+          <button class="btn btn-secondary" id="sw-forget-btn">✕ Forget</button>
+        </div>
+      </div>
+
+      <div class="sw-error" id="sw-error" style="display:none"></div>
+    </section>
+
+  </main>
+
+  <script>const SW_DATA_DIR = {{ data_dir | tojson }};</script>
+  <script src="{{ static_ver('js/solar_wizard.js') }}"></script>
+</body>
+</html>

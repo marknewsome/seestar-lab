@@ -26,6 +26,11 @@ track-path composite.
 | **Aircraft lookup** | Detected events are cross-referenced against the OpenSky Network ADS-B feed to identify the aircraft |
 | **Activity heatmap** | Calendar heatmap showing daily sub counts or session counts across the full observation history |
 | **Live updates** | A Server-Sent Events stream pushes progress to the browser in real time — no polling, no page reloads |
+| **Solar Timelapse wizard** | 3-step wizard: scan a directory of Seestar solar MP4 clips, tune parameters (sampling, stretch, stabilisation, quality filtering), render a disk-normalised VFR timelapse with title card and portrait. Pass 1 disk-detection results are cached so re-renders are fast. |
+| **Lunar Timelapse wizard** | Step-by-step pipeline for lunar sessions: select videos, choose render mode (Standard / Enhanced / Surface detail), configure stretch and quality parameters, produce an MP4 timelapse with title card. Supports cancel, back-to-parameters, and result persistence. |
+| **Live Capture** | RTSP stream viewer and recorder. Add one or more Seestar RTSP URLs; view the live MJPEG feed in the browser; optionally record to `SEESTAR_DATA_DIR/captures/` with auto-named MP4 files. Stream configs are persisted in browser localStorage. |
+| **Observing Planner** | Visibility planner for DSO and solar-system objects: shows rise/set times, altitude curves, and optimal observing windows for the configured observer location. |
+| **Result persistence** | Completed solar and lunar timelapse results are saved in browser localStorage (keyed by directory, 30-day TTL). Returning to a previously-rendered directory shows the results without re-rendering. A "Forget" button clears the saved state; "Re-render" re-runs Pass 2+3 using the cached disk-detection data. |
 
 ---
 
@@ -93,6 +98,10 @@ static/js/app.js     Sessions-page UI; SSE client; transit controls; stack contr
 static/js/comet_wizard.js  Comet wizard multi-step UI; frame grid; preview; job polling; frame browser
 static/js/catalog.js Messier / Caldwell bingo-card pages
 static/js/transits.js Transit gallery page; running-indicator logic
+solar_processor.py   Solar disk-normalised timelapse pipeline (3-pass: HoughCircles disk detection with JSON cache, affine normalisation + stretch, VFR MP4 assembly via ffconcat)
+static/js/solar_wizard.js  Solar timelapse wizard UI — 3-step flow, per-directory localStorage persistence, reconnect on page reload
+static/js/lunar_wizard.js  Lunar timelapse wizard UI — mode selection, cancel/back support, result persistence
+static/js/capture.js       Live capture page — RTSP stream cards, MJPEG viewer, recording start/stop, status polling
 templates/           Jinja2 HTML templates
 ```
 
@@ -116,6 +125,19 @@ Filesystem
                               db.transit_events ──► SSE ──► browser        frame review JPEGs
                                        │                                           │
                               aircraft_lookup.py (OpenSky)            job status polling ──► browser
+
+                    User clicks "☀ Start Render"       User clicks "⏺ Record"
+                              ▼                                ▼
+                 app.py ──► _solar_jobs (thread)    _capture_recs (thread)
+                                  │                          │
+                      solar_processor.py              ffmpeg -c copy
+                        Pass 1: HoughCircles              to DATA_DIR/captures/
+                        Pass 2: normalise + stretch
+                        Pass 3: VFR MP4 + title card
+                                  │
+                       solar_fulldisk.mp4
+                       solar_portrait.jpg
+                       solar_alignment.json (cache)
 ```
 
 **Local SSD caching** — if the source video is on a different storage device from the
@@ -349,6 +371,71 @@ frame and a good approximation for all others.
 
 ---
 
+## Solar Timelapse Wizard
+
+The Solar Timelapse Wizard processes directories of Seestar solar video clips into a
+disk-normalised VFR timelapse and a sharpness-ranked portrait.  Navigate to `/solar`.
+
+### Pipeline passes (`solar_processor.py`)
+
+| Pass | Description |
+|---|---|
+| 1 | **Disk detection** — Each source video is sampled at ~1 frame/second. Timestamps are parsed from the Seestar filename (`YYYY-MM-DD-HHMMSS`). Each frame is converted to grayscale and `HoughCircles` locates the solar disk. A Laplacian variance score estimates limb sharpness. Frames whose detected radius deviates more than 15 % from the per-video median are rejected. Results cached to `solar_alignment.json`. |
+| 2 | **Normalisation** — Each accepted frame is warped to a fixed `out_size × out_size` canvas so the disk fills ~86 % of the frame. Background subtraction and gamma stretch are applied. |
+| 3 | **Assembly** — Frames are sorted by UTC timestamp. VFR display durations are computed from real time gaps divided by the speedup factor, clamped to [1/60, 5] s. A title card (3 s) is prepended. `ffconcat` demuxer assembles the JPEG sequence into H.264 MP4. A portrait (sharpest frame with label overlay) is saved as JPEG. |
+
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| Sample interval | 1.0 s | Seconds between extracted frames per video |
+| Speedup | 1800× | 30 real minutes → 1 second of timelapse |
+| Gamma | 0.7 | Tone-mapping exponent (lower = brighter/more contrast) |
+| White point % | 99.5 | Percentile mapped to white |
+| Sky percentile | 5 % | Background sample percentile for subtraction |
+| Output size | 1080 px | Square canvas side length |
+| Min quality | 5 | Laplacian variance threshold; raise to reject blurry/occluded frames |
+| Stabilise | 0 | Gaussian rolling-average window (frames) applied to detected disk-centre positions before normalisation; smooths wind jitter |
+
+Re-rendering with different parameters re-runs only Passes 2 and 3 — Pass 1 is read from the JSON cache, making re-renders take seconds rather than minutes.
+
+---
+
+## Lunar Timelapse Wizard
+
+The Lunar Timelapse Wizard processes directories of Seestar lunar video clips into an MP4
+timelapse with a title card.  Navigate to `/lunar`.
+
+The wizard supports selecting videos, choosing a render mode (Standard / Enhanced / Surface
+detail), configuring stretch and quality parameters, and producing the timelapse.  Cancel
+and back-to-parameters navigation are available at any step.  Completed results are
+persisted in browser localStorage so returning to a previously-rendered directory restores
+the output without re-rendering.
+
+---
+
+## Live Capture
+
+The Capture page (`/capture`) provides a live RTSP viewer and optional recorder for one or
+more Seestar streams.  Useful for watching lunar eclipses, planetary transits, or any event
+where you want a persistent recording alongside the live view.
+
+### How it works
+
+- **Live view** — Flask proxies the RTSP stream through `ffmpeg`, re-encoding as MJPEG and
+  serving it as `multipart/x-mixed-replace` to a plain `<img>` tag.  No JavaScript library
+  is required.  Latency is ~1–3 seconds.
+- **Recording** — a separate `ffmpeg -c copy` process writes the stream directly to an MP4
+  file in `SEESTAR_DATA_DIR/captures/`, preserving the original H.264 stream without
+  re-encoding.  Recording and viewing run independently.
+- **Persistence** — stream configurations (name + URL) are saved in browser localStorage.
+  Configured streams reappear on the next visit.
+
+Output files are named `{stream_name}_{YYYYMMDD_HHMMSS}.mp4` and land in
+`SEESTAR_DATA_DIR/captures/` alongside other raw Seestar data.
+
+---
+
 ## Activity Heatmap
 
 `/activity` shows a full-year calendar heatmap of observation history.
@@ -570,6 +657,10 @@ thin-cloud artefacts.
 | `GET` | `/activity` | Activity heatmap page |
 | `GET` | `/comet` | Comet wizard page |
 | `GET` | `/impacts` | Lunar impact events page |
+| `GET` | `/solar` | Solar timelapse wizard |
+| `GET` | `/lunar` | Lunar timelapse wizard |
+| `GET` | `/planner` | Observing planner |
+| `GET` | `/capture` | Live RTSP capture page |
 
 ### Sessions & scanning
 
@@ -625,6 +716,34 @@ thin-cloud artefacts.
 | `GET` | `/api/comet/frames?dir=<path>` | JSON: list of annotated frame JPEGs in `{dir}/_frames/` |
 | `GET` | `/api/comet/info?name=<name>` | JSON: JPL SBDB designation and orbit class for a comet name |
 | `GET` | `/api/comet/discover` | JSON: all comet session directories found under `SEESTAR_DATA_DIR` |
+
+### Solar Timelapse
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/solar/scan` | Scan a directory for solar video files — body: `{"directory": str}`; returns file list with dates and durations |
+| `POST` | `/api/solar/render` | Launch render job — body: `{directory, files[], size, sample_interval, speedup, gamma, sky_pct, high_pct, no_cache, stab_window, min_quality}`; returns `job_id` |
+| `GET` | `/api/solar/status?job_id=<id>` | JSON: job status, progress pct, log lines, outputs |
+| `POST` | `/api/solar/cancel` | Cancel a running job — body: `{"job_id": str}` |
+| `GET` | `/api/solar/output?path=<path>` | Serve a solar output file (MP4 or JPEG) by absolute path |
+
+### Lunar Timelapse
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/lunar/scan` | Scan for lunar video sessions |
+| `POST` | `/api/lunar/render` | Launch render job |
+| `GET` | `/api/lunar/status?job_id=<id>` | Job status |
+| `POST` | `/api/lunar/cancel` | Cancel a running job |
+
+### Live Capture
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/capture/mjpeg?url=<rtsp_url>` | MJPEG proxy — streams `multipart/x-mixed-replace` from ffmpeg decoding the RTSP source |
+| `POST` | `/api/capture/record/start` | Start recording — body: `{"rtsp_url": str, "name": str}`; returns `{rec_id, out_path}` |
+| `POST` | `/api/capture/record/stop` | Stop recording — body: `{"rec_id": str}`; returns `{out_path, size_bytes}` |
+| `GET` | `/api/capture/record/status` | JSON: list of active recordings with `{id, name, elapsed_s, size_bytes, out_path}` |
 
 ### Activity
 

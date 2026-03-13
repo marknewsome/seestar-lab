@@ -214,6 +214,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path as _Path
@@ -1640,6 +1641,642 @@ def api_comet_cancel():
     return jsonify({"ok": True})
 
 
+# ── Solar timelapse wizard ─────────────────────────────────────────────────────
+
+_solar_jobs: dict = {}
+_solar_jobs_lock  = threading.Lock()
+
+
+def _solar_output_exists(directory: str, name: str):
+    p = os.path.join(directory, name)
+    return p if os.path.isfile(p) else None
+
+
+def _run_solar_job(job_id: str, cmd: list, out_dir: str) -> None:
+    _PASS_RE = re.compile(r"\[Pass\s+(\d+)\]")
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        with _solar_jobs_lock:
+            _solar_jobs[job_id]["proc"] = proc
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            with _solar_jobs_lock:
+                job = _solar_jobs[job_id]
+                job["log"].append(line)
+                if len(job["log"]) > 500:
+                    job["log"].pop(0)
+                job["message"] = line
+                m = _PASS_RE.search(line)
+                if m:
+                    job["pct"] = min(int((int(m.group(1)) - 1) / 3 * 90), 90)
+        proc.wait()
+        with _solar_jobs_lock:
+            job = _solar_jobs[job_id]
+            if proc.returncode == 0:
+                job["status"]  = "done"
+                job["pct"]     = 100
+                job["outputs"] = {
+                    "timelapse":   _solar_output_exists(out_dir, "solar_fulldisk.mp4"),
+                    "portrait":    _solar_output_exists(out_dir, "solar_portrait.jpg"),
+                    "frame_count": 0,
+                    "date_label":  "",
+                }
+                log_text = "\n".join(job["log"])
+                m = re.search(r"Total accepted frames:\s*(\d+)", log_text)
+                if m:
+                    job["outputs"]["frame_count"] = int(m.group(1))
+                m = re.search(r"date_label.*?([0-9]{4}-[0-9]{2}-[0-9]{2}.*?)[\n\"]", log_text)
+                if m:
+                    job["outputs"]["date_label"] = m.group(1).strip()
+            else:
+                job["status"] = "error"
+                job["error"]  = f"Process exited {proc.returncode}"
+    except Exception as exc:
+        if proc is not None:
+            try: proc.kill()
+            except Exception: pass
+        with _solar_jobs_lock:
+            job = _solar_jobs.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"]  = f"Internal error: {exc}"
+
+
+@app.route("/solar")
+def solar_wizard() -> str:
+    return render_template("solar.html", data_dir=DATA_DIR)
+
+
+@app.route("/api/solar/scan", methods=["POST"])
+def api_solar_scan():
+    """Scan a directory for solar video files."""
+    body      = request.get_json(silent=True) or {}
+    directory = body.get("directory", "").strip()
+    if not directory or not os.path.isdir(directory):
+        return jsonify({"error": f"Directory not found: {directory}"}), 400
+
+    VIDEO_EXT = {".mp4", ".avi", ".mov", ".mkv"}
+    files = []
+
+    try:
+        for fname in sorted(os.listdir(directory)):
+            if fname.startswith(".") or fname.startswith("solar_"):
+                continue
+            ext = _Path(fname).suffix.lower()
+            if ext not in VIDEO_EXT:
+                continue
+            fpath = os.path.join(directory, fname)
+
+            # Extract date from filename (YYYY-MM-DD-HHMMSS pattern)
+            date_str = ""
+            import re as _re
+            m = _re.search(r'(\d{4}-\d{2}-\d{2})', fname)
+            if m:
+                date_str = m.group(1)
+
+            # Get duration with cv2 if available
+            dur_s = 0.0
+            try:
+                import cv2 as _cv2
+                cap = _cv2.VideoCapture(fpath)
+                if cap.isOpened():
+                    fps  = cap.get(_cv2.CAP_PROP_FPS) or 0
+                    nfrm = cap.get(_cv2.CAP_PROP_FRAME_COUNT) or 0
+                    if fps > 0 and nfrm > 0:
+                        dur_s = nfrm / fps
+                cap.release()
+            except Exception:
+                pass
+
+            files.append({
+                "path":       fpath,
+                "name":       fname,
+                "date":       date_str,
+                "duration_s": round(dur_s, 1),
+            })
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"directory": directory, "count": len(files), "files": files})
+
+
+@app.route("/api/solar/render", methods=["POST"])
+def api_solar_render():
+    body      = request.get_json(silent=True) or {}
+    directory = body.get("directory", "").strip()
+    sel_files = body.get("files", [])
+    if not directory or not sel_files:
+        return jsonify({"error": "directory and files required"}), 400
+
+    job_id = hashlib.md5(f"solar:{directory}:{datetime.utcnow().isoformat()}".encode()).hexdigest()[:12]
+    with _solar_jobs_lock:
+        _solar_jobs[job_id] = {
+            "id": job_id, "status": "running", "pct": 0,
+            "message": "Starting…", "log": [], "error": None, "outputs": {},
+        }
+
+    cmd = [
+        sys.executable, "-u",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "solar_processor.py"),
+        directory,
+        "--files-json",      json.dumps(sel_files),
+        "--size",            str(body.get("size",            1080)),
+        "--sample-interval", str(body.get("sample_interval", 1.0)),
+        "--speedup",         str(body.get("speedup",         1800.0)),
+        "--gamma",           str(body.get("gamma",           0.7)),
+        "--sky-pct",         str(body.get("sky_pct",         5.0)),
+        "--high-pct",        str(body.get("high_pct",        99.5)),
+    ]
+    if body.get("no_cache"):
+        cmd.append("--no-cache")
+    stab = int(body.get("stab_window", 0))
+    if stab >= 3:
+        cmd += ["--stab-window", str(stab)]
+    min_q = body.get("min_quality")
+    if min_q is not None:
+        cmd += ["--min-quality", str(float(min_q))]
+
+    threading.Thread(target=_run_solar_job, args=(job_id, cmd, directory),
+                     daemon=True, name=f"solar-{job_id}").start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/solar/status")
+def api_solar_status():
+    job_id = request.args.get("job_id", "")
+    with _solar_jobs_lock:
+        job = _solar_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({k: v for k, v in job.items() if k != "proc"})
+
+
+@app.route("/api/solar/output")
+def api_solar_output():
+    """Serve a solar output file (mp4 / jpg) by absolute path."""
+    path = request.args.get("path", "")
+    if not path or not os.path.isfile(path):
+        abort(404)
+    ext  = os.path.splitext(path)[1].lower()
+    mime = {".mp4": "video/mp4", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext)
+    if not mime:
+        abort(400)
+    return send_file(path, mimetype=mime, conditional=True)
+
+
+# ── Solar cancel ──────────────────────────────────────────────────────────────
+
+@app.route("/api/solar/cancel", methods=["POST"])
+def api_solar_cancel():
+    body   = request.get_json(silent=True) or {}
+    job_id = body.get("job_id", "")
+    with _solar_jobs_lock:
+        job = _solar_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    proc = job.get("proc")
+    if proc and proc.poll() is None:
+        proc.terminate()
+    with _solar_jobs_lock:
+        _solar_jobs[job_id]["status"] = "error"
+        _solar_jobs[job_id]["error"]  = "Cancelled by user"
+    return jsonify({"ok": True})
+
+
+# ── Lunar timelapse wizard ─────────────────────────────────────────────────────
+
+_lunar_jobs: dict = {}
+_lunar_jobs_lock  = threading.Lock()
+
+LUNAR_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "lunar")
+
+
+def _lunar_output_exists(directory: str, name: str):
+    p = os.path.join(directory, name)
+    return p if os.path.isfile(p) else None
+
+
+def _run_lunar_job(job_id: str, cmd: list, out_dir: str) -> None:
+    _PASS_RE = re.compile(r"\[Pass\s+(\d+)\]")
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        with _lunar_jobs_lock:
+            _lunar_jobs[job_id]["proc"] = proc
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            with _lunar_jobs_lock:
+                job = _lunar_jobs[job_id]
+                job["log"].append(line)
+                if len(job["log"]) > 500:
+                    job["log"].pop(0)
+                job["message"] = line
+                m = _PASS_RE.search(line)
+                if m:
+                    job["pct"] = min(int((int(m.group(1)) - 1) / 3 * 90), 90)
+        proc.wait()
+        with _lunar_jobs_lock:
+            job = _lunar_jobs[job_id]
+            if proc.returncode == 0:
+                job["status"] = "done"
+                job["pct"]    = 100
+                mode = job.get("mode", "phase")
+                tl_name = "lunar_phases.mp4" if mode == "phase" else "lunar_session.mp4"
+                job["outputs"] = {
+                    "timelapse":   _lunar_output_exists(out_dir, tl_name),
+                    "portrait":    _lunar_output_exists(out_dir, "lunar_portrait.jpg"),
+                    "mosaic":      _lunar_output_exists(out_dir, "lunar_mosaic.jpg"),
+                    "frame_count": 0,
+                    "date_label":  "",
+                    "mode":        mode,
+                }
+                log_text = "\n".join(job["log"])
+                m = re.search(r"Total accepted (?:frames|sessions):\s*(\d+)", log_text)
+                if m:
+                    job["outputs"]["frame_count"] = int(m.group(1))
+            else:
+                job["status"] = "error"
+                job["error"]  = f"Process exited {proc.returncode}"
+    except Exception as exc:
+        if proc is not None:
+            try: proc.kill()
+            except Exception: pass
+        with _lunar_jobs_lock:
+            job = _lunar_jobs.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"]  = f"Internal error: {exc}"
+
+
+@app.route("/lunar")
+def lunar_wizard() -> str:
+    return render_template("lunar.html", data_dir=DATA_DIR)
+
+
+@app.route("/api/lunar/sessions")
+def api_lunar_sessions():
+    """Return lunar sessions from DB, optionally filtered by date range."""
+    from_date = request.args.get("from", "")
+    to_date   = request.args.get("to",   "")
+
+    sessions = db.get_all_sessions()
+    lunar = [
+        s for s in sessions
+        if s.get("object_type", "").lower() in ("lunar", "moon")
+        or (s.get("object_name", "").lower() in ("moon", "lunar"))
+    ]
+
+    # Filter by date range if provided
+    if from_date or to_date:
+        filtered = []
+        for s in lunar:
+            dates = s.get("dates") or []
+            if isinstance(dates, str):
+                try:
+                    dates = json.loads(dates)
+                except Exception:
+                    dates = []
+            if not dates:
+                filtered.append(s)
+                continue
+            latest = max(dates)
+            earliest = min(dates)
+            if from_date and latest < from_date:
+                continue
+            if to_date and earliest > to_date:
+                continue
+            filtered.append(s)
+        lunar = filtered
+
+    # Enrich with approximate phase data using the first date of each session
+    try:
+        import math as _math
+        _KNOWN_NEW_JD = 2451550.1
+        _LUNAR_CYCLE  = 29.530588
+
+        def _approx_phase(date_str: str):
+            try:
+                dt = datetime.fromisoformat(date_str + "T12:00:00+00:00")
+                ref = datetime(2000, 1, 6, 18, 14, tzinfo=timezone.utc)
+                age = ((dt - ref).total_seconds() / 86400) % _LUNAR_CYCLE
+                elong = (age / _LUNAR_CYCLE) * 2 * _math.pi
+                illum = (1.0 - _math.cos(elong)) / 2.0 * 100.0
+                # Phase name
+                if age < 1 or age > 28.5:    name = "New Moon"
+                elif age < 6.5:              name = "Waxing Crescent"
+                elif age < 8:                name = "First Quarter"
+                elif age < 13.5:             name = "Waxing Gibbous"
+                elif age < 15.5:             name = "Full Moon"
+                elif age < 21.5:             name = "Waning Gibbous"
+                elif age < 23:               name = "Last Quarter"
+                else:                        name = "Waning Crescent"
+                return round(illum, 1), round(age, 1), name
+            except Exception:
+                return None, None, None
+
+        for s in lunar:
+            dates = s.get("dates") or []
+            if isinstance(dates, str):
+                try:
+                    dates = json.loads(dates)
+                except Exception:
+                    dates = []
+            first_date = min(dates) if dates else ""
+            if first_date:
+                illum, age, pname = _approx_phase(first_date)
+                s["illum_pct"]  = illum
+                s["age_days"]   = age
+                s["phase_name"] = pname
+            else:
+                s["illum_pct"]  = None
+                s["age_days"]   = None
+                s["phase_name"] = None
+            # Ensure paths is a list (not JSON string)
+            paths = s.get("paths", [])
+            if isinstance(paths, str):
+                try:
+                    paths = json.loads(paths)
+                except Exception:
+                    paths = []
+            s["paths"] = paths
+            # Ensure dates is a list
+            if isinstance(s.get("dates"), str):
+                try:
+                    s["dates"] = json.loads(s["dates"])
+                except Exception:
+                    s["dates"] = []
+    except Exception as exc:
+        print(f"[lunar/sessions] enrichment error: {exc}")
+
+    os.makedirs(LUNAR_OUTPUT_DIR, exist_ok=True)
+    return jsonify({"sessions": lunar, "output_dir": LUNAR_OUTPUT_DIR})
+
+
+@app.route("/api/lunar/scan", methods=["POST"])
+def api_lunar_scan():
+    """Scan a directory for lunar video files (single-session mode)."""
+    body      = request.get_json(silent=True) or {}
+    directory = body.get("directory", "").strip()
+    if not directory or not os.path.isdir(directory):
+        return jsonify({"error": f"Directory not found: {directory}"}), 400
+
+    VIDEO_EXT_SET = {".mp4", ".avi", ".mov", ".mkv"}
+    files = []
+    try:
+        for fname in sorted(os.listdir(directory)):
+            if fname.startswith(".") or fname.startswith("lunar_"):
+                continue
+            ext = _Path(fname).suffix.lower()
+            if ext not in VIDEO_EXT_SET:
+                continue
+            fpath = os.path.join(directory, fname)
+            date_str = ""
+            m = re.search(r'(\d{4}-\d{2}-\d{2})', fname)
+            if m:
+                date_str = m.group(1)
+            dur_s = 0.0
+            try:
+                import cv2 as _cv2
+                cap = _cv2.VideoCapture(fpath)
+                if cap.isOpened():
+                    fps  = cap.get(_cv2.CAP_PROP_FPS) or 0
+                    nfrm = cap.get(_cv2.CAP_PROP_FRAME_COUNT) or 0
+                    if fps > 0 and nfrm > 0:
+                        dur_s = nfrm / fps
+                cap.release()
+            except Exception:
+                pass
+            files.append({"path": fpath, "name": fname, "date": date_str,
+                          "duration_s": round(dur_s, 1)})
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"directory": directory, "count": len(files), "files": files})
+
+
+@app.route("/api/lunar/render", methods=["POST"])
+def api_lunar_render():
+    body = request.get_json(silent=True) or {}
+    mode = body.get("mode", "phase")
+
+    if mode == "phase":
+        sessions = body.get("sessions", [])
+        if not sessions:
+            return jsonify({"error": "sessions list required"}), 400
+        out_dir = LUNAR_OUTPUT_DIR
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = [
+            sys.executable, "-u",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "lunar_processor.py"),
+            "phase", out_dir,
+            "--sessions-json", json.dumps(sessions),
+            "--size",       str(body.get("size",       1080)),
+            "--gamma",      str(body.get("gamma",      0.8)),
+            "--sky-pct",    str(body.get("sky_pct",    5.0)),
+            "--high-pct",   str(body.get("high_pct",   99.5)),
+            "--frame-hold", str(body.get("frame_hold", 1.5)),
+        ]
+        if body.get("no_cache"):
+            cmd.append("--no-cache")
+    else:
+        directory  = body.get("directory", "").strip()
+        sel_files  = body.get("files", [])
+        if not directory or not sel_files:
+            return jsonify({"error": "directory and files required"}), 400
+        out_dir = directory
+        cmd = [
+            sys.executable, "-u",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "lunar_processor.py"),
+            "single", directory,
+            "--files-json",      json.dumps(sel_files),
+            "--size",            str(body.get("size",            1080)),
+            "--sample-interval", str(body.get("sample_interval", 1.0)),
+            "--speedup",         str(body.get("speedup",         1800.0)),
+            "--gamma",           str(body.get("gamma",           0.8)),
+            "--sky-pct",         str(body.get("sky_pct",         5.0)),
+            "--high-pct",        str(body.get("high_pct",        99.5)),
+        ]
+        if body.get("no_cache"):
+            cmd.append("--no-cache")
+
+    job_id = hashlib.md5(f"lunar:{mode}:{out_dir}:{datetime.utcnow().isoformat()}".encode()).hexdigest()[:12]
+    with _lunar_jobs_lock:
+        _lunar_jobs[job_id] = {
+            "id": job_id, "status": "running", "pct": 0,
+            "message": "Starting…", "log": [], "error": None,
+            "outputs": {}, "mode": mode,
+        }
+
+    threading.Thread(target=_run_lunar_job, args=(job_id, cmd, out_dir),
+                     daemon=True, name=f"lunar-{job_id}").start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/lunar/status")
+def api_lunar_status():
+    job_id = request.args.get("job_id", "")
+    with _lunar_jobs_lock:
+        job = _lunar_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({k: v for k, v in job.items() if k != "proc"})
+
+
+@app.route("/api/lunar/cancel", methods=["POST"])
+def api_lunar_cancel():
+    body   = request.get_json(silent=True) or {}
+    job_id = body.get("job_id", "")
+    with _lunar_jobs_lock:
+        job = _lunar_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    proc = job.get("proc")
+    if proc and proc.poll() is None:
+        proc.terminate()
+    with _lunar_jobs_lock:
+        _lunar_jobs[job_id]["status"] = "error"
+        _lunar_jobs[job_id]["error"]  = "Cancelled by user"
+    return jsonify({"ok": True})
+
+
+@app.route("/api/lunar/output")
+def api_lunar_output():
+    """Serve a lunar output file (mp4 / jpg) by absolute path."""
+    path = request.args.get("path", "")
+    if not path or not os.path.isfile(path):
+        abort(404)
+    ext  = os.path.splitext(path)[1].lower()
+    mime = {".mp4": "video/mp4", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext)
+    if not mime:
+        abort(400)
+    return send_file(path, mimetype=mime, conditional=True)
+
+
+# ── DSO Planner ───────────────────────────────────────────────────────────────
+
+_planner_tasks: dict = {}
+_planner_lock         = threading.Lock()
+
+
+def _get_obs_location() -> dict:
+    """Return observer location from DB meta, or None if not set."""
+    lat = db.get_meta("obs_lat")
+    lon = db.get_meta("obs_lon")
+    if lat is None or lon is None:
+        return {}
+    return {
+        "lat":       float(lat),
+        "lon":       float(lon),
+        "elevation": float(db.get_meta("obs_elevation") or 50),
+        "name":      db.get_meta("obs_name") or "",
+    }
+
+
+def _run_planner_task(task_id: str, lat: float, lon: float,
+                      elevation: float, obs_date_str: str) -> None:
+    try:
+        from planner import tonight_plan
+        from datetime import date as _date
+        obs_date = _date.fromisoformat(obs_date_str) if obs_date_str else None
+        sessions = db.get_all_sessions()
+        result   = tonight_plan(lat, lon, elevation, obs_date, sessions=sessions)
+        with _planner_lock:
+            _planner_tasks[task_id] = {"status": "done", "result": result}
+    except Exception as exc:
+        with _planner_lock:
+            _planner_tasks[task_id] = {"status": "error", "error": str(exc)}
+
+
+@app.route("/planner")
+def planner_page():
+    loc = _get_obs_location()
+    return render_template("planner.html", data_dir=DATA_DIR,
+                           obs_location=json.dumps(loc))
+
+
+@app.route("/api/planner/location", methods=["GET", "POST"])
+def api_planner_location():
+    if request.method == "GET":
+        return jsonify(_get_obs_location())
+    body = request.get_json(silent=True) or {}
+    lat  = body.get("lat")
+    lon  = body.get("lon")
+    if lat is None or lon is None:
+        return jsonify({"error": "lat and lon required"}), 400
+    db.set_meta("obs_lat",       str(lat))
+    db.set_meta("obs_lon",       str(lon))
+    db.set_meta("obs_elevation", str(body.get("elevation", 50)))
+    db.set_meta("obs_name",      str(body.get("name", "")))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/planner/tonight", methods=["POST"])
+def api_planner_tonight():
+    """Start a planner computation; return task_id immediately."""
+    body       = request.get_json(silent=True) or {}
+    lat        = body.get("lat")
+    lon        = body.get("lon")
+    elevation  = float(body.get("elevation", 50))
+    obs_date   = body.get("date", "")
+
+    if lat is None or lon is None:
+        # Try stored location
+        loc = _get_obs_location()
+        if not loc:
+            return jsonify({"error": "Location not set"}), 400
+        lat, lon, elevation = loc["lat"], loc["lon"], loc.get("elevation", 50)
+
+    # Persist location if provided in request
+    if body.get("lat") is not None:
+        db.set_meta("obs_lat",       str(lat))
+        db.set_meta("obs_lon",       str(lon))
+        db.set_meta("obs_elevation", str(elevation))
+        if body.get("name"):
+            db.set_meta("obs_name", str(body["name"]))
+
+    task_id = hashlib.md5(
+        f"plan:{lat:.4f}:{lon:.4f}:{obs_date}".encode()
+    ).hexdigest()[:12]
+
+    with _planner_lock:
+        existing = _planner_tasks.get(task_id)
+
+    if existing and existing.get("status") == "done":
+        return jsonify({"task_id": task_id, "cached": True})
+
+    with _planner_lock:
+        _planner_tasks[task_id] = {"status": "running"}
+
+    threading.Thread(
+        target=_run_planner_task,
+        args=(task_id, float(lat), float(lon), float(elevation), obs_date),
+        daemon=True, name=f"planner-{task_id}",
+    ).start()
+
+    return jsonify({"task_id": task_id, "cached": False})
+
+
+@app.route("/api/planner/status")
+def api_planner_status():
+    task_id = request.args.get("task_id", "")
+    with _planner_lock:
+        task = _planner_tasks.get(task_id)
+    if not task:
+        return jsonify({"error": "not found"}), 404
+    if task["status"] == "done":
+        return jsonify({"status": "done", "result": task["result"]})
+    if task["status"] == "error":
+        return jsonify({"status": "error", "error": task.get("error", "")})
+    return jsonify({"status": "running"})
+
+
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
     body  = request.get_json(silent=True) or {}
@@ -1659,6 +2296,182 @@ def api_status():
         "data_dir":  DATA_DIR,
         "sessions":  len(db.get_all_sessions()),
     })
+
+
+# ── Capture ───────────────────────────────────────────────────────────────────
+
+_capture_recs: dict = {}
+_capture_lock = threading.Lock()
+
+_FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+
+
+@app.route("/capture")
+def capture_page():
+    return render_template("capture.html", data_dir=DATA_DIR)
+
+
+@app.route("/api/capture/mjpeg")
+def api_capture_mjpeg():
+    """MJPEG proxy: reads ?url=rtsp://... and streams JPEG frames."""
+    url = request.args.get("url", "").strip()
+    if not url:
+        return Response("Missing ?url= parameter", status=400)
+
+    def generate():
+        cmd = [
+            _FFMPEG,
+            "-rtsp_transport", "tcp",
+            "-i", url,
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-q:v", "5",
+            "-r", "10",
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return
+
+        buf = b""
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    start = buf.find(b"\xff\xd8")
+                    if start == -1:
+                        buf = b""
+                        break
+                    end = buf.find(b"\xff\xd9", start + 2)
+                    if end == -1:
+                        buf = buf[start:]
+                        break
+                    frame = buf[start: end + 2]
+                    buf = buf[end + 2:]
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
+                        b"\r\n" + frame + b"\r\n"
+                    )
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/api/capture/record/start", methods=["POST"])
+def api_capture_record_start():
+    body = request.get_json(silent=True) or {}
+    rtsp_url = body.get("rtsp_url", "").strip()
+    name = body.get("name", "capture").strip() or "capture"
+    if not rtsp_url:
+        return jsonify({"error": "Missing rtsp_url"}), 400
+
+    captures_dir = os.path.join(DATA_DIR, "captures")
+    os.makedirs(captures_dir, exist_ok=True)
+
+    safe_name = re.sub(r"[^\w\-]", "_", name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{safe_name}_{timestamp}.mp4"
+    out_path = os.path.join(captures_dir, filename)
+
+    cmd = [
+        _FFMPEG,
+        "-rtsp_transport", "tcp",
+        "-i", rtsp_url,
+        "-c", "copy",
+        "-y",
+        out_path,
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return jsonify({"error": "ffmpeg not found"}), 500
+
+    rec_id = f"{int(time.time() * 1000):x}"
+    with _capture_lock:
+        _capture_recs[rec_id] = {
+            "id": rec_id,
+            "name": name,
+            "out_path": out_path,
+            "started": time.time(),
+            "proc": proc,
+        }
+
+    return jsonify({"rec_id": rec_id, "out_path": out_path})
+
+
+@app.route("/api/capture/record/stop", methods=["POST"])
+def api_capture_record_stop():
+    body = request.get_json(silent=True) or {}
+    rec_id = body.get("rec_id", "").strip()
+    with _capture_lock:
+        rec = _capture_recs.pop(rec_id, None)
+    if not rec:
+        return jsonify({"error": "Recording not found"}), 404
+
+    proc = rec["proc"]
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+    out_path = rec["out_path"]
+    size_bytes = 0
+    try:
+        size_bytes = os.path.getsize(out_path)
+    except OSError:
+        pass
+
+    return jsonify({"out_path": out_path, "size_bytes": size_bytes})
+
+
+@app.route("/api/capture/record/status")
+def api_capture_record_status():
+    result = []
+    dead = []
+    with _capture_lock:
+        for rec_id, rec in list(_capture_recs.items()):
+            proc = rec["proc"]
+            if proc.poll() is not None:
+                dead.append(rec_id)
+                continue
+            out_path = rec["out_path"]
+            size_bytes = 0
+            try:
+                size_bytes = os.path.getsize(out_path)
+            except OSError:
+                pass
+            result.append({
+                "id": rec_id,
+                "name": rec["name"],
+                "elapsed_s": time.time() - rec["started"],
+                "size_bytes": size_bytes,
+                "out_path": out_path,
+            })
+        for rec_id in dead:
+            _capture_recs.pop(rec_id, None)
+    return jsonify(result)
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────

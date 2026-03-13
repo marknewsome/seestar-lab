@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lunar Timelapse — Seestar Lab</title>
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
+</head>
+<body>
+
+  <header id="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/transits">Transits</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link" href="/comet">Comet</a>
+        <a class="nav-link" href="/solar">Solar</a>
+        <a class="nav-link active" href="/lunar">Lunar</a>
+        <a class="nav-link" href="/planner">Planner</a>
+        <a class="nav-link" href="/capture">Capture</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="lunar-wizard">
+
+    <!-- ── Lunar hero ──────────────────────────────────────────────────────── -->
+    <div class="lunar-hero" aria-hidden="true">
+      <svg class="lunar-svg" viewBox="0 0 420 100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <radialGradient id="moonGrad" cx="40%" cy="40%" r="60%">
+            <stop offset="0%"   stop-color="#f5f0e0" stop-opacity="1"/>
+            <stop offset="45%"  stop-color="#c8b98a" stop-opacity="0.95"/>
+            <stop offset="80%"  stop-color="#7a6a4a" stop-opacity="0.7"/>
+            <stop offset="100%" stop-color="#2a2010" stop-opacity="0"/>
+          </radialGradient>
+          <radialGradient id="glowGrad" cx="50%" cy="50%" r="50%">
+            <stop offset="55%"  stop-color="transparent"/>
+            <stop offset="75%"  stop-color="#c8b98a" stop-opacity="0.08"/>
+            <stop offset="100%" stop-color="transparent"/>
+          </radialGradient>
+        </defs>
+        <!-- Glow -->
+        <circle cx="210" cy="50" r="48" fill="url(#glowGrad)" />
+        <!-- Disk -->
+        <circle cx="210" cy="50" r="38" fill="url(#moonGrad)" />
+        <!-- Terminator shadow (waxing gibbous look) -->
+        <path d="M210,12 Q240,50 210,88 Q195,69 195,50 Q195,31 210,12 Z"
+              fill="#1a1510" fill-opacity="0.55"/>
+        <!-- Stars -->
+        <g fill="#c8b98a" fill-opacity="0.5">
+          <circle cx="148" cy="22" r="1.2"/><circle cx="162" cy="68" r="0.9"/>
+          <circle cx="140" cy="44" r="1.0"/><circle cx="280" cy="30" r="1.1"/>
+          <circle cx="270" cy="72" r="0.8"/><circle cx="295" cy="55" r="1.3"/>
+          <circle cx="155" cy="85" r="0.7"/><circle cx="300" cy="18" r="1.0"/>
+        </g>
+      </svg>
+      <div class="lunar-hero-text">
+        <h1 class="lunar-hero-title">Lunar Timelapse</h1>
+        <p class="lunar-hero-sub">Phase sequence &amp; colour timelapse from Seestar lunar sessions</p>
+      </div>
+    </div>
+
+    <!-- ── Mode tabs ───────────────────────────────────────────────────────── -->
+    <div class="lw-mode-tabs">
+      <button class="lw-tab active" id="lw-tab-phase" data-mode="phase">
+        ))) Phase Sequence
+      </button>
+      <button class="lw-tab" id="lw-tab-single" data-mode="single">
+        ☽ Single Session
+      </button>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <!-- Phase Sequence panel                                                   -->
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <section class="lw-panel" id="lw-phase-panel">
+
+      <div class="lw-section-title">Select Sessions</div>
+
+      <div class="lw-date-row">
+        <label class="lw-label" for="lw-from-date">From</label>
+        <input type="date" class="lw-date-input" id="lw-from-date" />
+        <label class="lw-label" for="lw-to-date">To</label>
+        <input type="date" class="lw-date-input" id="lw-to-date" />
+        <button class="btn btn-sm" id="lw-load-sessions-btn">Load Sessions</button>
+      </div>
+
+      <div id="lw-sessions-status" class="lw-scan-status"></div>
+
+      <div id="lw-sessions-wrap" style="display:none">
+        <div class="lw-sessions-header-row">
+          <span class="lw-session-count" id="lw-session-count"></span>
+          <label class="lw-toggle-all">
+            <input type="checkbox" id="lw-select-all-sessions" checked /> Select all
+          </label>
+        </div>
+        <div class="lw-sessions-table-wrap">
+          <table class="lw-sessions-table" id="lw-sessions-table">
+            <thead>
+              <tr>
+                <th class="col-check"></th>
+                <th class="col-date">Date</th>
+                <th class="col-name">Session</th>
+                <th class="col-phase">Phase</th>
+                <th class="col-vids">Videos</th>
+              </tr>
+            </thead>
+            <tbody id="lw-sessions-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Phase parameters -->
+      <div class="lw-params-section" id="lw-phase-params" style="display:none">
+        <div class="lw-section-title">Parameters</div>
+        <div class="lw-params-grid">
+
+          <div class="lw-param-group">
+            <h3 class="lw-param-group-title">Playback</h3>
+            <label class="lw-param-row">
+              <span class="lw-param-lbl">Frame hold (s)
+                <span class="lw-param-hint">How long each session frame is shown</span>
+              </span>
+              <input class="lw-param-input" type="number" id="lw-frame-hold"
+                     value="1.5" min="0.2" max="10" step="0.1" />
+            </label>
+            <label class="lw-param-row">
+              <span class="lw-param-lbl">Output size (px)
+                <span class="lw-param-hint">Square canvas</span>
+              </span>
+              <select class="lw-param-input" id="lw-phase-size">
+                <option value="720">720 × 720</option>
+                <option value="1080" selected>1080 × 1080</option>
+                <option value="1440">1440 × 1440</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="lw-param-group">
+            <h3 class="lw-param-group-title">Display Stretch</h3>
+            <label class="lw-param-row">
+              <span class="lw-param-lbl">Gamma
+                <span class="lw-param-hint">Lower = brighter / more contrasty</span>
+              </span>
+              <div class="lw-slider-row">
+                <input type="range" class="lw-slider" id="lw-phase-gamma-range"
+                       min="0.3" max="1.5" step="0.05" value="0.8" />
+                <input class="lw-param-input lw-param-input-sm" type="number"
+                       id="lw-phase-gamma" value="0.8" min="0.3" max="1.5" step="0.05" />
+              </div>
+            </label>
+            <label class="lw-param-row">
+              <span class="lw-param-lbl">White point %
+                <span class="lw-param-hint">Percentile mapped to white (98–100)</span>
+              </span>
+              <div class="lw-slider-row">
+                <input type="range" class="lw-slider" id="lw-phase-high-pct-range"
+                       min="90" max="100" step="0.1" value="99.5" />
+                <input class="lw-param-input lw-param-input-sm" type="number"
+                       id="lw-phase-high-pct" value="99.5" min="90" max="100" step="0.1" />
+              </div>
+            </label>
+            <label class="lw-param-row">
+              <span class="lw-param-lbl">Sky percentile
+                <span class="lw-param-hint">Background sample percentile</span>
+              </span>
+              <div class="lw-slider-row">
+                <input type="range" class="lw-slider" id="lw-phase-sky-pct-range"
+                       min="1" max="30" step="0.5" value="5" />
+                <input class="lw-param-input lw-param-input-sm" type="number"
+                       id="lw-phase-sky-pct" value="5.0" min="1" max="30" step="0.5" />
+              </div>
+            </label>
+          </div>
+
+          <div class="lw-param-group">
+            <h3 class="lw-param-group-title">Options</h3>
+            <label class="lw-param-row lw-param-row-checkbox">
+              <input type="checkbox" id="lw-phase-no-cache" />
+              <span class="lw-param-lbl">Force re-detect
+                <span class="lw-param-hint">Ignore disk detection cache</span>
+              </span>
+            </label>
+            <div class="lw-output-note" id="lw-output-note"></div>
+          </div>
+
+        </div>
+
+        <div class="lw-step-nav">
+          <button class="btn" id="lw-phase-render-btn">))) Start Render</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <!-- Single Session panel                                                   -->
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <section class="lw-panel" id="lw-single-panel" style="display:none">
+
+      <div class="lw-section-title">Select Directory</div>
+
+      <div class="lw-dir-row">
+        <label class="lw-label" for="lw-dir-input">Directory</label>
+        <div class="lw-dir-input-wrap">
+          <input class="lw-dir-input" id="lw-dir-input"
+                 placeholder="/mnt/d/xfer/Moon" autocomplete="off" spellcheck="false" />
+          <button class="btn btn-sm" id="lw-scan-btn">Scan</button>
+        </div>
+      </div>
+
+      <!-- Quick-pick from known lunar sessions -->
+      <div class="lw-sessions-hint" id="lw-sessions-hint" style="display:none">
+        <span class="lw-sessions-label">Lunar sessions detected:</span>
+        <div class="lw-sessions-list" id="lw-sessions-quick-list"></div>
+      </div>
+
+      <div id="lw-scan-status" class="lw-scan-status"></div>
+
+      <!-- File list -->
+      <div id="lw-files-wrap" style="display:none">
+        <div class="lw-file-header-row">
+          <span class="lw-file-count" id="lw-file-count"></span>
+          <label class="lw-toggle-all">
+            <input type="checkbox" id="lw-select-all-files" checked /> Select all
+          </label>
+        </div>
+        <div class="lw-file-table-wrap">
+          <table class="lw-file-table" id="lw-file-table">
+            <thead>
+              <tr>
+                <th class="col-check"></th>
+                <th class="col-name">Filename</th>
+                <th class="col-date">Date</th>
+                <th class="col-dur">Duration</th>
+              </tr>
+            </thead>
+            <tbody id="lw-file-tbody"></tbody>
+          </table>
+        </div>
+
+        <!-- Single session parameters -->
+        <div class="lw-params-section">
+          <div class="lw-section-title">Parameters</div>
+          <div class="lw-params-grid">
+
+            <div class="lw-param-group">
+              <h3 class="lw-param-group-title">Sampling</h3>
+              <label class="lw-param-row">
+                <span class="lw-param-lbl">Sample interval
+                  <span class="lw-param-hint">Seconds between extracted frames</span>
+                </span>
+                <input class="lw-param-input" type="number" id="lw-sample-interval"
+                       value="1.0" min="0.2" max="30" step="0.5" />
+              </label>
+              <label class="lw-param-row">
+                <span class="lw-param-lbl">Speedup factor
+                  <span class="lw-param-hint">1800 = 30 min of video → 1 sec</span>
+                </span>
+                <input class="lw-param-input" type="number" id="lw-speedup"
+                       value="1800" min="60" max="86400" step="60" />
+              </label>
+            </div>
+
+            <div class="lw-param-group">
+              <h3 class="lw-param-group-title">Display Stretch</h3>
+              <label class="lw-param-row">
+                <span class="lw-param-lbl">Gamma
+                  <span class="lw-param-hint">Lower = brighter / more contrasty</span>
+                </span>
+                <div class="lw-slider-row">
+                  <input type="range" class="lw-slider" id="lw-gamma-range"
+                         min="0.3" max="1.5" step="0.05" value="0.8" />
+                  <input class="lw-param-input lw-param-input-sm" type="number"
+                         id="lw-gamma" value="0.8" min="0.3" max="1.5" step="0.05" />
+                </div>
+              </label>
+              <label class="lw-param-row">
+                <span class="lw-param-lbl">White point %
+                  <span class="lw-param-hint">Percentile mapped to white</span>
+                </span>
+                <div class="lw-slider-row">
+                  <input type="range" class="lw-slider" id="lw-high-pct-range"
+                         min="90" max="100" step="0.1" value="99.5" />
+                  <input class="lw-param-input lw-param-input-sm" type="number"
+                         id="lw-high-pct" value="99.5" min="90" max="100" step="0.1" />
+                </div>
+              </label>
+              <label class="lw-param-row">
+                <span class="lw-param-lbl">Sky percentile</span>
+                <div class="lw-slider-row">
+                  <input type="range" class="lw-slider" id="lw-sky-pct-range"
+                         min="1" max="30" step="0.5" value="5" />
+                  <input class="lw-param-input lw-param-input-sm" type="number"
+                         id="lw-sky-pct" value="5.0" min="1" max="30" step="0.5" />
+                </div>
+              </label>
+            </div>
+
+            <div class="lw-param-group">
+              <h3 class="lw-param-group-title">Output</h3>
+              <label class="lw-param-row">
+                <span class="lw-param-lbl">Output size (px)</span>
+                <select class="lw-param-input" id="lw-size">
+                  <option value="720">720 × 720</option>
+                  <option value="1080" selected>1080 × 1080</option>
+                  <option value="1440">1440 × 1440</option>
+                </select>
+              </label>
+              <label class="lw-param-row lw-param-row-checkbox">
+                <input type="checkbox" id="lw-no-cache" />
+                <span class="lw-param-lbl">Force re-detect
+                  <span class="lw-param-hint">Ignore disk detection cache</span>
+                </span>
+              </label>
+            </div>
+
+          </div>
+
+          <div class="lw-step-nav">
+            <button class="btn" id="lw-single-render-btn" disabled>☽ Start Render</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <!-- Render / Results panel (shared)                                        -->
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <section class="lw-panel" id="lw-render-panel" style="display:none">
+      <div class="lw-section-title" id="lw-render-title">Rendering…</div>
+
+      <div class="lw-progress-wrap" id="lw-progress-wrap">
+        <div class="lw-progress-bar-bg">
+          <div class="lw-progress-bar" id="lw-progress-bar" style="width:0%"></div>
+        </div>
+        <div class="lw-progress-msg" id="lw-progress-msg">Starting…</div>
+      </div>
+
+      <div class="sw-log-header" id="lw-log-header" style="display:none">
+        <span class="sw-log-label">Log</span>
+        <span class="sw-elapsed" id="lw-elapsed"></span>
+      </div>
+      <div class="lw-log-wrap" id="lw-log-wrap" style="display:none">
+        <pre class="lw-log" id="lw-log"></pre>
+      </div>
+
+      <div class="sw-render-actions" id="lw-render-actions">
+        <button class="btn btn-secondary btn-sm" id="lw-back-to-params-btn">← Back to Parameters</button>
+        <button class="btn btn-danger btn-sm"    id="lw-cancel-btn">✕ Cancel</button>
+      </div>
+
+      <div id="lw-results" style="display:none">
+        <div class="lw-result-topbar">
+          <span class="lw-result-label" id="lw-result-label"></span>
+        </div>
+
+        <div class="lw-result-grid" id="lw-result-grid">
+          <!-- Cards injected by JS -->
+        </div>
+
+        <div class="lw-step-nav">
+          <button class="btn btn-secondary" id="lw-rerender-btn">↺ Re-render</button>
+        </div>
+      </div>
+
+      <div class="lw-error" id="lw-error" style="display:none"></div>
+    </section>
+
+  </main>
+
+  <script>const LW_DATA_DIR = {{ data_dir | tojson }};</script>
+  <script src="{{ static_ver('js/lunar_wizard.js') }}"></script>
+</body>
+</html>
