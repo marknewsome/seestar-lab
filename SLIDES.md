@@ -70,8 +70,8 @@
 - Processes a directory of Seestar solar MP4 clips into a disk-normalised VFR timelapse
 - 3-pass pipeline in `solar_processor.py`:
   - Pass 1: `HoughCircles` disk detection, Laplacian sharpness scoring — **results cached**
-  - Pass 2: Affine normalisation, background subtraction, gamma stretch
-  - Pass 3: VFR MP4 assembly via `ffconcat` + title card; sharpest-frame portrait JPEG
+  - Pass 2: Affine normalisation, background subtraction, gamma stretch — **streamed to temp JPEGs one frame at a time** (O(1) RAM)
+  - Pass 3: `ffconcat` references the already-written JPEGs directly — no second in-memory copy; temp dir cleaned up on completion
 - Re-renders using cached disk data take seconds, not minutes
 - Tunable parameters: sample interval, speedup factor, gamma, white point, stabilisation window, min quality
 

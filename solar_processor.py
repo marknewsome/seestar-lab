@@ -38,13 +38,18 @@ Pass 2 — Normalisation
     tx, ty  = out_size/2 − scale·cx,  out_size/2 − scale·cy
   A 2×3 affine matrix is applied with cv2.warpAffine.  The result is then
   background-subtracted (sky percentile of the disk annulus) and gamma-curved.
+  Each normalised frame is written immediately to a temporary JPEG on disk
+  rather than accumulated in memory — peak RAM stays at O(1) regardless of
+  session length.  (A long solar session can produce thousands of frames;
+  holding them all as NumPy arrays caused OOM kills at ~21 GB RSS.)
 
 Pass 3 — VFR timelapse assembly
   Frames are sorted by UTC timestamp.  The display duration for each frame is
   real_gap_to_next_frame / speedup_factor, clamped to [1/60, 5] seconds.
-  ffconcat demuxer assembles the JPEG sequence into an H.264 MP4 (same
-  technique as comet_processor).  Falls back to fixed-fps VideoWriter when
-  ffmpeg is unavailable.
+  The ffconcat manifest references the already-written Pass 2 JPEGs directly,
+  so there is no second full-frame copy in RAM.  Falls back to fixed-fps
+  VideoWriter when ffmpeg is unavailable.  The temporary frame directory is
+  deleted in a finally block after the MP4 is written.
 """
 
 import argparse
@@ -270,16 +275,36 @@ def _make_title_frame(w: int, h: int,
     return frame
 
 
-def _prepend_title(frames: list[np.ndarray],
+def _prepend_title(frames: list,
                    durations: Optional[list[float]],
                    date_label: str,
                    frame_count: int,
                    session_dur: str) -> tuple:
-    """Prepend a title card to the timelapse frames (and matching duration)."""
+    """Prepend a title card to the timelapse frames (and matching duration).
+
+    ``frames`` may be a list of numpy arrays **or** a list of JPEG file paths
+    (str).  When paths are supplied the title card is also written to a JPEG
+    file and its path is prepended.
+    """
     if not frames:
         return frames, durations
-    h, w  = frames[0].shape[:2]
+
+    if isinstance(frames[0], str):
+        first = cv2.imread(frames[0])
+        h, w  = first.shape[:2]
+    else:
+        h, w = frames[0].shape[:2]
+
     title = _make_title_frame(w, h, date_label, frame_count, session_dur)
+
+    if isinstance(frames[0], str):
+        title_path = os.path.join(os.path.dirname(frames[0]), "title.jpg")
+        cv2.imwrite(title_path, title, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if durations is not None:
+            return [title_path] + list(frames), [TITLE_SECS] + list(durations)
+        n_title = max(1, round(TITLE_SECS * 30))
+        return [title_path] * n_title + list(frames), None
+
     if durations is not None:
         return [title] + frames, [TITLE_SECS] + durations
     n_title = max(1, round(TITLE_SECS * 30))
@@ -314,6 +339,10 @@ def _write_mp4(
     """
     Write frames to an MP4.  When durations is provided, uses the ffconcat
     demuxer for a VFR output.  Falls back to fixed-fps VideoWriter.
+
+    ``frames_bgr`` may be a list of numpy arrays **or** a list of JPEG file
+    paths (str).  When paths are supplied they are referenced directly in the
+    ffconcat manifest without re-encoding to avoid a second full copy in RAM.
     """
     if not frames_bgr:
         return
@@ -321,16 +350,22 @@ def _write_mp4(
     ffbin = "/usr/bin/ffmpeg" if os.path.isfile("/usr/bin/ffmpeg") else shutil.which("ffmpeg")
 
     if durations is not None and ffbin:
+        paths_on_disk = isinstance(frames_bgr[0], str)
+        # Only need a temp dir for the concat manifest (and any numpy frames).
         tmp_dir = tempfile.mkdtemp(prefix="solar_vfr_")
         try:
             concat_path = os.path.join(tmp_dir, "frames.txt")
             with open(concat_path, "w") as fh:
                 fh.write("ffconcat version 1.0\n")
                 for j, (frame, dur) in enumerate(zip(frames_bgr, durations)):
-                    jpg = os.path.join(tmp_dir, f"f{j:05d}.jpg")
-                    cv2.imwrite(jpg, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    if paths_on_disk:
+                        jpg = frame          # already written to disk
+                    else:
+                        jpg = os.path.join(tmp_dir, f"f{j:05d}.jpg")
+                        cv2.imwrite(jpg, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
                     fh.write(f"file '{jpg}'\nduration {dur:.6f}\n")
-                last = os.path.join(tmp_dir, f"f{len(frames_bgr)-1:05d}.jpg")
+                last_frame = frames_bgr[-1]
+                last = last_frame if paths_on_disk else os.path.join(tmp_dir, f"f{len(frames_bgr)-1:05d}.jpg")
                 fh.write(f"file '{last}'\n")
 
             tmp_out = path + ".vfr.tmp.mp4"
@@ -351,12 +386,13 @@ def _write_mp4(
     # CFR fallback
     if not frames_bgr:
         return
-    h, w   = frames_bgr[0].shape[:2]
+    first = cv2.imread(frames_bgr[0]) if isinstance(frames_bgr[0], str) else frames_bgr[0]
+    h, w   = first.shape[:2]
     raw    = path + ".raw.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(raw, fourcc, fps_cfr, (w, h))
     for f in frames_bgr:
-        writer.write(f)
+        writer.write(cv2.imread(f) if isinstance(f, str) else f)
     writer.release()
 
     if ffbin:
@@ -591,9 +627,15 @@ def run(
     # ─────────────────────────────────────────────────────────────────────────
     _progress(40, "Pass 2 — Normalising and stretching frames…")
 
-    normed_frames:  list[np.ndarray] = []
     frame_ts_utc:   list[Optional[str]] = []
     frame_quality:  list[float] = []
+
+    # Write each normalised frame to disk immediately so we never hold the
+    # full frame set in RAM.  At 1080×1080 BGR each frame is ~3.5 MB; for a
+    # long solar session (thousands of frames) keeping them all in memory
+    # caused OOM kills.
+    frame_tmp_dir = tempfile.mkdtemp(prefix="solar_frames_")
+    normed_frame_paths: list[str] = []
 
     # Open videos in order; cache last used cap to avoid repeated re-opens
     open_caps: dict[str, cv2.VideoCapture] = {}
@@ -603,7 +645,8 @@ def run(
             open_caps[vpath] = cv2.VideoCapture(vpath)
         return open_caps[vpath]
 
-    for i, entry in enumerate(raw_frames):
+    try:
+      for i, entry in enumerate(raw_frames):
         if i % 50 == 0:
             pct = 40 + int(i / len(raw_frames) * 33)
             _progress(pct, f"  Normalising frame {i+1}/{len(raw_frames)}…")
@@ -614,96 +657,107 @@ def run(
         if not ok:
             continue
 
-        normed  = _normalise_frame(frame, entry["cx"], entry["cy"], entry["r"],
-                                   out_size, target_r)
+        normed    = _normalise_frame(frame, entry["cx"], entry["cy"], entry["r"],
+                                     out_size, target_r)
         stretched = _stretch_frame(normed, sky_pct, high_pct, gamma, out_size, target_r)
-        normed_frames.append(stretched)
+
+        if entry.get("ts_utc"):
+            # Format as "YYYY-MM-DD  HH:MM:SS UTC" — replace the T separator with two spaces
+            ts_label = entry["ts_utc"].replace("T", "  ").split(".")[0] + " UTC"
+            stretched = _overlay_label(stretched, ts_label, pos="top")
+
+        jpg_path = os.path.join(frame_tmp_dir, f"f{i:05d}.jpg")
+        cv2.imwrite(jpg_path, stretched, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        normed_frame_paths.append(jpg_path)
         frame_ts_utc.append(entry["ts_utc"])
         frame_quality.append(entry["quality"])
 
-    for cap in open_caps.values():
-        cap.release()
+      for cap in open_caps.values():
+          cap.release()
 
-    if not normed_frames:
-        print("ERROR: no normalised frames produced.", flush=True)
-        sys.exit(1)
+      if not normed_frame_paths:
+          print("ERROR: no normalised frames produced.", flush=True)
+          sys.exit(1)
 
-    _progress(73, f"  Normalised {len(normed_frames)} frames", )
+      _progress(73, f"  Normalised {len(normed_frame_paths)} frames")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Pass 3 — Portrait + timelapse assembly
-    # ─────────────────────────────────────────────────────────────────────────
-    _progress(74, "Pass 3 — Assembling timelapse…")
+      # ─────────────────────────────────────────────────────────────────────────
+      # Pass 3 — Portrait + timelapse assembly
+      # ─────────────────────────────────────────────────────────────────────────
+      _progress(74, "Pass 3 — Assembling timelapse…")
 
-    # Portrait: sharpest frame
-    best_idx = int(np.argmax(frame_quality))
-    portrait = normed_frames[best_idx].copy()
+      # Portrait: sharpest frame — read back from disk (single frame, tiny RAM)
+      best_idx = int(np.argmax(frame_quality))
+      portrait = cv2.imread(normed_frame_paths[best_idx])
 
-    # Build date-range label
-    ts_valid = [t for t in frame_ts_utc if t]
-    if ts_valid:
-        t0 = ts_valid[0][:10]
-        t1 = ts_valid[-1][:10]
-        date_label = t0 if t0 == t1 else f"{t0} – {t1}"
-    else:
-        date_label = "Solar"
-    n_frames_str = f"Solar  |  {len(normed_frames)} frames  |  {date_label}"
+      # Build date-range label
+      ts_valid = [t for t in frame_ts_utc if t]
+      if ts_valid:
+          t0 = ts_valid[0][:10]
+          t1 = ts_valid[-1][:10]
+          date_label = t0 if t0 == t1 else f"{t0} – {t1}"
+      else:
+          date_label = "Solar"
+      n_frames = len(normed_frame_paths)
+      n_frames_str = f"Solar  |  {n_frames} frames  |  {date_label}"
 
-    portrait = _overlay_label(portrait, n_frames_str, pos="bottom")
-    portrait_path = os.path.join(out_dir, "solar_portrait.jpg")
-    cv2.imwrite(portrait_path, portrait, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    print(f"  Wrote portrait → {portrait_path}", flush=True)
+      portrait = _overlay_label(portrait, n_frames_str, pos="bottom")
+      portrait_path = os.path.join(out_dir, "solar_portrait.jpg")
+      cv2.imwrite(portrait_path, portrait, [cv2.IMWRITE_JPEG_QUALITY, 95])
+      print(f"  Wrote portrait → {portrait_path}", flush=True)
 
-    # Compute VFR durations
-    durations: list[float] = []
-    min_dur  = 1.0 / 60.0
-    max_dur  = 5.0
-    n        = len(normed_frames)
+      # Compute VFR durations
+      durations: list[float] = []
+      min_dur  = 1.0 / 60.0
+      max_dur  = 5.0
 
-    for i in range(n - 1):
-        ts_curr = frame_ts_utc[i]
-        ts_next = frame_ts_utc[i + 1]
-        if ts_curr and ts_next:
-            try:
-                dt = (datetime.fromisoformat(ts_next) -
-                      datetime.fromisoformat(ts_curr)).total_seconds()
-            except ValueError:
-                dt = sample_interval
-        else:
-            dt = sample_interval
-        dur = max(min_dur, min(max_dur, dt / speedup))
-        durations.append(dur)
-    durations.append(durations[-1] if durations else 1.0 / 30.0)
+      for i in range(n_frames - 1):
+          ts_curr = frame_ts_utc[i]
+          ts_next = frame_ts_utc[i + 1]
+          if ts_curr and ts_next:
+              try:
+                  dt = (datetime.fromisoformat(ts_next) -
+                        datetime.fromisoformat(ts_curr)).total_seconds()
+              except ValueError:
+                  dt = sample_interval
+          else:
+              dt = sample_interval
+          dur = max(min_dur, min(max_dur, dt / speedup))
+          durations.append(dur)
+      durations.append(durations[-1] if durations else 1.0 / 30.0)
 
-    # Compute session duration for title card
-    session_dur = ""
-    if len(ts_valid) >= 2:
-        try:
-            elapsed = (datetime.fromisoformat(ts_valid[-1]) -
-                       datetime.fromisoformat(ts_valid[0])).total_seconds()
-            h_s, rem = divmod(int(elapsed), 3600)
-            m_s = rem // 60
-            session_dur = f"{h_s}h {m_s:02d}m" if h_s else f"{m_s}m"
-        except Exception:
-            pass
+      # Compute session duration for title card
+      session_dur = ""
+      if len(ts_valid) >= 2:
+          try:
+              elapsed = (datetime.fromisoformat(ts_valid[-1]) -
+                         datetime.fromisoformat(ts_valid[0])).total_seconds()
+              h_s, rem = divmod(int(elapsed), 3600)
+              m_s = rem // 60
+              session_dur = f"{h_s}h {m_s:02d}m" if h_s else f"{m_s}m"
+          except Exception:
+              pass
 
-    # Prepend title card
-    title_frames, title_durations = _prepend_title(
-        normed_frames, durations, date_label, len(normed_frames), session_dur)
+      # Prepend title card
+      title_frames, title_durations = _prepend_title(
+          normed_frame_paths, durations, date_label, n_frames, session_dur)
 
-    # Write timelapse
-    timelapse_path = os.path.join(out_dir, "solar_fulldisk.mp4")
-    _progress(80, f"  Encoding {len(normed_frames)} frames → {Path(timelapse_path).name}")
-    _write_mp4(timelapse_path, title_frames, title_durations)
-    print(f"  Wrote timelapse → {timelapse_path}", flush=True)
+      # Write timelapse
+      timelapse_path = os.path.join(out_dir, "solar_fulldisk.mp4")
+      _progress(80, f"  Encoding {n_frames} frames → {Path(timelapse_path).name}")
+      _write_mp4(timelapse_path, title_frames, title_durations)
+      print(f"  Wrote timelapse → {timelapse_path}", flush=True)
 
-    _progress(100, "Done.")
-    return {
-        "timelapse": timelapse_path if os.path.isfile(timelapse_path) else None,
-        "portrait":  portrait_path  if os.path.isfile(portrait_path)  else None,
-        "frame_count": len(normed_frames),
-        "date_label":  date_label,
-    }
+      _progress(100, "Done.")
+      return {
+          "timelapse": timelapse_path if os.path.isfile(timelapse_path) else None,
+          "portrait":  portrait_path  if os.path.isfile(portrait_path)  else None,
+          "frame_count": n_frames,
+          "date_label":  date_label,
+      }
+
+    finally:
+        shutil.rmtree(frame_tmp_dir, ignore_errors=True)
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

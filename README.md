@@ -26,7 +26,7 @@ track-path composite.
 | **Aircraft lookup** | Detected events are cross-referenced against the OpenSky Network ADS-B feed to identify the aircraft |
 | **Activity heatmap** | Calendar heatmap showing daily sub counts or session counts across the full observation history |
 | **Live updates** | A Server-Sent Events stream pushes progress to the browser in real time — no polling, no page reloads |
-| **Solar Timelapse wizard** | 3-step wizard: scan a directory of Seestar solar MP4 clips, tune parameters (sampling, stretch, stabilisation, quality filtering), render a disk-normalised VFR timelapse with title card and portrait. Pass 1 disk-detection results are cached so re-renders are fast. |
+| **Solar Timelapse wizard** | 3-step wizard: scan a directory of Seestar solar MP4 clips, tune parameters (sampling, stretch, stabilisation, quality filtering), render a disk-normalised VFR timelapse with title card and portrait. Pass 1 disk-detection results are cached so re-renders are fast. Normalised frames are streamed to disk one at a time — memory usage is O(1) regardless of session length. |
 | **Lunar Timelapse wizard** | Step-by-step pipeline for lunar sessions: select videos, choose render mode (Standard / Enhanced / Surface detail), configure stretch and quality parameters, produce an MP4 timelapse with title card. Supports cancel, back-to-parameters, and result persistence. |
 | **Live Capture** | RTSP stream viewer and recorder. Add one or more Seestar RTSP URLs; view the live MJPEG feed in the browser; optionally record to `SEESTAR_DATA_DIR/captures/` with auto-named MP4 files. Stream configs are persisted in browser localStorage. |
 | **Observing Planner** | Visibility planner for DSO and solar-system objects: shows rise/set times, altitude curves, and optimal observing windows for the configured observer location. |
@@ -133,8 +133,9 @@ Filesystem
                       solar_processor.py              ffmpeg -c copy
                         Pass 1: HoughCircles              to DATA_DIR/captures/
                         Pass 2: normalise + stretch
-                        Pass 3: VFR MP4 + title card
-                                  │
+                                  │ (stream to tmp JPEGs — O(1) RAM)
+                        Pass 3: ffconcat from tmp JPEGs
+                                  │ (tmp dir cleaned up on completion)
                        solar_fulldisk.mp4
                        solar_portrait.jpg
                        solar_alignment.json (cache)
@@ -381,8 +382,8 @@ disk-normalised VFR timelapse and a sharpness-ranked portrait.  Navigate to `/so
 | Pass | Description |
 |---|---|
 | 1 | **Disk detection** — Each source video is sampled at ~1 frame/second. Timestamps are parsed from the Seestar filename (`YYYY-MM-DD-HHMMSS`). Each frame is converted to grayscale and `HoughCircles` locates the solar disk. A Laplacian variance score estimates limb sharpness. Frames whose detected radius deviates more than 15 % from the per-video median are rejected. Results cached to `solar_alignment.json`. |
-| 2 | **Normalisation** — Each accepted frame is warped to a fixed `out_size × out_size` canvas so the disk fills ~86 % of the frame. Background subtraction and gamma stretch are applied. |
-| 3 | **Assembly** — Frames are sorted by UTC timestamp. VFR display durations are computed from real time gaps divided by the speedup factor, clamped to [1/60, 5] s. A title card (3 s) is prepended. `ffconcat` demuxer assembles the JPEG sequence into H.264 MP4. A portrait (sharpest frame with label overlay) is saved as JPEG. |
+| 2 | **Normalisation** — Each accepted frame is warped to a fixed `out_size × out_size` canvas so the disk fills ~86 % of the frame. Background subtraction and gamma stretch are applied. Each normalised frame is written immediately to a temporary JPEG on disk rather than accumulated in RAM — this keeps peak memory at one frame in flight regardless of how many frames the session contains. |
+| 3 | **Assembly** — Frames are sorted by UTC timestamp. VFR display durations are computed from real time gaps divided by the speedup factor, clamped to [1/60, 5] s. A title card (3 s) is prepended. The `ffconcat` demuxer references the already-written Pass 2 JPEGs directly — no second in-memory copy. The final H.264 MP4 and a portrait JPEG (sharpest frame + label overlay) are written to the output directory; the temporary frames are cleaned up automatically. |
 
 ### Parameters
 
