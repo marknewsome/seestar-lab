@@ -89,9 +89,6 @@ scanner.py           Filesystem crawler; builds and diffs session records
 db.py                SQLite persistence (sessions, video jobs, transit events, stack jobs)
 stack_processor.py   Sub-frame stacking pipeline (registration, sigma-clip, stretch, denoise)
 comet_processor.py   Comet animation pipeline (star alignment, nucleus detection, animations, track composite)
-transit_detector.py  Computer-vision transit-detection pipeline
-yolo_validator.py    Optional YOLOv8n second-stage confirmation (soft dependency)
-aircraft_lookup.py   OpenSky REST API integration
 catalogs.py          Messier / Caldwell catalog data and DSO type/group mappings
 object_catalog.py    Object-type detection (solar/lunar/planet/comet/messier/…) and descriptions
 static/js/app.js     Sessions-page UI; SSE client; transit controls; stack controls; lightbox
@@ -124,7 +121,7 @@ Filesystem
                                        │            db.stack_jobs ──► SSE  track composite
                               db.transit_events ──► SSE ──► browser        frame review JPEGs
                                        │                                           │
-                              aircraft_lookup.py (OpenSky)            job status polling ──► browser
+                                                              job status polling ──► browser
 
                     User clicks "☀ Start Render"       User clicks "⏺ Record"
                               ▼                                ▼
