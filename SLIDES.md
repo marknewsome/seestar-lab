@@ -10,7 +10,7 @@
 - No cloud accounts, no subscriptions, no data leaves your network
 - Point it at your Seestar data directory and open a browser
 - Automatically discovers sessions, matches catalog objects, and drives processing pipelines
-- Built on Python / Flask — runs on Windows, macOS, and Linux
+- Built on Python / Flask — runs on Windows (WSL), macOS, and Linux
 
 ---
 
@@ -20,7 +20,8 @@
 - Each card shows a thumbnail (stacked output, enhanced JPEG, or video cover frame)
 - Hover to zoom; click to open a full-screen image gallery
 - Sessions are matched against the **Messier** and **Caldwell** catalogs automatically
-- Bingo-card views show which objects you have captured across your full history
+- Bingo-card views show which objects you have captured, with type filters and progress bar
+- Hover to pick the best thumbnail for any multi-night session — choice survives rescans
 - Calendar activity heatmap displays daily sub counts or session counts
 
 ---
@@ -40,14 +41,13 @@
 
 ---
 
-## Transit Detection
+## Catalog Poster Printing
 
-- Background-subtraction + blob-tracking pipeline finds aircraft, birds, and the ISS crossing the solar or lunar disk
-- Drift compensation corrects Seestar servo jitter before differencing frames
-- Weighted confidence score (linearity, velocity, duration) filters false positives
-- Optional **YOLOv8n** second-stage validation confirms visually recognisable aircraft and birds
-- Detected events cross-referenced against the **OpenSky Network ADS-B** feed for aircraft ID
-- Padded MP4 clips with burned UTC timestamps, hero-frame thumbnails, and JSON sidecars saved automatically
+- One click opens a full-catalog poster optimised for **13×19" paper** (e.g. Canon Pro 100)
+- Landscape layout: 11 columns × 10 rows — fits all 110 Messier or 109 Caldwell objects on one page
+- Captured objects show their best thumbnail, label, popular name, and ✓ badge
+- Uncaptured objects show a dark muted placeholder — a true visual scoreboard
+- Progress header: catalog name · ✓ N / 110 · Seestar Lab · date
 
 ---
 
