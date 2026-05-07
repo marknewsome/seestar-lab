@@ -533,6 +533,19 @@ def api_thumbnail(object_name: str):
         if candidate and os.path.isfile(candidate):
             thumb_path = candidate
             break
+
+    # For _sub sessions with no pinned thumbnail, prefer the sister session's
+    # thumbnail (e.g. "M45") over raw sub-frame slivers.
+    if object_name.endswith("_sub") and not session.get("pinned_thumbnail"):
+        sister_name = object_name[:-4]
+        sister = next((s for s in sessions if s["object_name"] == sister_name), None)
+        if sister:
+            for key in ("pinned_thumbnail", "thumbnail"):
+                candidate = sister.get(key)
+                if candidate and os.path.isfile(candidate):
+                    thumb_path = candidate
+                    break
+
     if not thumb_path:
         abort(404)
 
