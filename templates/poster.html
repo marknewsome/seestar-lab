@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>{{ catalog_title }} Poster — Seestar Lab</title>
+  <style>
+    /* ── Reset ──────────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── Screen chrome ───────────────────────────────────────────────────────── */
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0a0d13;
+      color: #cdd5e0;
+      min-height: 100vh;
+    }
+
+    /* ── Controls bar ────────────────────────────────────────────────────────── */
+    #controls {
+      position: sticky;
+      top: 0;
+      z-index: 200;
+      background: #111520;
+      border-bottom: 1px solid #1e2540;
+      padding: 0.65rem 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    #controls a, #controls button {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      font-size: 0.825rem;
+      cursor: pointer;
+      text-decoration: none;
+      border: 1px solid #2a3050;
+      background: #181d2e;
+      color: #9aabcc;
+      font-family: inherit;
+    }
+    #controls a:hover { color: #c8d6ef; border-color: #3a4870; }
+    #controls .btn-print {
+      background: #1a3a8a;
+      border-color: #2550c8;
+      color: #d0e0ff;
+      font-weight: 600;
+    }
+    #controls .btn-print:hover { background: #1f48b0; }
+    #controls .ctrl-note {
+      margin-left: auto;
+      font-size: 0.75rem;
+      color: #3a4a60;
+    }
+
+    /* ── Loading ─────────────────────────────────────────────────────────────── */
+    #poster-loading {
+      padding: 4rem;
+      text-align: center;
+      color: #3a4a60;
+      font-size: 1rem;
+    }
+
+    /* ── Poster outer ────────────────────────────────────────────────────────── */
+    .poster-outer {
+      padding: 1.25rem 1.5rem 3rem;
+      display: flex;
+      justify-content: center;
+    }
+
+    /* ── Poster wrapper ──────────────────────────────────────────────────────── */
+    .poster-wrap {
+      background: #0d1018;
+      width: 100%;
+      max-width: 1440px;
+      border: 1px solid #1a2030;
+      border-radius: 4px;
+      padding: 0.6rem 0.5rem 0.5rem;
+    }
+
+    /* ── Poster header ───────────────────────────────────────────────────────── */
+    .poster-header {
+      display: flex;
+      align-items: baseline;
+      gap: 1.25rem;
+      padding: 0 0.25rem 0.45rem;
+      margin-bottom: 0.4rem;
+      border-bottom: 1.5px solid #1a2540;
+    }
+    .ph-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #c0d0ef;
+    }
+    .ph-progress {
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: #5ecf8a;
+    }
+    .ph-brand {
+      font-size: 0.72rem;
+      color: #2a3850;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .ph-date {
+      margin-left: auto;
+      font-size: 0.72rem;
+      color: #2a3850;
+    }
+
+    /* ── Poster grid ─────────────────────────────────────────────────────────── */
+    .poster-grid {
+      display: grid;
+      grid-template-columns: repeat(11, 1fr);
+      gap: 3px;
+    }
+
+    /* ── Cards (shared) ──────────────────────────────────────────────────────── */
+    .p-card {
+      position: relative;
+      border-radius: 2px;
+      overflow: hidden;
+      aspect-ratio: 3 / 2;
+    }
+
+    /* ── Captured card ───────────────────────────────────────────────────────── */
+    .p-card.captured {
+      background: #05080d;
+    }
+    .p-card.captured .p-thumb {
+      position: absolute;
+      inset: 0 0 28% 0;  /* leave room for info strip at bottom */
+      overflow: hidden;
+    }
+    .p-card.captured .p-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .p-nothumb {
+      width: 100%;
+      height: 100%;
+      background: #10182a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.5rem;
+      color: #1c2840;
+    }
+    .p-check {
+      position: absolute;
+      top: 3px;
+      right: 3px;
+      background: rgba(22, 163, 74, 0.88);
+      color: #fff;
+      font-size: 0.48rem;
+      font-weight: 800;
+      line-height: 1;
+      padding: 2px 3px;
+      border-radius: 2px;
+    }
+    .p-info {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 2px 3px 2px;
+      background: rgba(0, 0, 0, 0.78);
+      backdrop-filter: blur(2px);
+    }
+    .p-label {
+      font-size: 0.6rem;
+      font-weight: 700;
+      color: #c8d8f0;
+      line-height: 1.15;
+      white-space: nowrap;
+    }
+    .p-name {
+      font-size: 0.52rem;
+      color: #6880a8;
+      line-height: 1.1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .p-type {
+      font-size: 0.44rem;
+      color: #384860;
+      line-height: 1.1;
+    }
+
+    /* ── Uncaptured card ─────────────────────────────────────────────────────── */
+    .p-card.uncaptured {
+      background: #0d1120;
+      border: 1px solid #141b2e;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+    }
+    .p-big-label {
+      font-size: 1rem;
+      font-weight: 800;
+      color: #161e30;
+      letter-spacing: -0.02em;
+      line-height: 1;
+    }
+    .p-small-name {
+      font-size: 0.4rem;
+      color: #1a243a;
+      letter-spacing: 0.03em;
+      text-align: center;
+      padding: 0 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 90%;
+    }
+    .p-small-const {
+      font-size: 0.38rem;
+      color: #141c2e;
+      letter-spacing: 0.02em;
+    }
+
+    /* ── Print ───────────────────────────────────────────────────────────────── */
+    @media print {
+      @page {
+        size: 19in 13in;
+        margin: 0.5in;
+      }
+
+      body {
+        background: white;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+      #controls     { display: none !important; }
+      #poster-loading { display: none !important; }
+
+      .poster-outer {
+        padding: 0;
+      }
+      .poster-wrap {
+        background: #080c14;
+        max-width: none;
+        width: 18in;
+        height: 12in;
+        border: none;
+        border-radius: 0;
+        padding: 0.15in 0.1in 0.1in;
+        overflow: hidden;
+      }
+      .poster-header {
+        height: 0.42in;
+        padding: 0 0.05in 0.1in;
+        margin-bottom: 0.05in;
+        border-bottom-color: #1e2d48;
+        align-items: flex-start;
+      }
+      .ph-title    { font-size: 14pt; color: #b0c4e8; }
+      .ph-progress { font-size: 11pt; color: #3db870; }
+      .ph-brand    { font-size: 8pt;  color: #283448; }
+      .ph-date     { font-size: 8pt;  color: #283448; }
+
+      .poster-grid {
+        height: calc(12in - 0.72in);
+        gap: 2px;
+        grid-template-rows: repeat(10, 1fr);
+        align-content: start;
+      }
+
+      .p-card {
+        aspect-ratio: unset;
+        height: 100%;
+        break-inside: avoid;
+      }
+      .p-card.captured .p-thumb {
+        bottom: 0.22in;
+      }
+      .p-label  { font-size: 6.5pt; }
+      .p-name   { font-size: 5.5pt; }
+      .p-type   { font-size: 4.5pt; }
+
+      .p-big-label   { font-size: 14pt; }
+      .p-small-name  { font-size: 4.5pt; }
+      .p-small-const { font-size: 4pt; }
+
+      .p-check { font-size: 5pt; top: 2px; right: 2px; }
+    }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <a href="/catalog/{{ catalog_type }}">← Back</a>
+  <button class="btn-print" onclick="window.print()">🖨 Print Poster</button>
+  <span class="ctrl-note" id="ctrl-note">Loading…</span>
+</div>
+
+<div class="poster-outer">
+  <div id="poster-loading">Loading catalog…</div>
+  <div class="poster-wrap" id="poster-wrap" style="display:none;">
+    <div class="poster-header">
+      <span class="ph-title">{{ catalog_title }}</span>
+      <span class="ph-progress" id="ph-progress"></span>
+      <span class="ph-brand">Seestar Lab</span>
+      <span class="ph-date" id="ph-date"></span>
+    </div>
+    <div class="poster-grid" id="poster-grid"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const CATALOG_TYPE = {{ catalog_type | tojson }};
+
+document.getElementById('ph-date').textContent =
+  new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+async function loadPoster() {
+  try {
+    const res = await fetch(`/api/catalog/${CATALOG_TYPE}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const items = await res.json();
+
+    items.sort((a, b) => a.number - b.number);
+
+    const captured = items.filter(i => i.captured).length;
+    document.getElementById('ph-progress').textContent = `✓ ${captured} / ${items.length}`;
+    document.getElementById('ctrl-note').textContent =
+      `${captured} captured · ${items.length - captured} remaining`;
+
+    const grid = document.getElementById('poster-grid');
+    grid.innerHTML = items.map(buildCard).join('');
+
+    document.getElementById('poster-loading').style.display = 'none';
+    document.getElementById('poster-wrap').style.display = '';
+  } catch (err) {
+    document.getElementById('poster-loading').textContent =
+      'Failed to load catalog: ' + err.message;
+  }
+}
+
+function buildCard(item) {
+  if (item.captured) {
+    const hasThumbnail = item.session?.pinned_thumbnail || item.session?.thumbnail;
+    const thumbContent = hasThumbnail
+      ? `<img src="/api/thumbnail/${encodeURIComponent(item.session.object_name)}"
+             alt="${esc(item.label)}" loading="lazy"
+             onerror="this.parentElement.innerHTML='<div class=p-nothumb>★</div>'">`
+      : `<div class="p-nothumb">★</div>`;
+    const popName = item.popular_name
+      ? `<div class="p-name">${esc(item.popular_name)}</div>` : '';
+    return `<div class="p-card captured" title="${esc(item.label)}${item.popular_name ? ' · ' + item.popular_name : ''}">
+      <div class="p-thumb">${thumbContent}</div>
+      <div class="p-check">✓</div>
+      <div class="p-info">
+        <div class="p-label">${esc(item.label)}</div>
+        ${popName}
+        <div class="p-type">${esc(item.dso_type_label)} · ${esc(item.constellation)}</div>
+      </div>
+    </div>`;
+  } else {
+    const subtitle = item.popular_name
+      ? `<div class="p-small-name">${esc(item.popular_name)}</div>`
+      : `<div class="p-small-name">${esc(item.dso_type_label)}</div>`;
+    return `<div class="p-card uncaptured" title="${esc(item.label)}${item.popular_name ? ' · ' + item.popular_name : ''}">
+      <div class="p-big-label">${esc(item.label)}</div>
+      ${subtitle}
+      <div class="p-small-const">${esc(item.constellation)}</div>
+    </div>`;
+  }
+}
+
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+loadPoster();
+</script>
+</body>
+</html>
