@@ -101,6 +101,7 @@ function buildCard(item) {
   const thumb = item.captured && item.session?.thumbnail
     ? `<div class="cat-thumb">
          <img src="/api/thumbnail/${encodeURIComponent(item.session.object_name)}"
+              data-session="${esc(item.session.object_name)}"
               alt="${esc(item.label)}" loading="lazy"
               onerror="this.parentElement.innerHTML='<div class=cat-thumb-placeholder>★</div>'" />
        </div>`
@@ -138,6 +139,19 @@ function buildCard(item) {
       </div>
     </div>`;
 }
+
+// ── SSE — live thumbnail updates ───────────────────────────────────────────────
+(function () {
+  const es = new EventSource('/api/events');
+  es.addEventListener('session', e => {
+    const s = JSON.parse(e.data);
+    const img = document.querySelector(
+      `img[data-session="${CSS.escape(s.object_name)}"]`
+    );
+    if (img) img.src =
+      `/api/thumbnail/${encodeURIComponent(s.object_name)}?_=${Date.now()}`;
+  });
+})();
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 function esc(str) {
