@@ -539,12 +539,13 @@ def api_thumbnail(object_name: str):
     try:
         from PIL import Image
         img = Image.open(thumb_path)
-        img.thumbnail((600, 600))
+        max_px = 1400 if request.args.get("large") else 600
+        img.thumbnail((max_px, max_px))
         # Convert to RGB if needed (TIFF/RGBA can't be JPEG)
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=82)
+        img.save(buf, format="JPEG", quality=88 if max_px > 600 else 82)
         buf.seek(0)
         resp = send_file(buf, mimetype="image/jpeg")
     except Exception:

@@ -316,7 +316,7 @@ function renderSlide() {
   const ph  = document.getElementById('slide-placeholder');
 
   if (hasThumbnail) {
-    img.src = `/api/thumbnail/${encodeURIComponent(item.session.object_name)}`;
+    img.src = `/api/thumbnail/${encodeURIComponent(item.session.object_name)}?large=1`;
     img.style.display = '';
     ph.style.display  = 'none';
   } else {
