@@ -272,12 +272,13 @@ function applyFilter() {
       (groups[prefix] = groups[prefix] || []).push(s);
     });
 
-    // Within each group sort numerically by the trailing number
+    // Within each group sort numerically; _sub follows its base session
     Object.values(groups).forEach(arr => {
       arr.sort((a, b) => {
         const na = parseInt(a.object_name.replace(/\D/g, ''), 10) || 0;
         const nb = parseInt(b.object_name.replace(/\D/g, ''), 10) || 0;
-        return na - nb;
+        if (na !== nb) return na - nb;
+        return (a.object_name.endsWith('_sub') ? 1 : 0) - (b.object_name.endsWith('_sub') ? 1 : 0);
       });
     });
 
@@ -296,7 +297,8 @@ function applyFilter() {
       if (isCatalogFilter) {
         const na = parseInt(a.object_name.replace(/\D/g, ''), 10);
         const nb = parseInt(b.object_name.replace(/\D/g, ''), 10);
-        return na - nb;
+        if (na !== nb) return na - nb;
+        return (a.object_name.endsWith('_sub') ? 1 : 0) - (b.object_name.endsWith('_sub') ? 1 : 0);
       }
       const da = a.dates[a.dates.length - 1] || '';
       const db = b.dates[b.dates.length - 1] || '';
