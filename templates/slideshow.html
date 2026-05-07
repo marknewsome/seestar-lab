@@ -88,33 +88,19 @@
     #slide-img-wrap {
       flex: 1 1 auto;
       min-height: 0;
-      position: relative;
       display: flex;
       align-items: center;
       justify-content: center;
       width: 100%;
-      overflow: hidden;
-      border-radius: 6px;
-    }
-    #slide-bg {
-      position: absolute;
-      inset: -10%;
-      width: 120%;
-      height: 120%;
-      object-fit: cover;
-      filter: blur(32px) brightness(0.28) saturate(1.6);
-      pointer-events: none;
     }
     #slide-img {
-      position: relative;
       max-height: 100%;
       max-width: 100%;
       object-fit: contain;
-      border-radius: 4px;
-      box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+      border-radius: 6px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.7);
     }
     #slide-placeholder {
-      position: relative;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -261,9 +247,8 @@
 
 <div id="slide-wrap" style="display:none;">
   <div id="slide-img-wrap">
-    <img id="slide-bg" alt="" aria-hidden="true" style="display:none;" />
     <img id="slide-img" alt="" style="display:none;"
-         onerror="this.style.display='none'; document.getElementById('slide-bg').style.display='none'; document.getElementById('slide-placeholder').style.display='flex';" />
+         onerror="this.style.display='none'; document.getElementById('slide-placeholder').style.display='flex';" />
     <div id="slide-placeholder" style="display:none;">★</div>
   </div>
   <div id="slide-info">
@@ -328,19 +313,14 @@ function renderSlide() {
   const hasThumbnail = item.session?.pinned_thumbnail || item.session?.thumbnail;
 
   const img = document.getElementById('slide-img');
-  const bg  = document.getElementById('slide-bg');
   const ph  = document.getElementById('slide-placeholder');
 
   if (hasThumbnail) {
-    const url = `/api/thumbnail/${encodeURIComponent(item.session.object_name)}?large=1`;
-    img.src = url;
-    bg.src  = url;
+    img.src = `/api/thumbnail/${encodeURIComponent(item.session.object_name)}?large=1`;
     img.style.display = '';
-    bg.style.display  = '';
     ph.style.display  = 'none';
   } else {
     img.style.display = 'none';
-    bg.style.display  = 'none';
     ph.style.display  = 'flex';
   }
 
