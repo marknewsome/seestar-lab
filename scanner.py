@@ -30,6 +30,29 @@ try:
 except ImportError:
     _HAVE_CV2 = False
 
+
+def _video_duration_s(path: str) -> int:
+    """Return video duration in whole seconds, or 0 if unreadable.
+
+    Suppresses libav/ffmpeg stderr noise (e.g. 'moov atom not found') that
+    leaks through even when the result is gracefully handled.
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_stderr  = os.dup(2)
+    os.dup2(devnull_fd, 2)
+    os.close(devnull_fd)
+    try:
+        cap = _cv2.VideoCapture(path)
+        fc  = cap.get(_cv2.CAP_PROP_FRAME_COUNT)
+        fps = cap.get(_cv2.CAP_PROP_FPS)
+        cap.release()
+        return int(fc / fps) if fps > 0 and fc > 0 else 0
+    except Exception:
+        return 0
+    finally:
+        os.dup2(old_stderr, 2)
+        os.close(old_stderr)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 FITS_EXT   = {".fit", ".fits", ".fts"}
@@ -71,13 +94,7 @@ def backfill_video_durations_iter() -> Generator[dict, None, None]:
             try:
                 for fname in os.listdir(dir_path):
                     if Path(fname).suffix.lower() in VIDEO_EXT:
-                        vf = os.path.join(dir_path, fname)
-                        cap = _cv2.VideoCapture(vf)
-                        fc  = cap.get(_cv2.CAP_PROP_FRAME_COUNT)
-                        fps = cap.get(_cv2.CAP_PROP_FPS)
-                        cap.release()
-                        if fps > 0 and fc > 0:
-                            duration += int(fc / fps)
+                        duration += _video_duration_s(os.path.join(dir_path, fname))
             except Exception:
                 pass
 
@@ -262,15 +279,7 @@ class Scanner:
         total_video_duration = 0
         if _HAVE_CV2:
             for vf in video_files:
-                try:
-                    cap = _cv2.VideoCapture(vf)
-                    fc  = cap.get(_cv2.CAP_PROP_FRAME_COUNT)
-                    fps = cap.get(_cv2.CAP_PROP_FPS)
-                    cap.release()
-                    if fps > 0 and fc > 0:
-                        total_video_duration += int(fc / fps)
-                except Exception:
-                    pass
+                total_video_duration += _video_duration_s(vf)
 
         obj_type = self.catalog.detect_type(obj_name)
         thumbnail = _find_thumbnail(image_files)

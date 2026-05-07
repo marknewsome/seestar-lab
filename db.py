@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_video_duration  INTEGER DEFAULT 0,   -- seconds of video (sum of all clips)
     paths                 TEXT DEFAULT '[]',   -- JSON array of directory paths
     thumbnail             TEXT DEFAULT NULL,   -- absolute path to best preview image
+    pinned_thumbnail      TEXT DEFAULT NULL,   -- user-selected override; survives rescans
     updated_at            TEXT
 );
 
@@ -45,21 +46,6 @@ CREATE TABLE IF NOT EXISTS scanned_dirs (
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
-);
-
--- Transit detection: one row per source video
-CREATE TABLE IF NOT EXISTS video_jobs (
-    video_path    TEXT PRIMARY KEY,
-    session_name  TEXT NOT NULL,
-    video_type    TEXT NOT NULL,    -- 'solar' | 'lunar'
-    output_dir    TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|running|done|error|cancelled
-    error_msg     TEXT,
-    pct           INTEGER DEFAULT 0,
-    message       TEXT DEFAULT '',
-    queued_at     TEXT NOT NULL,
-    started_at    TEXT,
-    finished_at   TEXT
 );
 
 -- Sub-frame stacking: one row per session ever stacked
@@ -95,27 +81,6 @@ CREATE TABLE IF NOT EXISTS meteor_impacts (
     detected_at      TEXT
 );
 
--- Transit detection: one row per detected event
-CREATE TABLE IF NOT EXISTS transit_events (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_path           TEXT NOT NULL,
-    session_name         TEXT NOT NULL,
-    video_type           TEXT NOT NULL,
-    label                TEXT NOT NULL,   -- 'plane' | 'bird' | 'iss' | 'unknown'
-    confidence           REAL NOT NULL,
-    frame_start          INTEGER,
-    frame_end            INTEGER,
-    duration_s           REAL,
-    velocity_pct_per_sec REAL,
-    linearity            REAL,
-    clip_path            TEXT,
-    meta_path            TEXT,
-    aircraft_candidates  TEXT,            -- JSON array of candidate dicts (may be NULL)
-    thumb_path           TEXT,            -- absolute path to hero-frame JPEG
-    yolo_label           TEXT,            -- YOLO-validated class ('airplane'/'bird') or NULL
-    yolo_confidence      REAL,            -- YOLO detection confidence, or NULL
-    detected_at          TEXT
-);
 """
 
 # Migration: add thumbnail column to existing databases that predate it
@@ -149,15 +114,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN thumbnail TEXT DEFAULT NULL")
         if "total_video_duration" not in cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN total_video_duration INTEGER DEFAULT 0")
-        te_cols = {row[1] for row in conn.execute("PRAGMA table_info(transit_events)").fetchall()}
-        if "aircraft_candidates" not in te_cols:
-            conn.execute("ALTER TABLE transit_events ADD COLUMN aircraft_candidates TEXT")
-        if "thumb_path" not in te_cols:
-            conn.execute("ALTER TABLE transit_events ADD COLUMN thumb_path TEXT")
-        if "yolo_label" not in te_cols:
-            conn.execute("ALTER TABLE transit_events ADD COLUMN yolo_label TEXT")
-        if "yolo_confidence" not in te_cols:
-            conn.execute("ALTER TABLE transit_events ADD COLUMN yolo_confidence REAL")
+        if "pinned_thumbnail" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN pinned_thumbnail TEXT DEFAULT NULL")
         # meteor_impacts table (added for dark-side flash detection)
         conn.executescript(
             "CREATE TABLE IF NOT EXISTS meteor_impacts ("
@@ -240,6 +198,14 @@ def upsert_session(session: dict) -> None:
 def remove_session(object_name: str) -> None:
     with _db() as conn:
         conn.execute("DELETE FROM sessions WHERE object_name = ?", (object_name,))
+
+
+def set_pinned_thumbnail(object_name: str, path: Optional[str]) -> None:
+    with _db() as conn:
+        conn.execute(
+            "UPDATE sessions SET pinned_thumbnail=? WHERE object_name=?",
+            (path, object_name),
+        )
 
 
 def get_all_sessions() -> list[dict]:
@@ -342,121 +308,7 @@ def get_meta(key: str, default: Optional[str] = None) -> Optional[str]:
     return row["value"] if row else default
 
 
-# ── Video jobs ─────────────────────────────────────────────────────────────────
-
-def queue_video_job(
-    video_path: str,
-    session_name: str,
-    video_type: str,
-    output_dir: str,
-    force: bool = False,
-) -> bool:
-    """
-    Insert a pending video_job row.  Returns True if inserted, False if the job
-    already exists with status 'pending', 'running', or 'done' (and force=False).
-    """
-    with _db() as conn:
-        existing = conn.execute(
-            "SELECT status FROM video_jobs WHERE video_path = ?", (video_path,)
-        ).fetchone()
-        if existing and not force:
-            if existing["status"] in ("pending", "running", "done"):
-                return False
-        conn.execute(
-            """
-            INSERT INTO video_jobs
-                (video_path, session_name, video_type, output_dir, status, queued_at)
-            VALUES (?, ?, ?, ?, 'pending', datetime('now'))
-            ON CONFLICT(video_path) DO UPDATE SET
-                status     = 'pending',
-                error_msg  = NULL,
-                pct        = 0,
-                message    = '',
-                queued_at  = datetime('now'),
-                started_at = NULL,
-                finished_at= NULL
-            """,
-            (video_path, session_name, video_type, output_dir),
-        )
-    return True
-
-
-def start_video_job(video_path: str) -> None:
-    with _db() as conn:
-        conn.execute(
-            "UPDATE video_jobs SET status='running', started_at=datetime('now'), pct=0 "
-            "WHERE video_path=?",
-            (video_path,),
-        )
-
-
-def update_video_job_progress(video_path: str, pct: int, message: str) -> None:
-    with _db() as conn:
-        conn.execute(
-            "UPDATE video_jobs SET pct=?, message=? WHERE video_path=?",
-            (pct, message, video_path),
-        )
-
-
-def finish_video_job(video_path: str) -> None:
-    with _db() as conn:
-        conn.execute(
-            "UPDATE video_jobs SET status='done', pct=100, finished_at=datetime('now') "
-            "WHERE video_path=?",
-            (video_path,),
-        )
-
-
-def fail_video_job(video_path: str, error_msg: str) -> None:
-    with _db() as conn:
-        conn.execute(
-            "UPDATE video_jobs SET status='error', error_msg=?, finished_at=datetime('now') "
-            "WHERE video_path=?",
-            (error_msg, video_path),
-        )
-
-
-def get_pending_jobs() -> list[dict]:
-    """Return all jobs that were left 'running' (from a crash) plus 'pending'."""
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM video_jobs WHERE status IN ('pending','running') "
-            "ORDER BY queued_at"
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def cancel_video_jobs(session_name: Optional[str] = None) -> int:
-    """
-    Mark pending/running jobs as 'cancelled'.
-    If session_name is given, only that session's jobs are cancelled.
-    Returns the number of rows updated.
-    """
-    with _db() as conn:
-        if session_name:
-            cur = conn.execute(
-                "UPDATE video_jobs SET status='cancelled', finished_at=datetime('now') "
-                "WHERE session_name=? AND status IN ('pending','running')",
-                (session_name,),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE video_jobs SET status='cancelled', finished_at=datetime('now') "
-                "WHERE status IN ('pending','running')"
-            )
-    return cur.rowcount
-
-
-# ── Transit events ─────────────────────────────────────────────────────────────
-
-def delete_transit_events_for_video(video_path: str) -> int:
-    """Delete all transit_events rows for *video_path*. Returns deleted count."""
-    with _db() as conn:
-        cur = conn.execute(
-            "DELETE FROM transit_events WHERE video_path=?", (video_path,)
-        )
-        return cur.rowcount
-
+# ── Impact events ──────────────────────────────────────────────────────────────
 
 def delete_impact_events_for_video(video_path: str) -> int:
     """Delete all meteor_impacts rows for *video_path*. Returns deleted count."""
@@ -470,20 +322,12 @@ def delete_impact_events_for_video(video_path: str) -> int:
 def purge_resource_fork_jobs() -> int:
     """
     Remove macOS resource-fork pseudo-files (basename starting with '._')
-    from video_jobs and transit_events.  These are created when Mac users copy
-    files to non-HFS volumes and are not real video files.
-    Returns the number of video_job rows deleted.
+    from meteor_impacts.  These are created when Mac users copy files to
+    non-HFS volumes and are not real video files.
+    Returns the number of rows deleted.
     """
     with _db() as conn:
-        # SQLite's substr+instr can't easily match on basename, but we can use
-        # LIKE on the full path since the separator is always '/'.
         cur = conn.execute(
-            "DELETE FROM video_jobs WHERE video_path LIKE '%/._%%'"
-        )
-        conn.execute(
-            "DELETE FROM transit_events WHERE video_path LIKE '%/._%%'"
-        )
-        conn.execute(
             "DELETE FROM meteor_impacts WHERE video_path LIKE '%/._%%'"
         )
         return cur.rowcount
@@ -526,127 +370,6 @@ def get_impact_gallery() -> list[dict]:
             "SELECT * FROM meteor_impacts ORDER BY detected_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
-
-
-def insert_transit_event(ev: dict) -> int:
-    """Insert one event row and return its new id."""
-    with _db() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO transit_events
-                (video_path, session_name, video_type, label, confidence,
-                 frame_start, frame_end, duration_s, velocity_pct_per_sec,
-                 linearity, clip_path, meta_path, aircraft_candidates, thumb_path,
-                 yolo_label, yolo_confidence,
-                 detected_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
-            """,
-            (
-                ev["video_path"], ev["session_name"], ev["video_type"],
-                ev["label"], ev["confidence"],
-                ev.get("frame_start"), ev.get("frame_end"),
-                ev.get("duration_s"), ev.get("velocity_pct_per_sec"),
-                ev.get("linearity"), ev.get("clip_path"), ev.get("meta_path"),
-                ev.get("aircraft_candidates"), ev.get("thumb_path"),
-                ev.get("yolo_label"), ev.get("yolo_confidence"),
-            ),
-        )
-    return cur.lastrowid
-
-
-def get_transit_event(event_id: int) -> Optional[dict]:
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM transit_events WHERE id=?", (event_id,)
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def get_transit_gallery() -> list[dict]:
-    """
-    Return all transit events as a flat list ordered by detected_at descending.
-    Includes video_type and detected_at, which get_transit_summary omits.
-    """
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM transit_events ORDER BY detected_at DESC"
-        ).fetchall()
-    result = []
-    for ev in rows:
-        ac: list = []
-        try:
-            if ev["aircraft_candidates"]:
-                ac = json.loads(ev["aircraft_candidates"])
-        except (json.JSONDecodeError, TypeError):
-            pass
-        result.append({
-            "id":                   ev["id"],
-            "video_path":           ev["video_path"],
-            "session_name":         ev["session_name"],
-            "video_type":           ev["video_type"],
-            "label":                ev["label"],
-            "confidence":           ev["confidence"],
-            "duration_s":           ev["duration_s"],
-            "velocity_pct_per_sec": ev["velocity_pct_per_sec"],
-            "linearity":            ev["linearity"],
-            "clip_path":            ev["clip_path"],
-            "thumb_path":           ev["thumb_path"],
-            "aircraft_candidates":  ac,
-            "yolo_label":           ev["yolo_label"],
-            "yolo_confidence":      ev["yolo_confidence"],
-            "detected_at":          ev["detected_at"],
-        })
-    return result
-
-
-def get_transit_summary() -> dict:
-    """
-    Return {session_name: {video_jobs: [...], events: [...]}} for all sessions
-    that have ever had a job queued.  Used by /api/transit/all.
-    """
-    with _db() as conn:
-        jobs   = conn.execute("SELECT * FROM video_jobs ORDER BY queued_at").fetchall()
-        events = conn.execute(
-            "SELECT * FROM transit_events ORDER BY detected_at"
-        ).fetchall()
-
-    result: dict[str, dict] = {}
-    for j in jobs:
-        sn = j["session_name"]
-        result.setdefault(sn, {"video_jobs": [], "events": []})
-        result[sn]["video_jobs"].append({
-            "video_path": j["video_path"],
-            "basename":   j["video_path"].rsplit("/", 1)[-1],
-            "status":     j["status"],
-            "pct":        j["pct"],
-            "message":    j["message"] or "",
-            "error_msg":  j["error_msg"],
-        })
-
-    for ev in events:
-        sn = ev["session_name"]
-        result.setdefault(sn, {"video_jobs": [], "events": []})
-        ac: list = []
-        try:
-            if ev["aircraft_candidates"]:
-                ac = json.loads(ev["aircraft_candidates"])
-        except (json.JSONDecodeError, TypeError):
-            pass
-        result[sn]["events"].append({
-            "id":                   ev["id"],
-            "video_path":           ev["video_path"],
-            "label":                ev["label"],
-            "confidence":           ev["confidence"],
-            "duration_s":           ev["duration_s"],
-            "velocity_pct_per_sec": ev["velocity_pct_per_sec"],
-            "clip_path":            ev["clip_path"],
-            "thumb_path":           ev["thumb_path"],
-            "aircraft_candidates":  ac,
-            "yolo_label":           ev["yolo_label"],
-            "yolo_confidence":      ev["yolo_confidence"],
-        })
-
-    return result
 
 
 # ── Stack jobs ─────────────────────────────────────────────────────────────────

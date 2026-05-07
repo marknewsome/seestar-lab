@@ -397,21 +397,27 @@ def _write_mp4(
     durations: Optional[list],
     fps_cfr: int = 30,
 ) -> None:
+    """``frames_bgr`` may be numpy arrays or JPEG file paths (str)."""
     if not frames_bgr:
         return
     ffbin = "/usr/bin/ffmpeg" if os.path.isfile("/usr/bin/ffmpeg") else shutil.which("ffmpeg")
 
     if durations is not None and ffbin:
+        paths_on_disk = isinstance(frames_bgr[0], str)
         tmp_dir = tempfile.mkdtemp(prefix="lunar_vfr_")
         try:
             concat = os.path.join(tmp_dir, "frames.txt")
             with open(concat, "w") as fh:
                 fh.write("ffconcat version 1.0\n")
                 for j, (frm, dur) in enumerate(zip(frames_bgr, durations)):
-                    jpg = os.path.join(tmp_dir, f"f{j:05d}.jpg")
-                    cv2.imwrite(jpg, frm, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    if paths_on_disk:
+                        jpg = frm
+                    else:
+                        jpg = os.path.join(tmp_dir, f"f{j:05d}.jpg")
+                        cv2.imwrite(jpg, frm, [cv2.IMWRITE_JPEG_QUALITY, 92])
                     fh.write(f"file '{jpg}'\nduration {dur:.6f}\n")
-                last = os.path.join(tmp_dir, f"f{len(frames_bgr)-1:05d}.jpg")
+                last_frm = frames_bgr[-1]
+                last = last_frm if paths_on_disk else os.path.join(tmp_dir, f"f{len(frames_bgr)-1:05d}.jpg")
                 fh.write(f"file '{last}'\n")
             tmp_out = path + ".vfr.tmp.mp4"
             r = subprocess.run(
@@ -429,12 +435,13 @@ def _write_mp4(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # CFR fallback
-    h, w   = frames_bgr[0].shape[:2]
+    first = cv2.imread(frames_bgr[0]) if isinstance(frames_bgr[0], str) else frames_bgr[0]
+    h, w   = first.shape[:2]
     raw    = path + ".raw.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(raw, fourcc, fps_cfr, (w, h))
     for f in frames_bgr:
-        writer.write(f)
+        writer.write(cv2.imread(f) if isinstance(f, str) else f)
     writer.release()
     if ffbin:
         tmp = path + ".tmp.mp4"
@@ -668,6 +675,14 @@ def run_phase(
 
         normed    = _normalise_frame(frame, e["cx"], e["cy"], e["r"], out_size, target_r)
         stretched = _stretch_frame(normed, sky_pct, high_pct, gamma, out_size, target_r)
+
+        # Top-left: date
+        date_str = (sf.get("ts_utc") or sf.get("date") or "")[:10]
+        if date_str:
+            stretched = _overlay_label(stretched, date_str, pos="top")
+        # Bottom-left: phase name + illumination
+        stretched = _overlay_label(stretched, sf["phase_lbl"], pos="bottom")
+
         normed_frames.append(stretched)
         mosaic_labels.append(sf["mosaic_lbl"])
         portrait_labels.append(sf["phase_lbl"])
@@ -858,23 +873,22 @@ def run_single(
     # ── Pass 2 ───────────────────────────────────────────────────────────────
     _progress(40, "Pass 2 — Normalising and stretching frames…")
 
-    normed_frames:  list[np.ndarray] = []
     frame_ts_utc:   list[Optional[str]] = []
     frame_quality:  list[float] = []
     open_caps: dict[str, cv2.VideoCapture] = {}
+
+    # Stream each normalised frame to disk immediately — same O(1)-RAM
+    # approach as the solar pipeline, avoiding OOM on long sessions.
+    frame_tmp_dir = tempfile.mkdtemp(prefix="lunar_frames_")
+    normed_frame_paths: list[str] = []
 
     def _get_cap(vp: str) -> cv2.VideoCapture:
         if vp not in open_caps:
             open_caps[vp] = cv2.VideoCapture(vp)
         return open_caps[vp]
 
-    # Determine target_r from median detected radius across all frames
-    # (adapts to the actual video resolution)
-    all_radii = [e["r"] for e in raw_frames]
-    median_r  = float(np.median(all_radii))
-    # target_r stays fixed at out_size * TARGET_R_FRAC
-
-    for i, entry in enumerate(raw_frames):
+    try:
+      for i, entry in enumerate(raw_frames):
         if i % 50 == 0:
             pct = 40 + int(i / len(raw_frames) * 33)
             _progress(pct, f"  Normalising frame {i+1}/{len(raw_frames)}…")
@@ -888,77 +902,87 @@ def run_single(
         normed    = _normalise_frame(frame, entry["cx"], entry["cy"], entry["r"],
                                      out_size, target_r)
         stretched = _stretch_frame(normed, sky_pct, high_pct, gamma, out_size, target_r)
-        normed_frames.append(stretched)
+
+        if entry.get("ts_utc"):
+            ts_label = entry["ts_utc"].replace("T", "  ").split(".")[0] + " UTC"
+            stretched = _overlay_label(stretched, ts_label, pos="top")
+
+        jpg_path = os.path.join(frame_tmp_dir, f"f{i:05d}.jpg")
+        cv2.imwrite(jpg_path, stretched, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        normed_frame_paths.append(jpg_path)
         frame_ts_utc.append(entry["ts_utc"])
         frame_quality.append(entry["quality"])
 
-    for cap in open_caps.values():
-        cap.release()
+      for cap in open_caps.values():
+          cap.release()
 
-    if not normed_frames:
-        print("ERROR: no normalised frames produced.", flush=True)
-        sys.exit(1)
+      if not normed_frame_paths:
+          print("ERROR: no normalised frames produced.", flush=True)
+          sys.exit(1)
 
-    _progress(73, f"  Normalised {len(normed_frames)} frames")
+      n = len(normed_frame_paths)
+      _progress(73, f"  Normalised {n} frames")
 
-    # ── Pass 3 ───────────────────────────────────────────────────────────────
-    _progress(74, "Pass 3 — Assembling timelapse…")
+      # ── Pass 3 ───────────────────────────────────────────────────────────────
+      _progress(74, "Pass 3 — Assembling timelapse…")
 
-    # Portrait
-    best_idx  = int(np.argmax(frame_quality))
-    portrait  = normed_frames[best_idx].copy()
-    ts_valid  = [t for t in frame_ts_utc if t]
-    date_label = ts_valid[0][:10] if ts_valid else "Lunar"
-    if ts_valid and ts_valid[-1][:10] != ts_valid[0][:10]:
-        date_label += f" – {ts_valid[-1][:10]}"
+      # Portrait: read sharpest frame back from disk
+      best_idx  = int(np.argmax(frame_quality))
+      portrait  = cv2.imread(normed_frame_paths[best_idx])
+      ts_valid  = [t for t in frame_ts_utc if t]
+      date_label = ts_valid[0][:10] if ts_valid else "Lunar"
+      if ts_valid and ts_valid[-1][:10] != ts_valid[0][:10]:
+          date_label += f" – {ts_valid[-1][:10]}"
 
-    # Phase label for portrait
-    ts_best: Optional[datetime] = None
-    if frame_ts_utc[best_idx]:
-        try:
-            ts_best = datetime.fromisoformat(frame_ts_utc[best_idx])
-        except Exception:
-            pass
-    illum, age = _lunar_illumination(ts_best)
-    pname      = _phase_name(age)
-    portrait_text = f"))) {pname}  {illum:.0f}%  ·  {date_label}  ·  {len(normed_frames)} frames"
-    portrait = _overlay_label(portrait, portrait_text, pos="bottom")
-    portrait_path = os.path.join(out_dir, "lunar_portrait.jpg")
-    cv2.imwrite(portrait_path, portrait, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    print(f"  Wrote portrait → {portrait_path}", flush=True)
+      # Phase label for portrait
+      ts_best: Optional[datetime] = None
+      if frame_ts_utc[best_idx]:
+          try:
+              ts_best = datetime.fromisoformat(frame_ts_utc[best_idx])
+          except Exception:
+              pass
+      illum, age = _lunar_illumination(ts_best)
+      pname      = _phase_name(age)
+      portrait_text = f"))) {pname}  {illum:.0f}%  ·  {date_label}  ·  {n} frames"
+      portrait = _overlay_label(portrait, portrait_text, pos="bottom")
+      portrait_path = os.path.join(out_dir, "lunar_portrait.jpg")
+      cv2.imwrite(portrait_path, portrait, [cv2.IMWRITE_JPEG_QUALITY, 95])
+      print(f"  Wrote portrait → {portrait_path}", flush=True)
 
-    # VFR durations (same as solar)
-    n       = len(normed_frames)
-    min_dur = 1.0 / 60.0
-    max_dur = 5.0
-    durations: list[float] = []
-    for i in range(n - 1):
-        ts_c = frame_ts_utc[i]
-        ts_n = frame_ts_utc[i + 1]
-        if ts_c and ts_n:
-            try:
-                dt = (datetime.fromisoformat(ts_n) -
-                      datetime.fromisoformat(ts_c)).total_seconds()
-            except ValueError:
-                dt = sample_interval
-        else:
-            dt = sample_interval
-        durations.append(max(min_dur, min(max_dur, dt / speedup)))
-    durations.append(durations[-1] if durations else 1.0 / 30.0)
+      # VFR durations (same as solar)
+      min_dur = 1.0 / 60.0
+      max_dur = 5.0
+      durations: list[float] = []
+      for i in range(n - 1):
+          ts_c = frame_ts_utc[i]
+          ts_n = frame_ts_utc[i + 1]
+          if ts_c and ts_n:
+              try:
+                  dt = (datetime.fromisoformat(ts_n) -
+                        datetime.fromisoformat(ts_c)).total_seconds()
+              except ValueError:
+                  dt = sample_interval
+          else:
+              dt = sample_interval
+          durations.append(max(min_dur, min(max_dur, dt / speedup)))
+      durations.append(durations[-1] if durations else 1.0 / 30.0)
 
-    timelapse_path = os.path.join(out_dir, "lunar_session.mp4")
-    _progress(82, f"  Encoding {n} frames → {Path(timelapse_path).name}")
-    _write_mp4(timelapse_path, normed_frames, durations)
-    print(f"  Wrote timelapse → {timelapse_path}", flush=True)
+      timelapse_path = os.path.join(out_dir, "lunar_session.mp4")
+      _progress(82, f"  Encoding {n} frames → {Path(timelapse_path).name}")
+      _write_mp4(timelapse_path, normed_frame_paths, durations)
+      print(f"  Wrote timelapse → {timelapse_path}", flush=True)
 
-    _progress(100, "Done.")
-    return {
-        "timelapse":   timelapse_path if os.path.isfile(timelapse_path) else None,
-        "portrait":    portrait_path  if os.path.isfile(portrait_path)  else None,
-        "mosaic":      None,
-        "frame_count": n,
-        "date_label":  date_label,
-    }
+      _progress(100, "Done.")
+      return {
+          "timelapse":   timelapse_path if os.path.isfile(timelapse_path) else None,
+          "portrait":    portrait_path  if os.path.isfile(portrait_path)  else None,
+          "mosaic":      None,
+          "frame_count": n,
+          "date_label":  date_label,
+      }
+
+    finally:
+        shutil.rmtree(frame_tmp_dir, ignore_errors=True)
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

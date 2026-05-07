@@ -9,13 +9,10 @@ async function shutdownApp() {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const sessions          = {};   // object_name → session dict  (source of truth)
-const transitData       = {};   // object_name → {video_jobs: [...], events: [...]}
 const stackData         = {};   // object_name → stack job dict
-const yoloConfirmedOnly = {};   // object_name → bool (confirmed-only filter per card)
 let activeFilter    = 'all';
 let evtSource       = null;
 let dbLoaded        = false; // true once we've received the initial DB flush
-let transitPaused   = false; // mirrors server pause state
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -62,8 +59,7 @@ function handleEvent(ev) {
 
     case 'db_loaded':
       dbLoaded = true;
-      // Load transit + stack data then render everything once both are ready
-      Promise.all([loadTransitData(), loadStackData()]).then(() => {
+      loadStackData().then(() => {
         applyFilter();
         updateFilterCounts();
         updateSummary();
@@ -103,14 +99,6 @@ function handleEvent(ev) {
       hideProgressBar();
       break;
 
-    case 'transit_progress':
-      handleTransitProgress(ev);
-      break;
-
-    case 'transit_done':
-      handleTransitDone(ev);
-      break;
-
     case 'stack_progress':
       handleStackProgress(ev);
       break;
@@ -119,19 +107,6 @@ function handleEvent(ev) {
       handleStackDone(ev);
       break;
 
-    case 'transit_queue_state':
-      transitPaused = !!ev.paused;
-      updateTransitQueueControls();
-      // If a cancel was for all, refresh affected footers
-      if (ev.cancel_all) {
-        document.querySelectorAll('.transit-footer').forEach(el => {
-          const card = el.closest('.session-card');
-          if (!card) return;
-          const name = Object.keys(sessions).find(n => cardId(n) === card.id);
-          if (name) el.outerHTML = buildTransitFooter(name);
-        });
-      }
-      break;
   }
 }
 
@@ -198,17 +173,6 @@ function setScanButtons(scanning) {
   document.getElementById('scan-full-btn').disabled = scanning;
 }
 
-// ── Transit detection ─────────────────────────────────────────────────────────
-
-async function loadTransitData() {
-  try {
-    const res = await fetch('/api/transit/all');
-    if (!res.ok) return;
-    const data = await res.json();
-    Object.assign(transitData, data);
-  } catch { /* non-fatal */ }
-}
-
 async function loadStackData() {
   try {
     const res = await fetch('/api/stack/status');
@@ -251,165 +215,6 @@ function _refreshStackFooter(sessionName) {
   if (footer) footer.outerHTML = buildStackFooter(sessionName);
 }
 
-function updateTransitQueueControls() {
-  const pauseBtn = document.getElementById('transit-pause-btn');
-  if (!pauseBtn) return;
-
-  // Tally job statuses across all sessions
-  let running = 0, pending = 0, done = 0, errored = 0;
-  for (const td of Object.values(transitData)) {
-    for (const j of td.video_jobs) {
-      if      (j.status === 'running')   running++;
-      else if (j.status === 'pending')   pending++;
-      else if (j.status === 'done')      done++;
-      else if (j.status === 'error')     errored++;
-    }
-  }
-
-  const hasActive = running > 0 || pending > 0;
-  const bar = document.getElementById('transit-queue-bar');
-  if (bar) bar.style.display = hasActive ? 'flex' : 'none';
-
-  // Build label: "Transit queue · 1 running · 4 pending · 12 done"
-  const label = document.getElementById('transit-queue-label');
-  if (label) {
-    const parts = [transitPaused ? 'Transit queue (paused)' : 'Transit queue'];
-    if (running) parts.push(`${running} running`);
-    if (pending) parts.push(`${pending} pending`);
-    if (done)    parts.push(`${done} done`);
-    if (errored) parts.push(`${errored} error`);
-    label.textContent = parts.join(' · ');
-  }
-
-  pauseBtn.textContent = transitPaused ? '▶ Resume' : '⏸ Pause';
-  pauseBtn.classList.toggle('paused', transitPaused);
-}
-
-async function toggleTransitPause() {
-  const route = transitPaused ? '/api/transit/resume' : '/api/transit/pause';
-  await fetch(route, { method: 'POST' });
-}
-
-async function cancelAllTransit() {
-  if (!confirm('Cancel all queued transit detection jobs?')) return;
-  await fetch('/api/transit/cancel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ all: true }),
-  });
-}
-
-async function cancelSessionTransit(sessionName) {
-  await fetch('/api/transit/cancel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_name: sessionName }),
-  });
-  // Optimistically mark pending jobs as cancelled in local state
-  const td = transitData[sessionName];
-  if (td) {
-    td.video_jobs.forEach(j => {
-      if (j.status === 'pending' || j.status === 'running') j.status = 'cancelled';
-    });
-  }
-  // Refresh card footer
-  const card = document.getElementById(cardId(sessionName));
-  if (card) {
-    const footer = card.querySelector('.transit-footer');
-    if (footer) footer.outerHTML = buildTransitFooter(sessionName);
-  }
-  updateTransitQueueControls();
-}
-
-async function queueTransitDetection(sessionName, force = false) {
-  const btn = document.getElementById(`transit-btn-${cardId(sessionName).slice(5)}`);
-  if (btn) { btn.disabled = true; btn.textContent = 'Queuing…'; }
-  try {
-    const res = await fetch('/api/transit/detect', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ session_name: sessionName, force }),
-    });
-    const body = await res.json();
-    if (!res.ok) {
-      alert(`Transit detection error: ${body.error || res.status}`);
-      if (btn) { btn.disabled = false; btn.textContent = 'Detect Transits'; }
-      return;
-    }
-    if (body.queued === 0) {
-      if (btn) { btn.disabled = false; btn.textContent = 'No new videos'; }
-    } else {
-      // Pre-populate transitData so we know total queue size before first SSE arrives.
-      // Always upsert — this resets any lingering error entries back to 'pending'.
-      if (!transitData[sessionName]) transitData[sessionName] = { video_jobs: [], events: [] };
-      const jobs = transitData[sessionName].video_jobs;
-      const queuedPaths = new Set(body.videos || []);
-      for (const vpath of queuedPaths) {
-        const basename = vpath.split('/').pop();
-        const pending  = { video_path: vpath, basename, status: 'pending', pct: 0, message: '', error_msg: null };
-        const idx = jobs.findIndex(j => j.video_path === vpath);
-        if (idx >= 0) jobs[idx] = pending; else jobs.push(pending);
-      }
-      // On a forced re-detect, immediately remove stale event pills for the
-      // re-queued videos so the UI shows a clean slate during detection.
-      if (force) {
-        transitData[sessionName].events = transitData[sessionName].events
-          .filter(e => !queuedPaths.has(e.video_path));
-      }
-      const card = document.getElementById(cardId(sessionName));
-      if (card) {
-        const footer = card.querySelector('.transit-footer');
-        if (footer) footer.outerHTML = buildTransitFooter(sessionName);
-      }
-    }
-  } catch {
-    if (btn) { btn.disabled = false; btn.textContent = 'Detect Transits'; }
-  }
-}
-
-function handleTransitProgress(ev) {
-  const sn = ev.session_name;
-  if (!transitData[sn]) transitData[sn] = { video_jobs: [], events: [] };
-
-  const jobs = transitData[sn].video_jobs;
-  const idx  = jobs.findIndex(j => j.video_path === ev.video_path);
-  const entry = {
-    video_path: ev.video_path, basename: ev.video_basename,
-    status: ev.status, pct: ev.pct, message: ev.message || '',
-    error_msg: ev.status === 'error' ? (ev.message || 'unknown error') : null,
-  };
-  if (idx >= 0) jobs[idx] = entry; else jobs.push(entry);
-
-  const card = document.getElementById(cardId(sn));
-  if (card) {
-    const footer = card.querySelector('.transit-footer');
-    if (footer) footer.outerHTML = buildTransitFooter(sn);
-  }
-  updateTransitQueueControls();
-}
-
-function handleTransitDone(ev) {
-  const sn = ev.session_name;
-  if (!transitData[sn]) transitData[sn] = { video_jobs: [], events: [] };
-
-  const jobs = transitData[sn].video_jobs;
-  const idx  = jobs.findIndex(j => j.video_path === ev.video_path);
-  const entry = { video_path: ev.video_path, basename: ev.video_basename,
-                  status: 'done', pct: 100, message: '', error_msg: null };
-  if (idx >= 0) jobs[idx] = entry; else jobs.push(entry);
-
-  // Remove any stale events for this video (handles re-detection cleanly).
-  transitData[sn].events = transitData[sn].events.filter(e => e.video_path !== ev.video_path);
-  transitData[sn].events.push(...ev.events);
-
-  const card = document.getElementById(cardId(sn));
-  if (card) {
-    const footer = card.querySelector('.transit-footer');
-    if (footer) footer.outerHTML = buildTransitFooter(sn);
-  }
-  updateTransitQueueControls();
-}
-
 // ── Progress bar ──────────────────────────────────────────────────────────────
 function updateProgressBar(pct) {
   const bar  = document.getElementById('scan-progress-bar');
@@ -443,18 +248,7 @@ function applyFilter() {
   const isCatalogFilter = activeFilter === 'messier' || activeFilter === 'caldwell'
                        || activeFilter === 'dso'     || activeFilter === 'unknown';
 
-  const visible = Object.values(sessions)
-    .filter(passesFilter)
-    .sort((a, b) => {
-      if (isCatalogFilter) {
-        const na = parseInt(a.object_name.replace(/\D/g, ''), 10);
-        const nb = parseInt(b.object_name.replace(/\D/g, ''), 10);
-        return na - nb;
-      }
-      const da = a.dates[a.dates.length - 1] || '';
-      const db = b.dates[b.dates.length - 1] || '';
-      return db.localeCompare(da);
-    });
+  const visible = Object.values(sessions).filter(passesFilter);
 
   const grid = document.getElementById('sessions-grid');
   if (!visible.length) {
@@ -467,7 +261,50 @@ function applyFilter() {
       </div>`;
     return;
   }
-  grid.innerHTML = visible.map(buildCard).join('');
+
+  if (activeFilter === 'all') {
+    // Group by catalog prefix (M, NGC, IC, C, …); non-catalog items sort last
+    const OTHER = '\uFFFF';
+    const groups = {};
+    visible.forEach(s => {
+      const m = s.object_name.match(/^([A-Za-z]+)\s*\d/);
+      const prefix = m ? m[1].toUpperCase() : OTHER;
+      (groups[prefix] = groups[prefix] || []).push(s);
+    });
+
+    // Within each group sort numerically by the trailing number
+    Object.values(groups).forEach(arr => {
+      arr.sort((a, b) => {
+        const na = parseInt(a.object_name.replace(/\D/g, ''), 10) || 0;
+        const nb = parseInt(b.object_name.replace(/\D/g, ''), 10) || 0;
+        return na - nb;
+      });
+    });
+
+    // Sort groups alphabetically; non-catalog group goes last
+    const sortedPrefixes = Object.keys(groups).sort((a, b) => a.localeCompare(b));
+
+    let html = '';
+    sortedPrefixes.forEach(prefix => {
+      const label = prefix === OTHER ? 'Other' : prefix;
+      html += `<div class="catalog-group-header">${label}</div>`;
+      html += groups[prefix].map(buildCard).join('');
+    });
+    grid.innerHTML = html;
+  } else {
+    visible.sort((a, b) => {
+      if (isCatalogFilter) {
+        const na = parseInt(a.object_name.replace(/\D/g, ''), 10);
+        const nb = parseInt(b.object_name.replace(/\D/g, ''), 10);
+        return na - nb;
+      }
+      const da = a.dates[a.dates.length - 1] || '';
+      const db = b.dates[b.dates.length - 1] || '';
+      return db.localeCompare(da);
+    });
+    grid.innerHTML = visible.map(buildCard).join('');
+  }
+
   visible.filter(s => s.object_type === 'comet').forEach(s => loadCometInfo(s.object_name));
 
   // Wire "View N images" buttons (data-attribute avoids inline JS quoting issues)
@@ -533,9 +370,10 @@ function buildCard(s) {
   // >1 also shows prev/next arrows). For everything else use the thumbnail API.
   const imgs    = (s.image_files && s.image_files.length >= 1) ? s.image_files : null;
   const hasArrows = imgs && imgs.length > 1;
+  const hasThumbnail = !imgs && s.thumbnail;
   const imgUrl0 = imgs
     ? `/api/image?path=${encodeURIComponent(imgs[0])}`
-    : (s.thumbnail ? `/api/thumbnail/${encodeURIComponent(s.object_name)}` : null);
+    : (hasThumbnail ? `/api/thumbnail/${encodeURIComponent(s.object_name)}` : null);
   const thumbHtml = imgUrl0
     ? (() => {
         const imgsAttr = imgs
@@ -547,11 +385,17 @@ function buildCard(s) {
         const clickAttr = imgs
           ? `onclick="openLightbox(JSON.parse(this.closest('.card-thumb-wrap').dataset.images),+this.closest('.card-thumb-wrap').dataset.idx)"`
           : '';
+        const pinned    = s.pinned_thumbnail ? ' thumb-pinned' : '';
+        const pickBtn   = hasThumbnail
+          ? `<button class="thumb-pick-btn" title="Choose thumbnail"
+               onclick="openThumbPicker('${s.object_name.replace(/'/g,"\\'")}',event)">⊞</button>`
+          : '';
         return `<div class="card-thumb-wrap"${imgsAttr}>
-          <img class="card-thumb${imgs ? ' thumb-clickable' : ''}" src="${imgUrl0}"
+          <img class="card-thumb${imgs ? ' thumb-clickable' : ''}${pinned}" src="${imgUrl0}"
                alt="${esc(s.object_name)} preview" ${clickAttr}
                onerror="this.closest('.card-thumb-wrap').style.display='none'">
           ${arrows}
+          ${pickBtn}
         </div>`;
       })()
     : '';
@@ -587,8 +431,6 @@ function buildCard(s) {
        </div>` : '';
 
   const isComet       = s.object_type === 'comet';
-  const isTransitType = s.object_type === 'solar' || s.object_type === 'lunar';
-  const transitFooter = isTransitType ? buildTransitFooter(s.object_name) : '';
 
   // Comets get their own footer; exclude from stack to avoid false _sub match
   const isSubSession  = !isComet && s.object_name.endsWith('_sub') && s.num_subs > 0;
@@ -618,7 +460,6 @@ function buildCard(s) {
         ${subRow}
         ${videoRow}
       </div>
-      ${transitFooter}
       ${stackFooter}
       ${cometFooter}
     </div>`;
@@ -811,138 +652,106 @@ function toggleDates(btn) {
   btn.textContent = open ? 'show less' : `+${btn.dataset.count} more`;
 }
 
-// ── YOLO filter ───────────────────────────────────────────────────────────────
+// ── Thumbnail picker ──────────────────────────────────────────────────────────
 
-function setYoloFilter(sessionName, active) {
-  yoloConfirmedOnly[sessionName] = active;
-  const card = document.getElementById(cardId(sessionName));
-  if (card) {
-    const footer = card.querySelector('.transit-footer');
-    if (footer) footer.outerHTML = buildTransitFooter(sessionName);
-  }
+function _ensureThumbPicker() {
+  if (document.getElementById('thumb-picker')) return;
+  const el = document.createElement('div');
+  el.id = 'thumb-picker';
+  el.innerHTML = `
+    <div id="tp-backdrop"></div>
+    <div id="tp-panel">
+      <div id="tp-header">
+        <span id="tp-title">Choose thumbnail</span>
+        <button id="tp-close" title="Close (Esc)">✕</button>
+      </div>
+      <div id="tp-grid"></div>
+    </div>`;
+  document.body.appendChild(el);
+  document.getElementById('tp-backdrop').addEventListener('click', _closeThumbPicker);
+  document.getElementById('tp-close').addEventListener('click', _closeThumbPicker);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && document.getElementById('thumb-picker').classList.contains('open'))
+      _closeThumbPicker();
+  });
 }
 
-// ── Transit footer ────────────────────────────────────────────────────────────
+function _closeThumbPicker() {
+  document.getElementById('thumb-picker')?.classList.remove('open');
+}
 
-function buildTransitFooter(sessionName) {
-  const td     = transitData[sessionName] || { video_jobs: [], events: [] };
-  const jobs   = td.video_jobs;
-  const events = td.events;
-  const sn_js  = sessionName.replace(/'/g, "\\'");
-  const idSuffix = sessionName.replace(/[^a-z0-9]/gi, '_');
+async function openThumbPicker(sessionName, event) {
+  event?.stopPropagation();
+  _ensureThumbPicker();
+  const picker = document.getElementById('thumb-picker');
+  const grid   = document.getElementById('tp-grid');
+  document.getElementById('tp-title').textContent = `Choose thumbnail — ${sessionName}`;
+  grid.innerHTML = '<div class="tp-loading">Loading…</div>';
+  picker.classList.add('open');
 
-  const hasActive = jobs.some(j => j.status === 'running' || j.status === 'pending');
-
-  // Compute position counters for the progress label "5/125 · …"
-  // With concurrent workers multiple jobs can be 'running' at once; each gets
-  // its own sequential position (doneCount+1, doneCount+2, …) rather than all
-  // sharing the same number.
-  const totalJobs = jobs.length;
-  const doneCount = jobs.filter(j => j.status === 'done' || j.status === 'cancelled' || j.status === 'error').length;
-
-  // --- job progress rows (skip done/cancelled/pending — only show active/errored) ---
-  let jobRows = '';
-  let runningIdx = 0;
-  for (const j of jobs) {
-    if (j.status === 'done' || j.status === 'cancelled' || j.status === 'pending') continue;
-    const pctBar = j.status === 'running'
-      ? `<div class="transit-progress-wrap"><div class="transit-progress-fill" style="width:${j.pct}%"></div></div>`
-      : '';
-    let posLabel = '';
-    if (j.status === 'running' && totalJobs > 1) {
-      runningIdx++;
-      posLabel = `${doneCount + runningIdx}/${totalJobs} · `;
-    }
-    const statusLabel = j.status === 'error'
-      ? `<span class="transit-status error">✗ ${esc(j.error_msg || 'error')}</span>`
-      : `<span class="transit-status running">${posLabel}${esc(j.message || j.status)} ${j.pct}%</span>`;
-    jobRows += `<div class="transit-job-row">${esc(j.basename)} — ${statusLabel}${pctBar}</div>`;
+  let images, pinned;
+  try {
+    const res = await fetch(`/api/session/${encodeURIComponent(sessionName)}/images`);
+    if (!res.ok) throw new Error(res.status);
+    ({ images, pinned } = await res.json());
+  } catch {
+    grid.innerHTML = '<div class="tp-loading">Failed to load images.</div>';
+    return;
   }
 
-  // --- YOLO confirmed-only toggle ---
-  const yoloActive    = yoloConfirmedOnly[sessionName] ?? true;
-  const displayEvents = yoloActive
-    ? events.filter(ev => ev.yolo_label != null)
-    : events;
-
-  const yoloToggle = `<label class="yolo-filter-label">
-       <input type="checkbox" ${yoloActive ? 'checked' : ''}
-              onchange="setYoloFilter('${sn_js}', this.checked)">
-       confirmed only
-     </label>`;
-
-  // --- detected event pills ---
-  let eventPills = '';
-  for (const ev of displayEvents) {
-    const pct  = Math.round(ev.confidence * 100);
-    const clip = ev.clip_path
-      ? ` onclick="window.open('/api/transit/clip/${ev.id}','_blank')" style="cursor:pointer"`
-      : '';
-
-    // YOLO confirmation badge
-    const yoloBadge = ev.yolo_label != null
-      ? `<span class="yolo-badge">✓ ${esc(ev.yolo_label)}</span>`
-      : '';
-
-    const pill = `<span class="transit-event-pill ${esc(ev.label)}"${clip}>`
-      + `${esc(ev.label)} ${pct}% · ${(ev.duration_s || 0).toFixed(1)}s`
-      + yoloBadge
-      + `</span>`;
-
-    // Hero-frame thumbnail
-    const thumbClick = ev.clip_path
-      ? `onclick="window.open('/api/transit/clip/${ev.id}','_blank')"` : '';
-    const thumb = ev.thumb_path
-      ? `<img class="transit-thumb" src="/api/transit/thumb/${ev.id}"
-             alt="${esc(ev.label)} transit" ${thumbClick}>` : '';
-
-    // Aircraft candidates — show up to 3, closest first
-    const ac = ev.aircraft_candidates;
-    let acHint = '';
-    if (Array.isArray(ac) && ac.length > 0) {
-      const parts = ac.slice(0, 3).map(a => {
-        const cs  = a.callsign || a.icao24 || '?';
-        const alt = a.alt_ft != null ? `${a.alt_ft.toLocaleString()}ft` : '';
-        return alt ? `${esc(cs)} ${alt}` : esc(cs);
-      });
-      acHint = `<div class="aircraft-hint">✈ ${parts.join('  ·  ')}</div>`;
-    }
-
-    eventPills += `<div class="transit-event-group">${thumb}${pill}${acHint}</div>`;
+  if (!images.length) {
+    grid.innerHTML = '<div class="tp-loading">No images found in this session.</div>';
+    return;
   }
 
-  const allDone = jobs.length > 0 && jobs.every(j => j.status === 'done' || j.status === 'cancelled' || j.status === 'error');
-  const noEvents = allDone && events.length === 0
-    ? '<span class="transit-no-events">No transits detected</span>' : '';
-
-  const btnLabel    = hasActive ? 'Detecting…' : 'Detect Transits';
-  const btnDisabled = hasActive ? 'disabled' : '';
-  const cancelBtn   = hasActive
-    ? `<button class="btn-transit-cancel" onclick="cancelSessionTransit('${sn_js}')">✕ Cancel</button>`
-    : '';
-  // Show Re-detect when all jobs are finished (forces re-run with current params)
-  const redetectBtn = (!hasActive && allDone)
-    ? `<button class="btn-transit-redetect" onclick="queueTransitDetection('${sn_js}', true)"
-              title="Re-run detection with current parameters (force)">↻ Re-detect</button>`
-    : '';
-
-  return `<div class="transit-footer">
-    <div class="transit-header-row">
-      <span class="transit-label">Transit detection</span>
-      ${yoloToggle}
-      <div class="transit-btn-group">
-        ${cancelBtn}
-        ${redetectBtn}
-        <button id="transit-btn-${idSuffix}" class="btn-transit" ${btnDisabled}
-          onclick="queueTransitDetection('${sn_js}')">
-          ${btnLabel}
+  const sn_js = sessionName.replace(/'/g, "\\'");
+  grid.innerHTML = images.map(path => {
+    const url      = `/api/image?path=${encodeURIComponent(path)}`;
+    const fname    = path.split('/').pop();
+    const isActive = path === pinned;
+    return `<div class="tp-item${isActive ? ' tp-active' : ''}" title="${esc(fname)}">
+      <img src="${url}" alt="${esc(fname)}" loading="lazy"
+           onerror="this.style.opacity='0.2'">
+      <div class="tp-item-overlay">
+        <button class="tp-pin-btn" onclick="_pinThumbnail('${sn_js}','${path.replace(/'/g,"\\'")}')">
+          ${isActive ? '✓ Pinned' : 'Pin'}
         </button>
       </div>
-    </div>
-    ${jobRows}
-    ${eventPills ? `<div class="transit-events">${eventPills}</div>` : ''}
-    ${noEvents}
-  </div>`;
+      ${isActive ? '<div class="tp-check">✓</div>' : ''}
+    </div>`;
+  }).join('');
+
+  // Clear-pin button at the bottom if one is set
+  const clearRow = pinned
+    ? `<div id="tp-clear-row">
+         <button id="tp-clear-btn" onclick="_pinThumbnail('${sn_js}', null)">
+           Clear pin (revert to auto)
+         </button>
+       </div>`
+    : '';
+  grid.insertAdjacentHTML('beforeend', clearRow);
+}
+
+async function _pinThumbnail(sessionName, path) {
+  try {
+    await fetch(`/api/session/${encodeURIComponent(sessionName)}/pin-thumbnail`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ path }),
+    });
+  } catch { return; }
+
+  // Update local state and refresh the card image immediately
+  if (sessions[sessionName]) sessions[sessionName].pinned_thumbnail = path;
+  const card = document.getElementById(cardId(sessionName));
+  if (card) {
+    const img = card.querySelector('.card-thumb');
+    if (img) {
+      img.src = `/api/thumbnail/${encodeURIComponent(sessionName)}?_=${Date.now()}`;
+      img.classList.toggle('thumb-pinned', !!path);
+    }
+  }
+  _closeThumbPicker();
 }
 
 // ── Grid helpers ──────────────────────────────────────────────────────────────

@@ -18,7 +18,6 @@
         <a class="nav-link" href="/">Sessions</a>
         <a class="nav-link {% if catalog_type == 'messier' %}active{% endif %}" href="/catalog/messier">Messier</a>
         <a class="nav-link {% if catalog_type == 'caldwell' %}active{% endif %}" href="/catalog/caldwell">Caldwell</a>
-        <a class="nav-link" href="/transits">Transits</a>
         <a class="nav-link" href="/activity">Activity</a>
         <a class="nav-link" href="/comet">Comet</a>
         <a class="nav-link" href="/solar">Solar</a>
@@ -36,7 +35,10 @@
 
     <!-- Catalog header + progress bar -->
     <div class="catalog-header">
-      <h1 class="catalog-title">{{ catalog_title }}</h1>
+      <div class="catalog-title-row">
+        <h1 class="catalog-title">{{ catalog_title }}</h1>
+        <a class="poster-link" href="/catalog/{{ catalog_type }}/poster" title="Print as poster (13×19&quot;)">🖨 Poster</a>
+      </div>
       <div class="catalog-progress" id="catalog-progress" style="display:none;">
         <div class="progress-bar-wrap">
           <div class="progress-bar-fill" id="progress-fill"></div>
