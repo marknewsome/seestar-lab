@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>{{ catalog_title }} Slideshow — Seestar Lab</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: #050810;
+      color: #d0daf0;
+      font-family: system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    /* ── Controls bar ── */
+    #controls {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+      height: 48px;
+      background: rgba(8, 12, 24, 0.92);
+      backdrop-filter: blur(6px);
+      border-bottom: 1px solid #1a2440;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0 1rem;
+      transition: opacity 0.4s ease;
+    }
+    #controls.hidden { opacity: 0; pointer-events: none; }
+
+    #controls a, #controls button, #controls select {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.3rem 0.7rem;
+      border-radius: 5px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      border: 1px solid #253060;
+      background: #131a30;
+      color: #8aaad8;
+      font-family: inherit;
+      text-decoration: none;
+    }
+    #controls a:hover, #controls button:hover { color: #c8d8f0; border-color: #3a50a0; }
+
+    .ctrl-title {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #7090c8;
+      letter-spacing: 0.04em;
+      flex: 1;
+      text-align: center;
+    }
+    #ctrl-progress {
+      font-size: 0.8rem;
+      color: #3a5080;
+      min-width: 4rem;
+      text-align: right;
+    }
+    #btn-auto.active {
+      background: #1a3a80;
+      border-color: #2a5ac8;
+      color: #b0ccff;
+    }
+    #btn-fs { font-size: 1rem; padding: 0.25rem 0.6rem; }
+    #speed-sel { padding: 0.25rem 0.5rem; }
+
+    /* ── Slide area ── */
+    #slide-wrap {
+      position: fixed;
+      inset: 48px 0 0 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+      padding: 1.5rem 2rem 3.5rem;
+      transition: opacity 0.35s ease;
+    }
+    #slide-wrap.fading { opacity: 0; }
+
+    /* ── Thumbnail ── */
+    #slide-img-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+    }
+    #slide-img {
+      max-height: 100%;
+      max-width: 100%;
+      object-fit: contain;
+      border-radius: 6px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.7);
+    }
+    #slide-placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 6rem;
+      color: #1a2840;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* ── Object info ── */
+    #slide-info {
+      flex: 0 0 auto;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    #slide-label {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: #c8dcff;
+      line-height: 1;
+    }
+    #slide-name {
+      font-size: 1.4rem;
+      font-weight: 400;
+      color: #6888c0;
+      line-height: 1.1;
+    }
+    #slide-meta {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .slide-type-pill {
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 0.2rem 0.6rem;
+      border-radius: 10px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: #1a2a50;
+      color: #5880c0;
+      border: 1px solid #253070;
+    }
+    .slide-const {
+      font-size: 0.8rem;
+      color: #3a5080;
+      font-style: italic;
+    }
+    #slide-dates {
+      font-size: 0.75rem;
+      color: #2a4070;
+    }
+    #slide-subs {
+      font-size: 0.72rem;
+      color: #223050;
+    }
+
+    /* ── Prev / Next buttons ── */
+    #btn-prev, #btn-next {
+      position: fixed;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(10, 14, 28, 0.6);
+      border: 1px solid #1a2848;
+      color: #3a5888;
+      font-size: 1.5rem;
+      width: 3rem;
+      height: 5rem;
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.15s, background 0.15s, opacity 0.4s;
+      z-index: 50;
+    }
+    #btn-prev { left: 0.5rem; }
+    #btn-next { right: 0.5rem; }
+    #btn-prev:hover, #btn-next:hover {
+      color: #c8dcff;
+      background: rgba(20, 30, 60, 0.8);
+    }
+    #btn-prev.hidden, #btn-next.hidden { opacity: 0; pointer-events: none; }
+
+    /* ── Auto-advance progress line ── */
+    #auto-bar {
+      position: fixed;
+      bottom: 0; left: 0;
+      height: 3px;
+      background: #2a50c8;
+      width: 0%;
+      transition: width linear;
+      z-index: 200;
+    }
+
+    /* ── Keyboard hint ── */
+    #kbd-hint {
+      position: fixed;
+      bottom: 0.6rem;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.65rem;
+      color: #1a2840;
+      white-space: nowrap;
+      transition: opacity 0.4s;
+      pointer-events: none;
+    }
+
+    /* ── Loading / empty ── */
+    #loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+      color: #2a4060;
+    }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <a href="/catalog/{{ catalog_type }}">← Back</a>
+  <span class="ctrl-title">{{ catalog_title }}</span>
+  <span id="ctrl-progress"></span>
+  <button id="btn-auto" onclick="toggleAuto()" title="Auto-advance (A)">▶ Auto</button>
+  <select id="speed-sel" title="Slide interval">
+    <option value="3">3 s</option>
+    <option value="5" selected>5 s</option>
+    <option value="10">10 s</option>
+    <option value="20">20 s</option>
+  </select>
+  <button id="btn-fs" onclick="toggleFullscreen()" title="Fullscreen (F)">⛶</button>
+</div>
+
+<div id="loading">Loading catalog…</div>
+
+<div id="slide-wrap" style="display:none;">
+  <div id="slide-img-wrap">
+    <img id="slide-img" alt="" style="display:none;"
+         onerror="this.style.display='none'; document.getElementById('slide-placeholder').style.display='flex';" />
+    <div id="slide-placeholder" style="display:none;">★</div>
+  </div>
+  <div id="slide-info">
+    <div id="slide-label"></div>
+    <div id="slide-name"></div>
+    <div id="slide-meta">
+      <span class="slide-type-pill" id="slide-type"></span>
+      <span class="slide-const" id="slide-const"></span>
+    </div>
+    <div id="slide-dates"></div>
+    <div id="slide-subs"></div>
+  </div>
+</div>
+
+<button id="btn-prev" onclick="prev()" title="Previous (←)">◀</button>
+<button id="btn-next" onclick="next()" title="Next (→ / Space)">▶</button>
+<div id="auto-bar"></div>
+<div id="kbd-hint">← → navigate &nbsp;·&nbsp; Space advance &nbsp;·&nbsp; A auto &nbsp;·&nbsp; F fullscreen</div>
+
+<script>
+'use strict';
+const CATALOG_TYPE = {{ catalog_type | tojson }};
+
+let items       = [];
+let currentIdx  = 0;
+let autoOn      = false;
+let autoTimer   = null;
+let barAnim     = null;
+let transitioning = false;
+let hideTimer   = null;
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+async function loadSlideshow() {
+  try {
+    const res = await fetch(`/api/catalog/${CATALOG_TYPE}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const all = await res.json();
+    items = all
+      .filter(i => i.captured)
+      .sort((a, b) => a.number - b.number);
+
+    document.getElementById('loading').style.display = 'none';
+
+    if (!items.length) {
+      document.getElementById('loading').style.display = 'flex';
+      document.getElementById('loading').textContent = 'No captured objects yet — go observe!';
+      return;
+    }
+
+    document.getElementById('slide-wrap').style.display = 'flex';
+    document.getElementById('btn-prev').style.display = '';
+    document.getElementById('btn-next').style.display = '';
+    renderSlide();
+  } catch (err) {
+    document.getElementById('loading').textContent = 'Failed to load: ' + err.message;
+  }
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderSlide() {
+  const item = items[currentIdx];
+  const hasThumbnail = item.session?.pinned_thumbnail || item.session?.thumbnail;
+
+  const img = document.getElementById('slide-img');
+  const ph  = document.getElementById('slide-placeholder');
+
+  if (hasThumbnail) {
+    img.src = `/api/thumbnail/${encodeURIComponent(item.session.object_name)}`;
+    img.style.display = '';
+    ph.style.display  = 'none';
+  } else {
+    img.style.display = 'none';
+    ph.style.display  = 'flex';
+  }
+
+  document.getElementById('slide-label').textContent = item.label;
+  document.getElementById('slide-name').textContent  = item.popular_name ?? '';
+  document.getElementById('slide-type').textContent  = item.dso_type_label;
+  document.getElementById('slide-const').textContent = item.constellation;
+
+  const dates = item.session?.dates ?? [];
+  document.getElementById('slide-dates').textContent =
+    dates.length ? dates.join('  ·  ') : '';
+
+  const subs  = item.session?.num_subs;
+  const size  = item.session?.total_size_human;
+  document.getElementById('slide-subs').textContent =
+    subs ? `${subs.toLocaleString()} subs · ${size}` : '';
+
+  document.getElementById('ctrl-progress').textContent =
+    `${currentIdx + 1} / ${items.length}`;
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+async function goTo(idx) {
+  if (transitioning || !items.length) return;
+  transitioning = true;
+
+  const wrap = document.getElementById('slide-wrap');
+  wrap.classList.add('fading');
+  await delay(320);
+  currentIdx = ((idx % items.length) + items.length) % items.length;
+  renderSlide();
+  wrap.classList.remove('fading');
+
+  transitioning = false;
+}
+
+function next() { stopAutoBar(); goTo(currentIdx + 1).then(() => autoOn && startAutoBar()); }
+function prev() { stopAutoBar(); goTo(currentIdx - 1).then(() => autoOn && startAutoBar()); }
+
+// ── Auto-advance ──────────────────────────────────────────────────────────────
+function toggleAuto() {
+  autoOn = !autoOn;
+  document.getElementById('btn-auto').classList.toggle('active', autoOn);
+  document.getElementById('btn-auto').textContent = autoOn ? '⏸ Auto' : '▶ Auto';
+  if (autoOn) startAutoBar(); else stopAutoBar();
+}
+
+function getSpeed() {
+  return parseInt(document.getElementById('speed-sel').value, 10) * 1000;
+}
+
+function startAutoBar() {
+  stopAutoBar();
+  const ms   = getSpeed();
+  const bar  = document.getElementById('auto-bar');
+  bar.style.transition = 'none';
+  bar.style.width = '0%';
+  // force reflow so transition restart works
+  bar.offsetWidth;
+  bar.style.transition = `width ${ms}ms linear`;
+  bar.style.width = '100%';
+  autoTimer = setTimeout(() => {
+    goTo(currentIdx + 1).then(() => { if (autoOn) startAutoBar(); });
+  }, ms);
+}
+
+function stopAutoBar() {
+  clearTimeout(autoTimer);
+  autoTimer = null;
+  const bar = document.getElementById('auto-bar');
+  bar.style.transition = 'none';
+  bar.style.width = '0%';
+}
+
+// ── Fullscreen ────────────────────────────────────────────────────────────────
+function toggleFullscreen() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(() => {});
+  } else {
+    document.exitFullscreen().catch(() => {});
+  }
+}
+
+// ── Controls auto-hide in fullscreen ─────────────────────────────────────────
+document.addEventListener('fullscreenchange', () => {
+  if (document.fullscreenElement) {
+    scheduleHide();
+  } else {
+    showControls();
+    clearTimeout(hideTimer);
+  }
+});
+
+document.addEventListener('mousemove', () => {
+  if (document.fullscreenElement) { showControls(); scheduleHide(); }
+});
+
+function showControls() {
+  document.getElementById('controls').classList.remove('hidden');
+  document.getElementById('btn-prev').classList.remove('hidden');
+  document.getElementById('btn-next').classList.remove('hidden');
+  document.getElementById('kbd-hint').style.opacity = '1';
+}
+
+function scheduleHide() {
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(() => {
+    document.getElementById('controls').classList.add('hidden');
+    document.getElementById('btn-prev').classList.add('hidden');
+    document.getElementById('btn-next').classList.add('hidden');
+    document.getElementById('kbd-hint').style.opacity = '0';
+  }, 3000);
+}
+
+// ── Keyboard ──────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  switch (e.key) {
+    case 'ArrowRight':
+    case ' ':
+      e.preventDefault();
+      next();
+      break;
+    case 'ArrowLeft':
+      e.preventDefault();
+      prev();
+      break;
+    case 'a':
+    case 'A':
+      toggleAuto();
+      break;
+    case 'f':
+    case 'F':
+      toggleFullscreen();
+      break;
+    case 'Escape':
+      if (autoOn) toggleAuto();
+      break;
+  }
+});
+
+// ── Utility ───────────────────────────────────────────────────────────────────
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+loadSlideshow();
+</script>
+</body>
+</html>

@@ -410,6 +410,19 @@ def catalog_poster(catalog_type: str):
     )
 
 
+@app.route("/catalog/<catalog_type>/slideshow")
+def catalog_slideshow(catalog_type: str):
+    if catalog_type not in ("messier", "caldwell"):
+        return "Not found", 404
+    titles = {"messier": "Messier Catalog", "caldwell": "Caldwell Catalog"}
+    return render_template(
+        "slideshow.html",
+        catalog_type=catalog_type,
+        catalog_title=titles[catalog_type],
+        data_dir=DATA_DIR,
+    )
+
+
 def _enrich_comet_session(s: dict) -> None:
     """Attach animation paths and image files to a comet session dict in-place."""
     animations: dict = {}
