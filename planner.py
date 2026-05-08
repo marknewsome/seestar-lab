@@ -353,6 +353,7 @@ def tonight_plan(
 
     # Build set of already-imaged objects from session DB
     have: dict[str, list] = {}
+    user_ratings: dict[str, str | None] = {}
     if sessions:
         for s in sessions:
             name  = (s.get("object_name") or "").strip()
@@ -369,9 +370,11 @@ def tonight_plan(
                 if _re.match(pat, name):
                     key = _re.sub(pat, repl, name, flags=_re.I)
                     have[key] = dates
+                    user_ratings[key] = s.get("user_rating")
                     break
             else:
                 have[name] = dates
+                user_ratings[name] = s.get("user_rating")
 
     # Collect all object ids and coordinates
     obj_ids = list(COORDS.keys())
@@ -425,6 +428,7 @@ def tonight_plan(
 
         have_data = obj_id in have or label in have
         session_dates = (have.get(obj_id) or have.get(label) or [])[:5]
+        user_rating = user_ratings.get(obj_id) or user_ratings.get(label)
         rating    = _rate(peak_alt, moon_sep, moon["illum_pct"], size, have_data)
 
         objects.append({
@@ -447,6 +451,7 @@ def tonight_plan(
             "rating":        rating,
             "have_data":     have_data,
             "session_dates": session_dates,
+            "user_rating":   user_rating,
         })
 
     objects.sort(key=lambda o: o["rating"], reverse=True)

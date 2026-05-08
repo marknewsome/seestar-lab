@@ -563,7 +563,7 @@ def api_thumbnail(object_name: str):
         resp = send_file(buf, mimetype="image/jpeg")
     except Exception:
         resp = send_file(thumb_path)
-    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Cache-Control"] = "public, max-age=300"
     return resp
 
 
@@ -612,6 +612,41 @@ def api_pin_thumbnail(object_name: str):
     return jsonify({"ok": True, "pinned": path})
 
 
+@app.route("/api/session/<path:object_name>/rate", methods=["POST"])
+def api_rate_session(object_name: str):
+    """Set or clear the user satisfaction rating for a session."""
+    sessions_list = db.get_all_sessions()
+    session = next((s for s in sessions_list if s["object_name"] == object_name), None)
+    if not session:
+        abort(404)
+    body = request.get_json(silent=True) or {}
+    rating = body.get("rating")  # satisfied|want_more|priority|null
+    if not db.set_session_rating(object_name, rating or None):
+        return jsonify({"error": "invalid rating"}), 400
+    sessions_list = db.get_all_sessions()
+    updated = next((s for s in sessions_list if s["object_name"] == object_name), None)
+    if updated:
+        _broadcast({"type": "session", "data": updated})
+    return jsonify({"ok": True, "rating": rating or None})
+
+
+@app.route("/api/session/<path:object_name>/notes", methods=["POST"])
+def api_session_notes(object_name: str):
+    """Set or clear free-text observing notes for a session."""
+    sessions_list = db.get_all_sessions()
+    session = next((s for s in sessions_list if s["object_name"] == object_name), None)
+    if not session:
+        abort(404)
+    body = request.get_json(silent=True) or {}
+    notes = (body.get("notes") or "").strip() or None
+    db.set_session_notes(object_name, notes)
+    sessions_list = db.get_all_sessions()
+    updated = next((s for s in sessions_list if s["object_name"] == object_name), None)
+    if updated:
+        _broadcast({"type": "session", "data": updated})
+    return jsonify({"ok": True, "notes": notes})
+
+
 @app.route("/api/image")
 def api_image():
     """Serve an arbitrary image file by absolute path (local tool only)."""
@@ -630,9 +665,11 @@ def api_image():
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=88)
         buf.seek(0)
-        return send_file(buf, mimetype="image/jpeg")
+        resp = send_file(buf, mimetype="image/jpeg")
     except Exception:
-        return send_file(path)
+        resp = send_file(path)
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
 
 
 @app.route("/api/stack/start", methods=["POST"])

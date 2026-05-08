@@ -205,6 +205,8 @@ function _renderTable() {
     objs = objs.filter(o => o.id.startsWith('C'));
   } else if (_plFilter === 'new') {
     objs = objs.filter(o => !o.have_data);
+  } else if (_plFilter === 'reimage') {
+    objs = objs.filter(o => o.user_rating === 'want_more' || o.user_rating === 'priority');
   }
 
   // Min alt
@@ -238,8 +240,9 @@ function _renderTable() {
     const fovBadge = _fovBadge(o.fov_note);
     const ratingEl = _ratingStars(o.rating);
     const transit  = o.transit_utc ? _utcToLocal(o.transit_utc) : '—';
+    const urBadge  = _userRatingBadge(o.user_rating);
     const imageEl  = o.have_data
-      ? `<span class="pl-have-yes" title="${o.session_dates.join(', ')}">✓ ${o.session_dates.length}</span>`
+      ? `<span class="pl-have-yes" title="${o.session_dates.join(', ')}">✓ ${o.session_dates.length}</span>${urBadge}`
       : `<span class="pl-have-no">new</span>`;
 
     tr.innerHTML = `
@@ -267,6 +270,12 @@ function _fovBadge(note) {
   const cls = {mosaic: 'pl-fov-mosaic', large: 'pl-fov-large', good: 'pl-fov-good',
                 small: 'pl-fov-small',   tiny:  'pl-fov-tiny'}[note] || '';
   return ` <span class="pl-fov-badge ${cls}">${note}</span>`;
+}
+
+function _userRatingBadge(ur) {
+  if (!ur) return '';
+  const labels = { satisfied: 'satisfied', want_more: 'want more', priority: 'priority' };
+  return ` <span class="ur-badge ur-badge-${ur}">${labels[ur] ?? ur}</span>`;
 }
 
 function _fmtSize(arcmin) {

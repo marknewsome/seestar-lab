@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     paths                 TEXT DEFAULT '[]',   -- JSON array of directory paths
     thumbnail             TEXT DEFAULT NULL,   -- absolute path to best preview image
     pinned_thumbnail      TEXT DEFAULT NULL,   -- user-selected override; survives rescans
+    user_rating           TEXT DEFAULT NULL,   -- satisfied|want_more|priority; survives rescans
+    notes                 TEXT DEFAULT NULL,   -- free-text observing notes; survives rescans
     updated_at            TEXT
 );
 
@@ -116,6 +118,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN total_video_duration INTEGER DEFAULT 0")
         if "pinned_thumbnail" not in cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN pinned_thumbnail TEXT DEFAULT NULL")
+        if "user_rating" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN user_rating TEXT DEFAULT NULL")
+        if "notes" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN notes TEXT DEFAULT NULL")
         # meteor_impacts table (added for dark-side flash detection)
         conn.executescript(
             "CREATE TABLE IF NOT EXISTS meteor_impacts ("
@@ -177,6 +183,7 @@ def upsert_session(session: dict) -> None:
                 paths                 = excluded.paths,
                 thumbnail             = excluded.thumbnail,
                 updated_at            = excluded.updated_at
+                -- pinned_thumbnail and user_rating are intentionally excluded (user-set, survive rescans)
             """,
             (
                 session["object_name"],
@@ -205,6 +212,29 @@ def set_pinned_thumbnail(object_name: str, path: Optional[str]) -> None:
         conn.execute(
             "UPDATE sessions SET pinned_thumbnail=? WHERE object_name=?",
             (path, object_name),
+        )
+
+
+_VALID_RATINGS = {"satisfied", "want_more", "priority", None}
+
+def set_session_rating(object_name: str, rating: Optional[str]) -> bool:
+    """Set user_rating for a session. Returns False if rating value is invalid."""
+    if rating not in _VALID_RATINGS:
+        return False
+    with _db() as conn:
+        conn.execute(
+            "UPDATE sessions SET user_rating=? WHERE object_name=?",
+            (rating, object_name),
+        )
+    return True
+
+
+def set_session_notes(object_name: str, notes: Optional[str]) -> None:
+    """Set or clear free-text observing notes for a session."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE sessions SET notes=? WHERE object_name=?",
+            (notes or None, object_name),
         )
 
 

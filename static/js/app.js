@@ -130,7 +130,20 @@ function upsertSession(session) {
   } else {
     // Update existing card in place (diff-scan found changes)
     const el = document.getElementById(cardId(name));
-    if (el) el.outerHTML = buildCard(session);
+    if (el) {
+      // Don't rebuild if the user is typing in the notes textarea —
+      // just patch the rating dot and notes value quietly instead.
+      const textarea = el.querySelector('.session-notes');
+      if (textarea && document.activeElement === textarea) {
+        const dot = el.querySelector('.rating-dot');
+        if (dot) {
+          dot.dataset.rating = session.user_rating ?? 'none';
+          dot.title = session.user_rating ? RATING_TIPS[session.user_rating] : 'Not rated — click to rate';
+        }
+      } else {
+        el.outerHTML = buildCard(session);
+      }
+    }
   }
   updateSummary();
 }
@@ -361,6 +374,42 @@ function cardId(name) {
   return 'card-' + name.replace(/[^a-z0-9]/gi, '_');
 }
 
+const RATING_CYCLE = [null, 'satisfied', 'want_more', 'priority'];
+const RATING_TIPS  = { satisfied: 'Satisfied', want_more: 'Want more time', priority: 'Priority re-image' };
+
+async function saveSessionNotes(sessionName, text) {
+  if (sessions[sessionName]) sessions[sessionName].notes = text || null;
+  try {
+    await fetch(`/api/session/${encodeURIComponent(sessionName)}/notes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes: text }),
+    });
+  } catch { /* ignore */ }
+}
+
+async function cycleSessionRating(sessionName) {
+  const s = sessions[sessionName];
+  if (!s) return;
+  const cur = s.user_rating ?? null;
+  const idx = RATING_CYCLE.indexOf(cur);
+  const next = RATING_CYCLE[(idx + 1) % RATING_CYCLE.length];
+  s.user_rating = next;
+  // Update dot immediately (optimistic)
+  const dot = document.querySelector(`.rating-dot[data-session="${CSS.escape(sessionName)}"]`);
+  if (dot) {
+    dot.dataset.rating = next ?? 'none';
+    dot.title = next ? RATING_TIPS[next] : 'Not rated — click to rate';
+  }
+  try {
+    await fetch(`/api/session/${encodeURIComponent(sessionName)}/rate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rating: next }),
+    });
+  } catch { /* ignore */ }
+}
+
 function buildCard(s) {
   const badge = `<span class="type-badge ${esc(s.object_type)}">${esc(s.type_label)}</span>`;
   const desc  = s.description
@@ -444,12 +493,28 @@ function buildCard(s) {
     ? `<div class="comet-fullname-row" id="comet-info-${cardId(s.object_name).slice(5)}"></div>`
     : '';
 
+  const ratingVal = s.user_rating ?? null;
+  const ratingTip = ratingVal ? RATING_TIPS[ratingVal] : 'Not rated — click to rate';
+  const ratingDot = `<span class="rating-dot"
+      data-rating="${ratingVal ?? 'none'}"
+      data-session="${esc(s.object_name)}"
+      title="${esc(ratingTip)}"
+      onclick="cycleSessionRating('${s.object_name.replace(/'/g, "\\'")}')"></span>`;
+
+  const safeObjName = s.object_name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  const notesHtml = `<textarea class="session-notes" rows="2"
+      placeholder="Observing notes (conditions, issues, goals…)"
+      onblur="saveSessionNotes('${safeObjName}', this.value)"
+      onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();this.blur();}"
+      >${esc(s.notes ?? '')}</textarea>`;
+
   return `
     <div class="session-card" id="${cardId(s.object_name)}">
       ${thumbHtml}
       <div class="card-header">
         <div class="object-name">${esc(s.object_name)}</div>
         ${badge}
+        ${ratingDot}
       </div>
       ${cometInfoRow}
       ${desc}
@@ -462,6 +527,7 @@ function buildCard(s) {
         ${subRow}
         ${videoRow}
       </div>
+      ${notesHtml}
       ${stackFooter}
       ${cometFooter}
     </div>`;
