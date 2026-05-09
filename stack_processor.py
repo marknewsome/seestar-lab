@@ -351,8 +351,8 @@ def _weighted_sigma_clip(
 ) -> np.ndarray:
     """
     Weighted sigma-clipped mean, chunked over rows to bound peak RAM.
-    stack: float32 (N, H, W, 3);  weights: float32 (N,).
-    Returns float32 (H, W, 3).
+    stack: float16 or float32 (N, H, W, 3);  weights: float32 (N,).
+    Each chunk is upcast to float32 before arithmetic. Returns float32 (H, W, 3).
     """
     N, H, W, C = stack.shape
     w  = (weights / weights.sum()).astype(np.float32)
@@ -361,7 +361,7 @@ def _weighted_sigma_clip(
 
     for r0 in range(0, H, chunk_rows):
         r1    = min(r0 + chunk_rows, H)
-        chunk = stack[:, r0:r1, :, :]
+        chunk = stack[:, r0:r1, :, :].astype(np.float32)  # upcast float16 → float32
 
         mu = (chunk * wc).sum(axis=0)
 
@@ -818,9 +818,11 @@ class StackProcessor:
             ref_lum    = _lum_for_registration(ref_lum_raw)
             h, w = ref_bgr.shape[:2]
 
-            # Pre-allocate stack array (avoids list + np.stack double-RAM peak)
-            stack_arr = np.zeros((n_selected, h, w, 3), dtype=np.float32)
-            stack_arr[0] = ref_bgr
+            # Pre-allocate stack array in float16 to halve peak RAM.
+            # float16 gives ~3 significant decimal digits on [0,1] data — more
+            # than enough for stacking; sigma-clip operates in float32 per chunk.
+            stack_arr = np.zeros((n_selected, h, w, 3), dtype=np.float16)
+            stack_arr[0] = ref_bgr  # float32 → float16 truncation is automatic
             n_accepted   = 1
 
             masks:    list[np.ndarray] = [np.ones((h, w), dtype=bool)]
