@@ -39,9 +39,11 @@ import os
 import shutil
 import tempfile
 import warnings
+import time
 import numpy as np
 import cv2
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 
@@ -167,6 +169,22 @@ def _to_gray8(bgr_f32: np.ndarray) -> np.ndarray:
     return clahe.apply(gray8)
 
 
+def _lum_for_registration(lum: np.ndarray) -> np.ndarray:
+    """
+    Background-subtract luminance before passing to astroalign.
+    Removes extended nebula/galaxy glow that overwhelms star detection.
+    The original frame data is never modified — this copy is only for
+    deriving the alignment transform.
+    """
+    try:
+        import sep
+        lum64 = np.ascontiguousarray(lum.astype(np.float64))
+        bkg   = sep.Background(lum64, bw=64, bh=64, fw=3, fh=3)
+        return np.clip(lum64 - bkg.back(), 0.0, None).astype(np.float32)
+    except Exception:
+        return lum
+
+
 def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray,
               ref_lum: np.ndarray | None = None,
               frame_lum: np.ndarray | None = None) -> np.ndarray | None:
@@ -193,7 +211,7 @@ def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray,
         src_frame = frame_lum if frame_lum is not None else frame_gray8.astype(np.float32) / 255.0
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            _, tf = aa.find_transform(src_frame, src_ref)
+            _, tf = aa.find_transform(src_frame, src_ref, detection_sigma=3)
         p = tf.params
         warp_aa = np.array([[p[0,0], p[0,1], p[0,2]],
                              [p[1,0], p[1,1], p[1,2]]], dtype=np.float32)
@@ -572,6 +590,49 @@ def _write_fits(path: str, data: np.ndarray, object_name: str = '') -> bool:
         return False
 
 
+# ── Log writer ────────────────────────────────────────────────────────────────
+
+def _write_stack_log(log_path: str, stats: dict, output_path: str) -> None:
+    """Write a human-readable pipeline run log alongside the FITS output."""
+    elapsed = stats.get('elapsed_s', 0.0)
+    mins, secs = divmod(int(elapsed), 60)
+    elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+    total          = stats.get('total', 0)
+    stage_a        = stats.get('stage_a_pass', 0)
+    stage_b        = stats.get('stage_b_pass', 0)
+    selected       = stats.get('selected', 0)
+    aligned        = stats.get('aligned', 0)
+    rejected_align = stats.get('rejected_align', 0)
+    align_rate     = f"{100*aligned/selected:.1f}%" if selected else "n/a"
+
+    lines = [
+        f"Seestar Lab — stacking run log",
+        f"  Started : {stats.get('started_utc', 'unknown')}",
+        f"  Elapsed : {elapsed_str}",
+        f"  Output  : {output_path}",
+        f"",
+        f"Frame counts",
+        f"  Input total         : {total}",
+        f"  Stage A pass (sharpness)   : {stage_a}  ({100*stage_a/total:.1f}%)"
+            if total else f"  Stage A pass (sharpness)   : {stage_a}",
+        f"  Stage B pass (SEP metrics) : {stage_b}  ({100*stage_b/total:.1f}%)"
+            if total else f"  Stage B pass (SEP metrics) : {stage_b}",
+        f"  Selected after cap  : {selected}  (max_frames={stats.get('max_frames', '?')})",
+        f"  Alignment accepted  : {aligned}  ({align_rate} of selected)",
+        f"  Alignment rejected  : {rejected_align}",
+        f"",
+        f"Registration",
+        f"  Reference frame  : {stats.get('ref_frame', 'unknown')}",
+        f"  Bayer pattern    : {stats.get('bayer_pattern', 'unknown')}",
+    ]
+    try:
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+    except Exception:
+        pass
+
+
 # ── Main processor ────────────────────────────────────────────────────────────
 
 class StackProcessor:
@@ -604,7 +665,23 @@ class StackProcessor:
             if cancel_cb and cancel_cb():
                 raise StackCancelled("Stacking cancelled")
 
+        t_start = time.monotonic()
+        run_stats: dict = {
+            'started_utc':    datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'total':          0,
+            'stage_a_pass':   0,
+            'stage_b_pass':   0,
+            'selected':       0,
+            'aligned':        0,
+            'rejected_align': 0,
+            'ref_frame':      '',
+            'bayer_pattern':  '',
+            'max_frames':     max_frames,
+            'elapsed_s':      0.0,
+        }
+
         total = len(fits_files)
+        run_stats['total'] = total
         if total < MIN_FRAMES:
             raise RuntimeError(
                 f"Need at least {MIN_FRAMES} FITS files to stack, found {total}"
@@ -665,6 +742,8 @@ class StackProcessor:
                 raise RuntimeError(
                     f"Only {n_stage_a} frames passed Stage A quality filter (need {MIN_FRAMES})"
                 )
+            run_stats['stage_a_pass']  = n_stage_a
+            run_stats['bayer_pattern'] = bayer_pattern
             progress_cb(22, f"Stage A: {n_stage_a}/{total} frames pass "
                             f"(rejected {total - n_stage_a} below sharpness threshold)",
                         n_stage_a, total)
@@ -709,9 +788,14 @@ class StackProcessor:
                     f"Only {n_selected} frames passed Stage B quality selection (need {MIN_FRAMES})"
                 )
 
+            run_stats['stage_b_pass'] = len(stage_a_idx)
+            run_stats['selected']     = n_selected
+
             # Reference frame: highest Stage B quality score (best FWHM + stars + SNR)
             ref_rank_idx = max(range(n_selected),
                                key=lambda k: _quality_score(sel_metrics[k]))
+            ref_frame_name = os.path.basename(selected_files[ref_rank_idx])
+            run_stats['ref_frame'] = ref_frame_name
 
             progress_cb(36, f"Selected {n_selected}/{total} frames "
                             f"(dropped {total - n_selected} total); "
@@ -728,9 +812,10 @@ class StackProcessor:
             ref_raw, _ = _read_fits(selected_files[ref_rank_idx])
             ref_bgr    = _debayer(ref_raw, bayer_pattern).astype(np.float32) / 65535.0
             ref_gray8  = _to_gray8(ref_bgr)
-            ref_lum    = (0.299 * ref_bgr[:,:,2]
-                        + 0.587 * ref_bgr[:,:,1]
-                        + 0.114 * ref_bgr[:,:,0])
+            ref_lum_raw = (0.299 * ref_bgr[:,:,2]
+                         + 0.587 * ref_bgr[:,:,1]
+                         + 0.114 * ref_bgr[:,:,0])
+            ref_lum    = _lum_for_registration(ref_lum_raw)
             h, w = ref_bgr.shape[:2]
 
             # Pre-allocate stack array (avoids list + np.stack double-RAM peak)
@@ -748,11 +833,12 @@ class StackProcessor:
                 pct = 37 + int(38 * (fi + 1) / n_selected)
                 progress_cb(pct, f"Aligning {fi + 1}/{n_selected}", n_selected, total)
                 try:
-                    raw, _    = _read_fits(fpath)
-                    bgr       = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
-                    frame_lum = (0.299 * bgr[:,:,2]
-                               + 0.587 * bgr[:,:,1]
-                               + 0.114 * bgr[:,:,0])
+                    raw, _        = _read_fits(fpath)
+                    bgr           = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
+                    frame_lum_raw = (0.299 * bgr[:,:,2]
+                                   + 0.587 * bgr[:,:,1]
+                                   + 0.114 * bgr[:,:,0])
+                    frame_lum     = _lum_for_registration(frame_lum_raw)
                     gray8 = _to_gray8(bgr)
                     warp  = _register(ref_gray8, gray8, ref_lum, frame_lum)
                     if warp is None:
@@ -778,6 +864,8 @@ class StackProcessor:
                     pass
 
             n_dropped_align = n_selected - n_accepted
+            run_stats['aligned']        = n_accepted
+            run_stats['rejected_align'] = n_dropped_align
             progress_cb(75,
                         f"Alignment complete: {n_accepted}/{n_selected} frames accepted "
                         f"({n_dropped_align} rejected by registration)",
@@ -889,11 +977,16 @@ class StackProcessor:
             if not ok:
                 raise RuntimeError(f"Failed to write preview JPEG to {output_path}")
 
+            run_stats['elapsed_s'] = round(time.monotonic() - t_start, 1)
+            log_path = str(Path(output_path).with_suffix('.log'))
+            _write_stack_log(log_path, run_stats, output_path)
+
             progress_cb(100, "Done", n_accepted, total)
             return {
                 "frames_total":    total,
                 "frames_accepted": n_accepted,
                 "output_path":     output_path,
+                "log_path":        log_path,
             }
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)

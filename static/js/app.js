@@ -603,9 +603,12 @@ function buildStackFooter(sessionName) {
       <div class="stack-stage">${stage}${esc(counts)} ${pct}%</div>`;
   }
 
-  // Result thumbnail + view link
+  // Result thumbnail + view link + log link
   let resultRow = '';
   if (isDone && job.output_path) {
+    const logLink = `<a class="stack-log-link"
+           href="/api/stack/log/${encodeURIComponent(sessionName)}"
+           target="_blank">View run log</a>`;
     resultRow = `
       <div class="stack-result">
         <img class="stack-result-thumb"
@@ -616,6 +619,7 @@ function buildStackFooter(sessionName) {
         <a class="stack-view-link"
            href="/api/stack/image/${encodeURIComponent(sessionName)}"
            target="_blank">View full size</a>
+        ${logLink}
       </div>`;
   }
 

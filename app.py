@@ -772,6 +772,19 @@ def api_stack_image(session_name: str):
     return send_file(path, mimetype="image/jpeg")
 
 
+@app.route("/api/stack/log/<path:session_name>")
+def api_stack_log(session_name: str):
+    """Serve the plain-text pipeline run log for a completed stack job."""
+    job = db.get_stack_job(session_name)
+    if not job or not job.get("output_path"):
+        abort(404)
+    from pathlib import Path
+    log_path = str(Path(job["output_path"]).with_suffix('.log'))
+    if not os.path.isfile(log_path):
+        abort(404)
+    return send_file(log_path, mimetype="text/plain")
+
+
 @app.route("/impacts")
 def impacts() -> str:
     return render_template("impacts.html", data_dir=DATA_DIR)
