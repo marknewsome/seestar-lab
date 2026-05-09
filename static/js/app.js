@@ -537,12 +537,14 @@ function buildCard(s) {
 
 async function queueStack(sessionName, force = false) {
   const btn = document.getElementById(`stack-btn-${cardId(sessionName).slice(5)}`);
+  const mfEl = document.getElementById(`stack-mf-${cardId(sessionName).slice(5)}`);
+  const maxFrames = mfEl ? (parseInt(mfEl.value, 10) || 500) : 500;
   if (btn) { btn.disabled = true; btn.textContent = 'Queuing…'; }
   try {
     const res  = await fetch('/api/stack/start', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ session_name: sessionName, force }),
+      body:    JSON.stringify({ session_name: sessionName, force, max_frames: maxFrames }),
     });
     const body = await res.json();
     if (!res.ok) {
@@ -611,6 +613,15 @@ function buildStackFooter(sessionName) {
     : '';
 
   // Buttons
+  const mfVal = job?.max_frames ?? 500;
+  const mfInput = (!isActive)
+    ? `<label class="stack-mf-label" title="Best N frames to use (quality-ranked)">
+         <input id="stack-mf-${idSuffix}" class="stack-mf-input" type="number"
+                value="${mfVal}" min="10" max="9999" step="50" />
+         frames
+       </label>`
+    : `<span class="stack-mf-label">top ${job.frames_accepted || mfVal} frames</span>`;
+
   const stackBtn = (!isActive)
     ? `<button id="stack-btn-${idSuffix}" class="btn-stack"
          onclick="queueStack('${sn_js}')">Stack</button>`
@@ -631,6 +642,7 @@ function buildStackFooter(sessionName) {
       <span class="stack-label">Stacking</span>
       ${frameInfo}
       <div class="stack-btn-group">
+        ${mfInput}
         ${restackBtn}
         ${stackBtn}
       </div>

@@ -1198,6 +1198,26 @@ main {
 .btn-stack:hover:not(:disabled) { background: #1e4a7f; }
 .btn-stack:disabled { opacity: 0.5; cursor: default; }
 
+.stack-mf-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.stack-mf-input {
+  width: 4rem;
+  padding: 0.15rem 0.3rem;
+  border-radius: 4px;
+  border: 1px solid var(--border-hi);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.72rem;
+  text-align: right;
+}
+.stack-mf-input:focus { outline: none; border-color: var(--accent); }
+
 .btn-stack-rerun {
   font-size: 0.72rem;
   padding: 0.2rem 0.5rem;

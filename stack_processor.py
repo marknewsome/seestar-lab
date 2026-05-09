@@ -2,29 +2,41 @@
 Seestar Lab — FITS sub-frame stacking engine (v2).
 
 Pipeline:
-  1. Quality scan      — Laplacian-variance sharpness; pick reference frame
-  2. Registration pass — align each frame to reference; normalise sky background
-  3. Frame metrics     — SEP FWHM / eccentricity / background → per-frame weight
-  4. Integration       — weighted sigma-clipped mean (chunked, memory-efficient)
-  5. Upsample          — 2× Lanczos-4 to match Seestar output resolution
-  6. Background        — 2D polynomial gradient subtraction (16×16 grid)
-  7. Crop              — trim invalid border pixels from alignment warps
-  8. Colour calibration— background neutralise + star white balance (SEP)
-  9. Stretch           — PixInsight-style MTF auto-stretch per channel
- 10. Enhancement       — NLM denoising + unsharp-mask sharpening
- 11. Save              — linear float32 FITS (optional) + JPEG
+  1. Sharpness scan    — light sequential pass: read raw Bayer, compute Laplacian
+                         variance, no debayer.  Establishes quality ranking.
+  2. Frame selection   — reject below 40 % of median sharpness; keep top max_frames
+                         by score.  Files re-sorted to original on-disk order so
+                         pass 2 is as sequential as possible on spinning drives.
+  3. Registration pass — heavy pass on accepted files only: read FITS, debayer,
+                         normalise sky background to reference, align (astroalign →
+                         ECC → phase-correlation), measure SEP frame metrics.
+  4. Integration       — weighted sigma-clipped mean (chunked, memory-efficient).
+  5. Upsample          — 2× Lanczos-4 to match Seestar output resolution.
+  6. Background        — 2D polynomial gradient subtraction (16×16 grid).
+  7. Crop              — trim invalid border pixels from alignment warps.
+  8. Colour calibration— background neutralise + star white-balance (SEP).
+  9. Stretch           — PixInsight-style MTF auto-stretch per channel.
+ 10. Enhancement       — NLM denoising + unsharp-mask sharpening.
+ 11. Save              — linear float32 FITS (if astropy present) + JPEG.
 
-v2 improvements over v1:
-  - Per-frame sky background normalisation before integration — critical for
-    multi-session data; frames from murky nights no longer bias the stack
-  - SEP-based FWHM + eccentricity frame weighting; sharper frames contribute more
-  - Weighted sigma-clipped mean replaces unweighted mean
-  - Colour calibration: background neutralisation + aperture-photometry star
-    white balance so galaxy colours are not shifted by the stretch
-  - Linear float32 FITS output alongside JPEG for further processing
+Drive I/O strategy
+------------------
+Pass 1 reads the raw Bayer uint16 only (~4 MB/frame), sequentially, in filename
+order — no debayer, no caching.  For a 5 000-frame library on a spinning drive
+this is one sequential sweep of ~20 GB.
+
+Pass 2 reads only the top-max_frames files (default 500), still in their original
+filename order so the heads move forward, never back.  At 500 frames that is
+~2 GB of sequential I/O from the source drive; the other 4 500 files are never
+touched again.
+
+This replaces the v1 pattern of two full random-access sweeps (sharpness scan
+then registration), which caused a head seek per file on each pass.
 """
 
 import os
+import shutil
+import tempfile
 import warnings
 import numpy as np
 import cv2
@@ -37,6 +49,7 @@ from typing import Callable, Optional
 FITS_EXT          = {'.fit', '.fits', '.fts'}
 MIN_FRAMES        = 3      # refuse to stack fewer than this many accepted frames
 QUALITY_THRESHOLD = 0.40   # reject frames below this fraction of median sharpness
+DEFAULT_MAX_FRAMES = 500   # keep only this many best frames (quality-ranked)
 DRIZZLE_SCALE     = 2      # Lanczos upsample factor (matches Seestar's output size)
 
 
@@ -99,7 +112,7 @@ def _read_fits(path: str) -> tuple[np.ndarray, dict]:
     return np.clip(physical, 0, 65535).astype(np.uint16), header
 
 
-# ── Quality assessment ────────────────────────────────────────────────────────
+# ── Quality assessment ─────────────────────────────────────────────────────────
 
 def _sharpness(raw_bayer: np.ndarray) -> float:
     """Laplacian-variance sharpness on the centre quarter of a Bayer frame."""
@@ -130,11 +143,8 @@ def _debayer(raw: np.ndarray, bayer_pattern: str = 'GRBG') -> np.ndarray:
 # ── Background measurement ────────────────────────────────────────────────────
 
 def _sky_background(bgr_f32: np.ndarray) -> float:
-    """
-    Estimate sky background level as the 10th percentile of the green channel.
-    Uses only non-zero pixels to exclude alignment border padding.
-    """
-    green = bgr_f32[:, :, 1].ravel()
+    """10th-percentile of green channel (non-zero pixels) as sky background proxy."""
+    green   = bgr_f32[:, :, 1].ravel()
     nonzero = green[green > 0.001]
     if nonzero.size == 0:
         return float(np.percentile(green, 10))
@@ -144,11 +154,7 @@ def _sky_background(bgr_f32: np.ndarray) -> float:
 # ── Registration ──────────────────────────────────────────────────────────────
 
 def _to_gray8(bgr_f32: np.ndarray) -> np.ndarray:
-    """
-    Convert float32 BGR [0,1] to uint8 grayscale for registration.
-    CLAHE boosts local contrast so faint star fields have enough gradient
-    for ECC to converge even when a single hot pixel dominates the range.
-    """
+    """Float32 BGR [0,1] → uint8 grayscale with CLAHE contrast boost for registration."""
     gray = (0.299 * bgr_f32[:, :, 2]
           + 0.587 * bgr_f32[:, :, 1]
           + 0.114 * bgr_f32[:, :, 0])
@@ -175,10 +181,9 @@ def _warp_is_sane(warp: np.ndarray) -> bool:
 
 def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray) -> np.ndarray | None:
     """
-    Find the 2×3 Euclidean warp aligning frame to reference.
-    Tries astroalign → ECC → phase correlation, returns None if all fail.
+    2×3 Euclidean warp (WARP_INVERSE_MAP) aligning frame to reference.
+    astroalign → ECC → phase-correlation; returns None if all fail.
     """
-    # 1. astroalign — star-triangle pattern matching
     try:
         import astroalign as aa
         with warnings.catch_warnings():
@@ -194,7 +199,6 @@ def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray) -> np.ndarray | No
     except Exception:
         pass
 
-    # 2. ECC image correlation
     warp     = np.eye(2, 3, dtype=np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
     try:
@@ -208,7 +212,6 @@ def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray) -> np.ndarray | No
     except cv2.error:
         pass
 
-    # 3. Phase correlation — translation only
     try:
         (dx, dy), _ = cv2.phaseCorrelate(
             ref_gray8.astype(np.float32),
@@ -229,9 +232,8 @@ def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray) -> np.ndarray | No
 
 def _frame_metrics(bgr_f32: np.ndarray) -> dict:
     """
-    Measure per-frame quality using SEP (Source Extractor Python).
-    Returns {fwhm, eccentricity, background}.
-    Falls back to neutral penalty values if SEP is unavailable or finds too few stars.
+    SEP-based FWHM + eccentricity.  Falls back to neutral values if SEP
+    is unavailable or finds too few stars.
     """
     try:
         import sep
@@ -251,18 +253,12 @@ def _frame_metrics(bgr_f32: np.ndarray) -> dict:
         return {
             'fwhm':         float(np.median(fwhm)),
             'eccentricity': float(np.median(ecc)),
-            'background':   float(bkg.globalback),
         }
     except Exception:
-        # Neutral fallback — frame gets average weight, not zero
-        return {'fwhm': 3.0, 'eccentricity': 0.3, 'background': 0.0}
+        return {'fwhm': 3.0, 'eccentricity': 0.3}
 
 
 def _compute_weight(metrics: dict) -> float:
-    """
-    w = (1/FWHM²) × (1/(1+ecc))
-    Background term omitted here — background normalisation handles that separately.
-    """
     fwhm = max(metrics['fwhm'], 0.5)
     ecc  = max(metrics['eccentricity'], 0.0)
     return (1.0 / fwhm**2) * (1.0 / (1.0 + ecc))
@@ -279,25 +275,20 @@ def _weighted_sigma_clip(
     chunk_rows: int   = 128,
 ) -> np.ndarray:
     """
-    Weighted sigma-clipped mean, chunked over rows for memory efficiency.
-
-    stack:   float32 (N, H, W, 3)
-    weights: float32 (N,) — need not be normalised
-    Returns  float32 (H, W, 3)
-
-    Peak extra RAM per chunk ≈ 2 × chunk_size; the full (N,H,W,3) stack
-    must already be in memory but no additional N-sized temporaries are created.
+    Weighted sigma-clipped mean, chunked over rows to bound peak RAM.
+    stack: float32 (N, H, W, 3);  weights: float32 (N,).
+    Returns float32 (H, W, 3).
     """
     N, H, W, C = stack.shape
     w  = (weights / weights.sum()).astype(np.float32)
-    wc = w[:, np.newaxis, np.newaxis, np.newaxis]    # (N,1,1,1)
+    wc = w[:, np.newaxis, np.newaxis, np.newaxis]
     result = np.empty((H, W, C), dtype=np.float32)
 
     for r0 in range(0, H, chunk_rows):
         r1    = min(r0 + chunk_rows, H)
-        chunk = stack[:, r0:r1, :, :]       # (N, rH, W, C) — view, no copy
+        chunk = stack[:, r0:r1, :, :]
 
-        mu = (chunk * wc).sum(axis=0)       # weighted mean
+        mu = (chunk * wc).sum(axis=0)
 
         for _ in range(n_iter):
             diff  = chunk - mu[np.newaxis]
@@ -309,7 +300,6 @@ def _weighted_sigma_clip(
             w_sel = np.where(valid, wc, 0.0)
             w_sum = w_sel.sum(axis=0)
             new_mu = (chunk * w_sel).sum(axis=0) / np.maximum(w_sum, 1e-12)
-            # Where everything was clipped, keep the plain weighted mean
             mu = np.where(w_sum < 1e-12, mu, new_mu)
 
         result[r0:r1] = mu
@@ -320,12 +310,7 @@ def _weighted_sigma_clip(
 # ── Background subtraction ────────────────────────────────────────────────────
 
 def _subtract_background(img: np.ndarray, grid: int = 16) -> np.ndarray:
-    """
-    Fit and subtract a degree-2 2D polynomial background per channel.
-    Samples the 20th percentile of each grid cell to avoid stars/galaxy arms.
-    A 16×16 grid provides finer spatial resolution than v1's 8×8 while
-    still fitting well above the scale of extended emission in most targets.
-    """
+    """Degree-2 2D polynomial background per channel, sampled on a grid×grid mesh."""
     h, w   = img.shape[:2]
     result = img.copy()
     cell_h = max(h // grid, 1)
@@ -341,10 +326,9 @@ def _subtract_background(img: np.ndarray, grid: int = 16) -> np.ndarray:
                 patch  = ch[y0:y1, x0:x1].ravel()
                 if patch.size == 0:
                     continue
-                bg = float(np.percentile(patch, 20))
                 ys.append((y0 + y1) * 0.5 / h)
                 xs.append((x0 + x1) * 0.5 / w)
-                vals.append(bg)
+                vals.append(float(np.percentile(patch, 20)))
 
         if len(vals) < 6:
             continue
@@ -352,7 +336,7 @@ def _subtract_background(img: np.ndarray, grid: int = 16) -> np.ndarray:
         ys_   = np.asarray(ys,   dtype=np.float64)
         xs_   = np.asarray(xs,   dtype=np.float64)
         vals_ = np.asarray(vals, dtype=np.float64)
-        A     = np.column_stack([
+        A = np.column_stack([
             np.ones_like(xs_), xs_, ys_,
             xs_**2, xs_ * ys_, ys_**2,
         ])
@@ -368,9 +352,8 @@ def _subtract_background(img: np.ndarray, grid: int = 16) -> np.ndarray:
                     + coef[1] * xx + coef[2] * yy
                     + coef[3] * xx**2 + coef[4] * xx * yy + coef[5] * yy**2
                     ).astype(np.float32)
-
         sub = ch - bg_model
-        sub -= sub.min()    # floor to 0 without clipping faint detail
+        sub -= sub.min()
         result[:, :, c] = sub
 
     return result
@@ -379,21 +362,10 @@ def _subtract_background(img: np.ndarray, grid: int = 16) -> np.ndarray:
 # ── Colour calibration ────────────────────────────────────────────────────────
 
 def _color_calibrate(img: np.ndarray) -> np.ndarray:
-    """
-    Two-step colour calibration on a linear float32 (H, W, 3) BGR image.
-
-    Step 1 — Background neutralisation:
-      Scale each channel so all three sky backgrounds match.
-      Removes colour casts without touching the signal.
-
-    Step 2 — Star white balance via SEP aperture photometry:
-      Measure R/G and B/G flux ratios across bright isolated stars.
-      Scale R and B so stars appear neutral (white).
-      Falls back to step-1 result if SEP is unavailable or too few stars.
-    """
+    """Background neutralisation + SEP aperture-photometry star white-balance."""
     result = img.copy()
 
-    # Step 1: background neutralisation
+    # Background neutralisation
     bg = np.array([
         float(np.percentile(result[:, :, c][result[:, :, c] > 0], 5))
         for c in range(3)
@@ -403,7 +375,7 @@ def _color_calibrate(img: np.ndarray) -> np.ndarray:
         if bg[c] > 0:
             result[:, :, c] *= bg_mean / bg[c]
 
-    # Step 2: star white balance
+    # Star white-balance
     try:
         import sep
         lum = np.ascontiguousarray(
@@ -425,11 +397,11 @@ def _color_calibrate(img: np.ndarray) -> np.ndarray:
             for o in obj:
                 fluxes = []
                 for ci in range(3):
-                    ch     = np.ascontiguousarray(result[:, :, ci].astype(np.float64))
-                    bk     = sep.Background(ch)
+                    ch      = np.ascontiguousarray(result[:, :, ci].astype(np.float64))
+                    bk      = sep.Background(ch)
                     f, _, _ = sep.sum_circle(ch - bk.back(), [o['x']], [o['y']], 3.0)
                     fluxes.append(float(f[0]))
-                b_val, g_val, r_val = fluxes   # OpenCV BGR
+                b_val, g_val, r_val = fluxes
                 if g_val > 0:
                     r_ratios.append(r_val / g_val)
                     b_ratios.append(b_val / g_val)
@@ -450,7 +422,6 @@ def _color_calibrate(img: np.ndarray) -> np.ndarray:
 # ── Crop ──────────────────────────────────────────────────────────────────────
 
 def _auto_crop(img: np.ndarray, valid_mask: np.ndarray, margin: int = 12) -> np.ndarray:
-    """Crop img to the rectangle where valid_mask is True, with a safety margin."""
     rows = np.where(np.any(valid_mask, axis=1))[0]
     cols = np.where(np.any(valid_mask, axis=0))[0]
     if not rows.size or not cols.size:
@@ -470,10 +441,7 @@ _STF_MIDTONE_TARGET = 0.12
 
 
 def _auto_stretch(img: np.ndarray) -> np.ndarray:
-    """
-    PixInsight-style Midtone Transfer Function (STF) auto-stretch, per channel.
-    Black clip at (sky − 2.8σ); MTF midpoint solved so sky median → 0.12.
-    """
+    """PixInsight-style MTF auto-stretch, per channel."""
     result = np.zeros_like(img, dtype=np.float32)
     m_tgt  = _STF_MIDTONE_TARGET
 
@@ -484,20 +452,16 @@ def _auto_stretch(img: np.ndarray) -> np.ndarray:
         med   = float(np.median(sky))
         mad   = float(np.median(np.abs(sky - med)))
         sigma = mad * 1.4826
-
-        c0   = max(0.0, med - 2.8 * sigma)
-        hi   = float(np.percentile(sky, 99.9))
-        span = max(hi - c0, 1e-10)
+        c0    = max(0.0, med - 2.8 * sigma)
+        hi    = float(np.percentile(sky, 99.9))
+        span  = max(hi - c0, 1e-10)
 
         x     = np.clip((img[:, :, c] - c0) / span, 0.0, 1.0)
         med_n = float(np.clip((med - c0) / span, 1e-6, 1.0 - 1e-6))
 
         denom_m = 2.0 * med_n * m_tgt - m_tgt - med_n
-        if abs(denom_m) > 1e-10:
-            m = float(med_n * (m_tgt - 1.0) / denom_m)
-            m = max(1e-4, min(1.0 - 1e-4, m))
-        else:
-            m = 0.5
+        m = float(med_n * (m_tgt - 1.0) / denom_m) if abs(denom_m) > 1e-10 else 0.5
+        m = max(1e-4, min(1.0 - 1e-4, m))
 
         denom = (2.0 * m - 1.0) * x - m
         denom = np.where(np.abs(denom) > 1e-10, denom, np.sign(denom + 1e-30) * 1e-10)
@@ -510,9 +474,8 @@ def _auto_stretch(img: np.ndarray) -> np.ndarray:
 
 def _denoise_sharpen(img: np.ndarray) -> np.ndarray:
     """NLM colour denoising + unsharp-mask sharpening. img: uint8 BGR."""
-    denoised = cv2.fastNlMeansDenoisingColored(
-        img, None,
-        h=6, hColor=6,
+    denoised  = cv2.fastNlMeansDenoisingColored(
+        img, None, h=6, hColor=6,
         templateWindowSize=7, searchWindowSize=21,
     )
     blurred   = cv2.GaussianBlur(denoised, (0, 0), 1.2)
@@ -523,19 +486,16 @@ def _denoise_sharpen(img: np.ndarray) -> np.ndarray:
 # ── FITS writer ───────────────────────────────────────────────────────────────
 
 def _write_fits(path: str, data: np.ndarray, object_name: str = '') -> bool:
-    """
-    Save a linear float32 (H, W, 3) BGR image as a 3-plane FITS (RGB axis order).
-    Returns True on success, False if astropy is unavailable.
-    """
+    """Save linear float32 BGR image as 3-plane RGB FITS. Returns True on success."""
     try:
         from astropy.io import fits as _fits
         rgb = data[:, :, ::-1].transpose(2, 0, 1).astype(np.float32)
         hdu = _fits.PrimaryHDU(rgb)
-        hdu.header['BUNIT']   = 'normalized'
-        hdu.header['COLORMD'] = 'RGB'
-        hdu.header['OBJECT']  = object_name
+        hdu.header['BUNIT']    = 'normalized'
+        hdu.header['COLORMD']  = 'RGB'
+        hdu.header['OBJECT']   = object_name
         hdu.header['INSTRUME'] = 'Seestar S50'
-        hdu.header['CREATOR'] = 'Seestar Lab'
+        hdu.header['CREATOR']  = 'Seestar Lab'
         hdu.writeto(path, overwrite=True)
         return True
     except Exception:
@@ -550,10 +510,15 @@ class StackProcessor:
 
     Usage:
         proc   = StackProcessor()
-        result = proc.run(fits_files, output_path, progress_cb, cancel_cb)
+        result = proc.run(fits_files, output_path, progress_cb, cancel_cb,
+                          max_frames=500)
 
     progress_cb(pct: int, stage: str, accepted: int, total: int)
     cancel_cb() -> bool   (return True to abort)
+    max_frames: keep only this many best-quality frames; set lower to reduce
+                RAM and time at the cost of marginally less integration depth.
+                500 is a good default — SNR gains above that are √N-limited
+                and rarely worth the processing cost.
     """
 
     def run(
@@ -562,6 +527,7 @@ class StackProcessor:
         output_path: str,
         progress_cb: Callable[[int, str, int, int], None],
         cancel_cb:   Optional[Callable[[], bool]] = None,
+        max_frames:  int = DEFAULT_MAX_FRAMES,
     ) -> dict:
 
         def _chk():
@@ -574,8 +540,11 @@ class StackProcessor:
                 f"Need at least {MIN_FRAMES} FITS files to stack, found {total}"
             )
 
-        # ── Stage 1: Sharpness scan ────────────────────────────────────────────
-        progress_cb(2, f"Scanning {total} frames for quality", 0, total)
+        # ── Pass 1: light sharpness scan (sequential, Bayer only, no debayer) ──
+        # Reads each file once to compute Laplacian-variance sharpness.
+        # No debayer — we only need the raw pixel gradient for a quality rank.
+        # This is the cheapest possible pass: ~4 MB/frame, fully sequential.
+        progress_cb(2, f"Scanning {total} frames (pass 1/2 — quality)", 0, total)
         _chk()
 
         sharpness:    list[float] = []
@@ -590,29 +559,48 @@ class StackProcessor:
                 sharpness.append(_sharpness(raw))
             except Exception:
                 sharpness.append(0.0)
-            progress_cb(2 + int(18 * (i + 1) / total),
-                        f"Scanning quality: {i + 1}/{total}", 0, total)
+            progress_cb(2 + int(23 * (i + 1) / total),
+                        f"Quality scan: {i + 1}/{total}", 0, total)
 
         positive = [s for s in sharpness if s > 0]
         if not positive:
             raise RuntimeError("Could not read any FITS frames")
 
+        # Apply quality threshold, then keep only the best max_frames.
         threshold    = float(np.median(positive)) * QUALITY_THRESHOLD
-        accepted_idx = [i for i, s in enumerate(sharpness) if s >= threshold]
-        if len(accepted_idx) < MIN_FRAMES:
-            accepted_idx = list(range(len(fits_files)))
+        passing_idx  = [i for i, s in enumerate(sharpness) if s >= threshold]
 
-        accepted_files = [fits_files[i] for i in accepted_idx]
-        n_accepted     = len(accepted_files)
-        progress_cb(20, f"Accepted {n_accepted}/{total} frames", n_accepted, total)
+        # Sort by sharpness descending, cap at max_frames
+        passing_idx.sort(key=lambda i: sharpness[i], reverse=True)
+        selected_idx = passing_idx[:max_frames]
+
+        # Re-sort to original on-disk order so pass 2 reads are as sequential
+        # as possible — the heads move forward, never backward.
+        selected_idx.sort()
+        selected_files = [fits_files[i] for i in selected_idx]
+        n_selected     = len(selected_files)
+
+        if n_selected < MIN_FRAMES:
+            raise RuntimeError(
+                f"Only {n_selected} frames passed quality selection (need {MIN_FRAMES})"
+            )
+
+        dropped = total - n_selected
+        progress_cb(25, (f"Selected top {n_selected}/{total} frames"
+                         f" (dropped {dropped} below threshold or max_frames cap)"),
+                    n_selected, total)
         _chk()
 
-        # ── Stage 2: Load reference frame ─────────────────────────────────────
-        ref_scores = [sharpness[i] for i in accepted_idx]
-        ref_local  = int(np.argmax(ref_scores))
+        # ── Pass 2: debayer + register + metrics (selected files only) ─────────
+        # Reads only n_selected files (≤ max_frames), in original filename order.
+        # For a 5 000-frame library with max_frames=500, this reads 10 % of files.
 
-        progress_cb(22, "Loading reference frame", n_accepted, total)
-        ref_raw, _ = _read_fits(accepted_files[ref_local])
+        # Reference frame: the sharpest among the selected set
+        ref_sharp_idx = max(range(n_selected),
+                            key=lambda i: sharpness[selected_idx[i]])
+
+        progress_cb(26, "Loading reference frame (pass 2/2)", n_selected, total)
+        ref_raw, _ = _read_fits(selected_files[ref_sharp_idx])
         ref_bgr    = _debayer(ref_raw, bayer_pattern).astype(np.float32) / 65535.0
         ref_gray8  = _to_gray8(ref_bgr)
         h, w       = ref_bgr.shape[:2]
@@ -622,24 +610,25 @@ class StackProcessor:
         masks:   list[np.ndarray] = [np.ones((h, w), dtype=bool)]
         metrics: list[dict]       = [_frame_metrics(ref_bgr)]
 
-        # ── Stage 3: Register + normalise + measure ────────────────────────────
-        for fi, fpath in enumerate(accepted_files):
+        for fi, fpath in enumerate(selected_files):
             _chk()
-            if fi == ref_local:
+            if fi == ref_sharp_idx:
                 continue
-            pct = 22 + int(43 * (fi + 1) / n_accepted)
-            progress_cb(pct, f"Aligning {fi + 1}/{n_accepted}", n_accepted, total)
+            pct = 26 + int(44 * (fi + 1) / n_selected)
+            progress_cb(pct, f"Aligning {fi + 1}/{n_selected}", n_selected, total)
             try:
-                raw, _  = _read_fits(fpath)
-                bgr     = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
+                raw, _   = _read_fits(fpath)
+                bgr      = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
 
-                # Background-normalise to reference level before alignment
+                # Normalise sky background to reference level before alignment.
+                # Frames from bright/murky sessions are shifted additively so
+                # they don't bias the integrated stack sky level.
                 frame_bg = _sky_background(bgr)
                 if frame_bg > 0 and ref_bg > 0:
                     bgr = np.clip(bgr + (ref_bg - frame_bg), 0.0, None)
 
-                gray8 = _to_gray8(bgr)
-                warp  = _register(ref_gray8, gray8)
+                gray8   = _to_gray8(bgr)
+                warp    = _register(ref_gray8, gray8)
                 if warp is None:
                     continue
 
@@ -663,18 +652,19 @@ class StackProcessor:
 
         if len(frames) < MIN_FRAMES:
             raise RuntimeError(
-                f"Only {len(frames)} frames registered (need {MIN_FRAMES})"
+                f"Only {len(frames)} frames registered successfully (need {MIN_FRAMES})"
             )
 
-        # ── Stage 4: Compute weights + integrate ──────────────────────────────
-        progress_cb(65, f"Integrating {len(frames)} frames (weighted σ-clip)", n_accepted, total)
+        # ── Integration ────────────────────────────────────────────────────────
+        progress_cb(70, f"Integrating {len(frames)} frames (weighted σ-clip)",
+                    n_selected, total)
         _chk()
 
         raw_weights = np.array([_compute_weight(m) for m in metrics], dtype=np.float32)
         if raw_weights.sum() == 0:
             raw_weights = np.ones(len(frames), dtype=np.float32)
 
-        stack_arr = np.stack(frames, axis=0)    # (N, H, W, 3)
+        stack_arr = np.stack(frames, axis=0)
         del frames
 
         stacked = _weighted_sigma_clip(stack_arr, raw_weights)
@@ -684,8 +674,8 @@ class StackProcessor:
         for m in masks[1:]:
             all_valid_native &= m
 
-        # ── Stage 5: 2× upsample ──────────────────────────────────────────────
-        progress_cb(72, "Upsampling 2×", n_accepted, total)
+        # ── 2× upsample ───────────────────────────────────────────────────────
+        progress_cb(77, "Upsampling 2×", n_selected, total)
         oh, ow  = h * DRIZZLE_SCALE, w * DRIZZLE_SCALE
         stacked = cv2.resize(stacked, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
         all_valid = cv2.resize(
@@ -693,39 +683,38 @@ class StackProcessor:
             interpolation=cv2.INTER_NEAREST,
         ).astype(bool)
 
-        # ── Stage 6: Background subtraction ───────────────────────────────────
-        progress_cb(75, "Removing background gradient", n_accepted, total)
+        # ── Background subtraction ─────────────────────────────────────────────
+        progress_cb(80, "Removing background gradient", n_selected, total)
         _chk()
         stacked = _subtract_background(stacked, grid=16)
 
-        # ── Stage 7: Crop ─────────────────────────────────────────────────────
-        progress_cb(80, "Cropping to valid overlap region", n_accepted, total)
+        # ── Crop ───────────────────────────────────────────────────────────────
+        progress_cb(84, "Cropping to valid overlap region", n_selected, total)
         stacked = _auto_crop(stacked, all_valid)
 
-        # ── Stage 8: Colour calibration ───────────────────────────────────────
-        progress_cb(83, "Colour calibration", n_accepted, total)
+        # ── Colour calibration ─────────────────────────────────────────────────
+        progress_cb(86, "Colour calibration", n_selected, total)
         _chk()
         stacked = _color_calibrate(stacked)
 
-        # ── Stage 9: Save linear FITS ─────────────────────────────────────────
+        # ── Save linear FITS ───────────────────────────────────────────────────
         fits_path = str(Path(output_path).with_suffix('.fits'))
-        progress_cb(87, "Saving linear FITS", n_accepted, total)
-        object_name = Path(output_path).stem
-        _write_fits(fits_path, stacked, object_name)
+        progress_cb(88, "Saving linear FITS", n_selected, total)
+        _write_fits(fits_path, stacked, Path(output_path).stem)
 
-        # ── Stage 10: Stretch ─────────────────────────────────────────────────
-        progress_cb(88, "Auto-stretch", n_accepted, total)
+        # ── Stretch ────────────────────────────────────────────────────────────
+        progress_cb(89, "Auto-stretch", n_selected, total)
         _chk()
         stacked = _auto_stretch(stacked)
 
-        # ── Stage 11: Denoise + sharpen ───────────────────────────────────────
-        progress_cb(93, "Noise reduction and sharpening", n_accepted, total)
+        # ── Denoise + sharpen ──────────────────────────────────────────────────
+        progress_cb(93, "Noise reduction and sharpening", n_selected, total)
         _chk()
         stacked_u8 = (stacked * 255).astype(np.uint8)
         stacked_u8 = _denoise_sharpen(stacked_u8)
 
-        # ── Stage 12: Save JPEG ───────────────────────────────────────────────
-        progress_cb(97, "Saving JPEG", n_accepted, total)
+        # ── Save JPEG ──────────────────────────────────────────────────────────
+        progress_cb(97, "Saving JPEG", n_selected, total)
         out_dir = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(out_dir, exist_ok=True)
         ok = cv2.imwrite(
@@ -735,9 +724,9 @@ class StackProcessor:
         if not ok:
             raise RuntimeError(f"Failed to write JPEG to {output_path}")
 
-        progress_cb(100, "Done", n_accepted, total)
+        progress_cb(100, "Done", n_selected, total)
         return {
             "frames_total":    total,
-            "frames_accepted": n_accepted,
+            "frames_accepted": n_selected,
             "output_path":     output_path,
         }

@@ -259,6 +259,7 @@ def _run_stack_job(job: dict) -> None:
     session_name = job["session_name"]
     fits_files   = job["fits_files"]
     output_path  = job["output_path"]
+    max_frames   = job.get("max_frames", 500)
 
     db.start_stack_job(session_name)
 
@@ -275,7 +276,8 @@ def _run_stack_job(job: dict) -> None:
         })
 
     try:
-        result = StackProcessor().run(fits_files, output_path, progress_cb)
+        result = StackProcessor().run(fits_files, output_path, progress_cb,
+                                      max_frames=max_frames)
         db.finish_stack_job(
             session_name, output_path,
             result["frames_accepted"], result["frames_total"],
@@ -676,12 +678,14 @@ def api_image():
 def api_stack_start():
     """
     Queue a stacking job for a _sub session.
-    Body: {"session_name": str, "force": bool}
+    Body: {"session_name": str, "force": bool, "max_frames": int}
+    max_frames caps how many best-quality frames are used; default 500.
     """
     from pathlib import Path as _Path
     body         = request.get_json(silent=True) or {}
     session_name = body.get("session_name", "").strip()
     force        = bool(body.get("force", False))
+    max_frames   = int(body.get("max_frames", 500))
 
     if not session_name:
         return jsonify({"error": "session_name required"}), 400
@@ -718,8 +722,10 @@ def api_stack_start():
         "session_name": session_name,
         "fits_files":   fits_files,
         "output_path":  output_path,
+        "max_frames":   max_frames,
     })
-    return jsonify({"status": "queued", "fits_count": len(fits_files), "output": output_path})
+    return jsonify({"status": "queued", "fits_count": len(fits_files),
+                    "max_frames": max_frames, "output": output_path})
 
 
 @app.route("/api/stack/status")
