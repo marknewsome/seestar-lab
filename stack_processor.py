@@ -205,7 +205,7 @@ def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray,
                 and 0.7 <= det <= 1.4
                 and dx  <= w * 0.6
                 and dy  <= h * 0.6
-                and rot <= 45.0):
+                and rot <= 90.0):
             return warp_aa
     except Exception:
         pass
@@ -777,9 +777,17 @@ class StackProcessor:
                 except Exception:
                     pass
 
+            n_dropped_align = n_selected - n_accepted
+            progress_cb(75,
+                        f"Alignment complete: {n_accepted}/{n_selected} frames accepted "
+                        f"({n_dropped_align} rejected by registration)",
+                        n_accepted, total)
+            _chk()
+
             if n_accepted < MIN_FRAMES:
                 raise RuntimeError(
-                    f"Only {n_accepted} frames registered successfully (need {MIN_FRAMES})"
+                    f"Only {n_accepted}/{n_selected} frames registered successfully "
+                    f"(need {MIN_FRAMES}) — check that frames overlap the reference field"
                 )
 
             stack_arr = stack_arr[:n_accepted]
