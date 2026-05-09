@@ -640,10 +640,12 @@ function buildStackFooter(sessionName) {
        </label>`
     : `<span class="stack-mf-label">top ${job.frames_accepted || mfVal} frames</span>`;
 
-  const stackBtn = (!isActive)
-    ? `<button id="stack-btn-${idSuffix}" class="btn-stack"
-         onclick="queueStack('${sn_js}')">Stack</button>`
-    : `<button id="stack-btn-${idSuffix}" class="btn-stack" disabled>Stacking…</button>`;
+  const stackBtn = isActive
+    ? `<button id="stack-btn-${idSuffix}" class="btn-stack" disabled>Stacking…</button>`
+    : (!isDone && !isError)
+      ? `<button id="stack-btn-${idSuffix}" class="btn-stack"
+           onclick="queueStack('${sn_js}')">Stack</button>`
+      : '';
 
   const cancelBtn = isActive
     ? `<button class="btn-stack-cancel"
