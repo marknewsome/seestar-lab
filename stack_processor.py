@@ -2,14 +2,15 @@
 Seestar Lab — FITS sub-frame stacking engine (v2).
 
 Pipeline:
-  1. Sharpness scan    — light sequential pass: read raw Bayer, compute Laplacian
-                         variance, no debayer.  Establishes quality ranking.
-  2. Frame selection   — reject below 40 % of median sharpness; keep top max_frames
+  1. SSD copy          — all source frames copied to a local temp dir before any
+                         reads begin.  Both passes work entirely from local storage;
+                         the source drive (spinning or network) is never touched again.
+  2. Sharpness scan    — light sequential pass on the temp copies: read raw Bayer,
+                         compute Laplacian variance, no debayer.
+  3. Frame selection   — reject below 40 % of median sharpness; keep top max_frames
                          by score.  Files re-sorted to original on-disk order so
-                         pass 2 is as sequential as possible on spinning drives.
-  2b. SSD copy         — selected frames copied to a local temp dir so all pass-2
-                         reads come from fast local storage, not the source drive.
-  3. Registration pass — heavy pass on accepted files only: read FITS, debayer,
+                         pass 2 is as sequential as possible.
+  4. Registration pass — heavy pass on accepted files only: read FITS, debayer,
                          normalise sky background to reference, align (astroalign →
                          ECC → phase-correlation), measure SEP frame metrics.
   4. Integration       — weighted sigma-clipped mean (chunked, memory-efficient).
@@ -23,17 +24,15 @@ Pipeline:
 
 Drive I/O strategy
 ------------------
-Pass 1 reads the raw Bayer uint16 only (~4 MB/frame), sequentially, in filename
-order — no debayer, no caching.  For a 5 000-frame library on a spinning drive
-this is one sequential sweep of ~20 GB.
+All source files are copied to a local temp dir (tempfile.mkdtemp) before either
+pass begins.  The source drive (spinning or network mount) is read exactly once,
+sequentially, during the copy.  Every subsequent operation — quality scan, frame
+selection, alignment, integration — reads from local SSD.
 
-Pass 2 reads only the top-max_frames files (default 500), still in their original
-filename order so the heads move forward, never back.  At 500 frames that is
-~2 GB of sequential I/O from the source drive; the other 4 500 files are never
-touched again.
-
-This replaces the v1 pattern of two full random-access sweeps (sharpness scan
-then registration), which caused a head seek per file on each pass.
+The copy covers all frames so the quality scan is also fast; previously the scan
+ran directly on the source drive which caused a seek per file on spinning media.
+Only the top-max_frames selected files are loaded in pass 2, so the unselected
+temp copies are never read again (they are cleaned up in the finally block).
 """
 
 import os
@@ -542,82 +541,77 @@ class StackProcessor:
                 f"Need at least {MIN_FRAMES} FITS files to stack, found {total}"
             )
 
-        # ── Pass 1: light sharpness scan (sequential, Bayer only, no debayer) ──
-        # Reads each file once to compute Laplacian-variance sharpness.
-        # No debayer — we only need the raw pixel gradient for a quality rank.
-        # This is the cheapest possible pass: ~4 MB/frame, fully sequential.
-        progress_cb(2, f"Scanning {total} frames (pass 1/2 — quality)", 0, total)
-        _chk()
-
-        sharpness:    list[float] = []
-        bayer_pattern = 'GRBG'
-
-        for i, fpath in enumerate(fits_files):
-            _chk()
-            try:
-                raw, hdr = _read_fits(fpath)
-                if i == 0:
-                    bayer_pattern = hdr.get('BAYERPAT', 'GRBG').strip("'").strip()
-                sharpness.append(_sharpness(raw))
-            except Exception:
-                sharpness.append(0.0)
-            progress_cb(2 + int(23 * (i + 1) / total),
-                        f"Quality scan: {i + 1}/{total}", 0, total)
-
-        positive = [s for s in sharpness if s > 0]
-        if not positive:
-            raise RuntimeError("Could not read any FITS frames")
-
-        # Apply quality threshold, then keep only the best max_frames.
-        threshold    = float(np.median(positive)) * QUALITY_THRESHOLD
-        passing_idx  = [i for i, s in enumerate(sharpness) if s >= threshold]
-
-        # Sort by sharpness descending, cap at max_frames
-        passing_idx.sort(key=lambda i: sharpness[i], reverse=True)
-        selected_idx = passing_idx[:max_frames]
-
-        # Re-sort to original on-disk order so pass 2 reads are as sequential
-        # as possible — the heads move forward, never backward.
-        selected_idx.sort()
-        selected_files = [fits_files[i] for i in selected_idx]
-        n_selected     = len(selected_files)
-
-        if n_selected < MIN_FRAMES:
-            raise RuntimeError(
-                f"Only {n_selected} frames passed quality selection (need {MIN_FRAMES})"
-            )
-
-        dropped = total - n_selected
-        progress_cb(25, (f"Selected top {n_selected}/{total} frames"
-                         f" (dropped {dropped} below threshold or max_frames cap)"),
-                    n_selected, total)
-        _chk()
-
-        # ── Copy selected frames to local SSD temp dir ─────────────────────────
-        # Pass 2 (debayer + alignment) is CPU-heavy and revisits each selected
-        # file at least once.  Copying to a local temp dir before that pass
-        # means all pass-2 reads come from a fast local drive rather than the
-        # source (which may be a slow spinning drive or a network mount).
-        # Only the ~max_frames selected files are copied; the rest are never read.
+        # ── Copy all source frames to local SSD temp dir ──────────────────────
+        # Both passes read entirely from local storage so spinning-drive or
+        # network-mount latency never affects either the quality scan or the
+        # alignment pass.  All files are copied sequentially once; the temp
+        # dir is cleaned up in the finally block regardless of outcome.
         tmp_dir = tempfile.mkdtemp(prefix="seestar_stack_")
         try:
-            progress_cb(25, f"Copying {n_selected} frames to local temp dir…",
-                        n_selected, total)
+            progress_cb(1, f"Copying {total} frames to local temp dir…", 0, total)
             _chk()
             local_files: list[str] = []
-            for ci, src in enumerate(selected_files):
+            for ci, src in enumerate(fits_files):
                 _chk()
                 dst = os.path.join(tmp_dir, os.path.basename(src))
                 shutil.copy2(src, dst)
                 local_files.append(dst)
-                if (ci + 1) % 25 == 0 or ci + 1 == n_selected:
-                    progress_cb(25, f"Copying: {ci + 1}/{n_selected}",
-                                n_selected, total)
-            selected_files = local_files
+                if (ci + 1) % 50 == 0 or ci + 1 == total:
+                    progress_cb(1 + int(9 * (ci + 1) / total),
+                                f"Copying: {ci + 1}/{total}", 0, total)
+            fits_files = local_files
+
+            # ── Pass 1: light sharpness scan (sequential, Bayer only, no debayer) ──
+            # Reads each file once to compute Laplacian-variance sharpness.
+            # No debayer — we only need the raw pixel gradient for a quality rank.
+            progress_cb(10, f"Scanning {total} frames (pass 1/2 — quality)", 0, total)
+            _chk()
+
+            sharpness:    list[float] = []
+            bayer_pattern = 'GRBG'
+
+            for i, fpath in enumerate(fits_files):
+                _chk()
+                try:
+                    raw, hdr = _read_fits(fpath)
+                    if i == 0:
+                        bayer_pattern = hdr.get('BAYERPAT', 'GRBG').strip("'").strip()
+                    sharpness.append(_sharpness(raw))
+                except Exception:
+                    sharpness.append(0.0)
+                progress_cb(10 + int(15 * (i + 1) / total),
+                            f"Quality scan: {i + 1}/{total}", 0, total)
+
+            positive = [s for s in sharpness if s > 0]
+            if not positive:
+                raise RuntimeError("Could not read any FITS frames")
+
+            # Apply quality threshold, then keep only the best max_frames.
+            threshold    = float(np.median(positive)) * QUALITY_THRESHOLD
+            passing_idx  = [i for i, s in enumerate(sharpness) if s >= threshold]
+
+            # Sort by sharpness descending, cap at max_frames
+            passing_idx.sort(key=lambda i: sharpness[i], reverse=True)
+            selected_idx = passing_idx[:max_frames]
+
+            # Re-sort to original on-disk order so pass 2 reads are sequential.
+            selected_idx.sort()
+            selected_files = [fits_files[i] for i in selected_idx]
+            n_selected     = len(selected_files)
+
+            if n_selected < MIN_FRAMES:
+                raise RuntimeError(
+                    f"Only {n_selected} frames passed quality selection (need {MIN_FRAMES})"
+                )
+
+            dropped = total - n_selected
+            progress_cb(25, (f"Selected top {n_selected}/{total} frames"
+                             f" (dropped {dropped} below threshold or max_frames cap)"),
+                        n_selected, total)
+            _chk()
 
             # ── Pass 2: debayer + register + metrics (selected files only) ─────
-            # Reads only n_selected files (≤ max_frames), in original filename order.
-            # For a 5 000-frame library with max_frames=500, this reads 10 % of files.
+            # Reads only n_selected files (≤ max_frames) from the local temp dir.
 
             # Reference frame: the sharpest among the selected set
             ref_sharp_idx = max(range(n_selected),

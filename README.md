@@ -154,10 +154,10 @@ stacked JPEG is saved and displayed as the session thumbnail.
 
 | # | Stage | Details |
 |---|---|---|
-| 1 | **Pass 1 — quality scan** | Each FITS file is read once (raw Bayer uint16 only, no debayer). Laplacian-variance sharpness is scored on the centre quarter. Sequential I/O — the drive head moves forward through the file tree. |
-| 2 | **Frame selection** | Frames below 40 % of the median sharpness score are rejected. The surviving frames are sorted by score descending and capped at `max_frames` (default 500). They are then re-sorted to original on-disk order so pass 2 reads are as sequential as possible. |
-| 2b | **SSD copy** | The selected frames (≤ `max_frames` files) are copied to a local temp directory before pass 2. All subsequent I/O reads from fast local storage regardless of where the source library lives. The temp dir is cleaned up automatically on completion, error, or cancel. |
-| 3 | **Pass 2 — registration** | Each selected frame is debayered (RGGB → BGR), sky background is normalised to the reference frame's level (additive shift), and aligned to the sharpest accepted frame via `cv2.findTransformECC` (`MOTION_EUCLIDEAN`). Falls back to phase correlation if ECC fails. |
+| 1 | **SSD copy** | All source frames are copied sequentially to a local temp directory before any processing begins. The source drive (spinning or network mount) is read exactly once; every subsequent operation reads from local SSD. The temp dir is cleaned up automatically on completion, error, or cancel. |
+| 2 | **Pass 1 — quality scan** | Each temp-dir FITS file is read once (raw Bayer uint16 only, no debayer). Laplacian-variance sharpness is scored on the centre quarter. Fully sequential SSD reads — no more drive-head noise during the scan. |
+| 3 | **Frame selection** | Frames below 40 % of the median sharpness score are rejected. The surviving frames are sorted by score descending and capped at `max_frames` (default 500), then re-sorted to original on-disk order for pass 2. |
+| 4 | **Pass 2 — registration** | Each selected frame is debayered (RGGB → BGR), sky background is normalised to the reference frame's level (additive shift), and aligned to the sharpest accepted frame via `cv2.findTransformECC` (`MOTION_EUCLIDEAN`). Falls back to phase correlation if ECC fails. |
 | 4 | **Weighted sigma-clip integration** | Per-frame quality weights (FWHM, eccentricity, SNR via SEP) drive a MAD-based sigma-clip (σ = 2.5) that rejects hot pixels, cosmic rays, and satellite trails. Processing is chunked (128 rows at a time) to bound peak RAM. |
 | 5 | **2× upsample** | Lanczos-4 resize to match the Seestar's own stacked-image resolution. |
 | 6 | **Background subtraction** | A 16 × 16 grid samples 20th-percentile pixel values; a degree-2 2-D polynomial is fit and subtracted to remove gradient vignetting. |
