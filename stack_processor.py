@@ -630,7 +630,15 @@ class StackProcessor:
             h, w       = ref_bgr.shape[:2]
             ref_bg     = _sky_background(ref_bgr)
 
-            frames:  list[np.ndarray] = [ref_bgr]
+            # Pre-allocate the full stack array now that h, w are known.
+            # Writing directly into pre-allocated slots avoids building a Python
+            # list of arrays and then calling np.stack — that pattern peaks at
+            # 2× frame-data RAM (list + contiguous copy coexist briefly), which
+            # OOMs at ~500 frames on memory-capped systems like WSL2.
+            stack_arr = np.zeros((n_selected, h, w, 3), dtype=np.float32)
+            stack_arr[0] = ref_bgr
+            n_accepted = 1
+
             masks:   list[np.ndarray] = [np.ones((h, w), dtype=bool)]
             metrics: list[dict]       = [_frame_metrics(ref_bgr)]
 
@@ -668,28 +676,29 @@ class StackProcessor:
                         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
                     ) > 0.5
 
-                    frames.append(aligned)
+                    stack_arr[n_accepted] = aligned
+                    n_accepted += 1
                     masks.append(valid)
                     metrics.append(_frame_metrics(aligned))
                 except Exception:
                     pass
 
-            if len(frames) < MIN_FRAMES:
+            if n_accepted < MIN_FRAMES:
                 raise RuntimeError(
-                    f"Only {len(frames)} frames registered successfully (need {MIN_FRAMES})"
+                    f"Only {n_accepted} frames registered successfully (need {MIN_FRAMES})"
                 )
 
+            # Trim unused slots (frames that failed registration)
+            stack_arr = stack_arr[:n_accepted]
+
             # ── Integration ────────────────────────────────────────────────────
-            progress_cb(70, f"Integrating {len(frames)} frames (weighted σ-clip)",
+            progress_cb(70, f"Integrating {n_accepted} frames (weighted σ-clip)",
                         n_selected, total)
             _chk()
 
             raw_weights = np.array([_compute_weight(m) for m in metrics], dtype=np.float32)
             if raw_weights.sum() == 0:
-                raw_weights = np.ones(len(frames), dtype=np.float32)
-
-            stack_arr = np.stack(frames, axis=0)
-            del frames
+                raw_weights = np.ones(n_accepted, dtype=np.float32)
 
             stacked = _weighted_sigma_clip(stack_arr, raw_weights)
             del stack_arr
@@ -748,10 +757,10 @@ class StackProcessor:
             if not ok:
                 raise RuntimeError(f"Failed to write JPEG to {output_path}")
 
-            progress_cb(100, "Done", n_selected, total)
+            progress_cb(100, "Done", n_accepted, total)
             return {
                 "frames_total":    total,
-                "frames_accepted": n_selected,
+                "frames_accepted": n_accepted,
                 "output_path":     output_path,
             }
         finally:
