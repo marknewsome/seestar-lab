@@ -167,39 +167,39 @@ def _to_gray8(bgr_f32: np.ndarray) -> np.ndarray:
     return clahe.apply(gray8)
 
 
-_MAX_WARP_SHIFT_PX = 50.0
-_MAX_WARP_ROT_DEG  = 2.0
-
-
-def _warp_is_sane(warp: np.ndarray) -> bool:
-    dx  = float(warp[0, 2])
-    dy  = float(warp[1, 2])
-    rot = abs(float(np.degrees(np.arctan2(warp[1, 0], warp[0, 0]))))
-    return (abs(dx) <= _MAX_WARP_SHIFT_PX
-            and abs(dy) <= _MAX_WARP_SHIFT_PX
-            and rot     <= _MAX_WARP_ROT_DEG)
-
-
-def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray) -> np.ndarray | None:
+def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray,
+              ref_lum: np.ndarray | None = None,
+              frame_lum: np.ndarray | None = None) -> np.ndarray | None:
     """
-    2×3 Euclidean warp (WARP_INVERSE_MAP) aligning frame to reference.
-    astroalign → ECC → phase-correlation; returns None if all fail.
+    2×3 affine warp (WARP_INVERSE_MAP) aligning frame to reference.
+
+    astroalign (star-pattern matching) → ECC → phase-correlation.
+    astroalign is tried first because it handles arbitrarily large shifts
+    and rotations — critical for multi-session data from different nights.
+    ECC and phase-correlation only cope with small displacements and are
+    kept as fallbacks for single-session runs where astroalign finds too
+    few stars (e.g. very narrow field or cloudy frames).
     """
+    # ── astroalign: star-triangle matching, large-offset / rotation tolerant ──
     try:
         import astroalign as aa
+        # Prefer float luminance (more dynamic range for faint stars) over gray8
+        src_ref   = ref_lum   if ref_lum   is not None else ref_gray8.astype(np.float32) / 255.0
+        src_frame = frame_lum if frame_lum is not None else frame_gray8.astype(np.float32) / 255.0
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            _, tf = aa.find_transform(frame_gray8, ref_gray8)
-        params = tf.params
-        warp_aa = np.array([
-            [params[0, 0], params[0, 1], params[0, 2]],
-            [params[1, 0], params[1, 1], params[1, 2]],
-        ], dtype=np.float32)
-        if _warp_is_sane(warp_aa):
+            _, tf = aa.find_transform(src_frame, src_ref)
+        p = tf.params
+        warp_aa = np.array([[p[0,0], p[0,1], p[0,2]],
+                             [p[1,0], p[1,1], p[1,2]]], dtype=np.float32)
+        # Trust astroalign if the matrix is finite — it uses star triangles, so
+        # any finite solution is valid regardless of shift/rotation magnitude.
+        if np.isfinite(warp_aa).all():
             return warp_aa
     except Exception:
         pass
 
+    # ── ECC: pixel-based, only reliable for small offsets (< ~30 px, < 2°) ───
     warp     = np.eye(2, 3, dtype=np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
     try:
@@ -208,25 +208,50 @@ def _register(ref_gray8: np.ndarray, frame_gray8: np.ndarray) -> np.ndarray | No
             cv2.MOTION_EUCLIDEAN, criteria,
             inputMask=None, gaussFiltSize=5,
         )
-        if _warp_is_sane(warp):
+        dx  = abs(float(warp[0, 2]))
+        dy  = abs(float(warp[1, 2]))
+        rot = abs(float(np.degrees(np.arctan2(warp[1, 0], warp[0, 0]))))
+        if dx <= 80 and dy <= 80 and rot <= 5:
             return warp
     except cv2.error:
         pass
 
+    # ── Phase correlation: translation only, last resort ─────────────────────
     try:
         (dx, dy), _ = cv2.phaseCorrelate(
             ref_gray8.astype(np.float32),
             frame_gray8.astype(np.float32),
         )
-        fallback       = np.eye(2, 3, dtype=np.float32)
-        fallback[0, 2] = float(dx)
-        fallback[1, 2] = float(dy)
-        if _warp_is_sane(fallback):
+        if abs(dx) <= 80 and abs(dy) <= 80:
+            fallback       = np.eye(2, 3, dtype=np.float32)
+            fallback[0, 2] = float(dx)
+            fallback[1, 2] = float(dy)
             return fallback
     except Exception:
         pass
 
     return None
+
+
+def _fix_hot_pixels(bgr: np.ndarray, sigma: float = 8.0) -> np.ndarray:
+    """
+    Replace isolated hot pixels with their 3×3 neighbourhood median.
+    A pixel is "hot" if it exceeds the local median by more than sigma × MAD.
+    Applied per-frame before alignment so hot pixels don't survive sigma-clip.
+    """
+    result = bgr.copy()
+    for c in range(3):
+        ch  = bgr[:, :, c]
+        # 3×3 median as local background estimate (fast via medianBlur on uint16)
+        ch16  = np.clip(ch * 65535, 0, 65535).astype(np.uint16)
+        med16 = cv2.medianBlur(ch16, 3)
+        med   = med16.astype(np.float32) / 65535.0
+        diff  = ch - med
+        noise = float(np.median(np.abs(diff))) * 1.4826
+        if noise > 0:
+            hot = diff > sigma * noise
+            result[:, :, c][hot] = med[hot]
+    return result
 
 
 # ── Frame quality metrics (SEP-based) ─────────────────────────────────────────
@@ -418,6 +443,19 @@ def _color_calibrate(img: np.ndarray) -> np.ndarray:
         pass
 
     return np.clip(result, 0.0, None)
+
+
+def _scnr_green(img: np.ndarray) -> np.ndarray:
+    """
+    Maximum-neutral Subtractive Chromatic Noise Reduction for the green channel.
+    OSC Bayer sensors have 2× as many green photosites as red or blue, so the
+    integrated stack always has excess green noise.  This clips the green channel
+    to max(R, B) wherever it exceeds that value — the standard Siril SCNR step.
+    """
+    result = img.copy()
+    result[:, :, 1] = np.minimum(img[:, :, 1],
+                                  np.maximum(img[:, :, 2], img[:, :, 0]))
+    return result
 
 
 # ── Crop ──────────────────────────────────────────────────────────────────────
@@ -620,7 +658,12 @@ class StackProcessor:
             progress_cb(26, "Loading reference frame (pass 2/2)", n_selected, total)
             ref_raw, _ = _read_fits(selected_files[ref_sharp_idx])
             ref_bgr    = _debayer(ref_raw, bayer_pattern).astype(np.float32) / 65535.0
+            ref_bgr    = _fix_hot_pixels(ref_bgr)
             ref_gray8  = _to_gray8(ref_bgr)
+            # Float luminance for astroalign — more dynamic range than uint8
+            ref_lum    = (0.299 * ref_bgr[:,:,2]
+                        + 0.587 * ref_bgr[:,:,1]
+                        + 0.114 * ref_bgr[:,:,0])
             h, w       = ref_bgr.shape[:2]
             ref_bg     = _sky_background(ref_bgr)
 
@@ -646,6 +689,10 @@ class StackProcessor:
                     raw, _   = _read_fits(fpath)
                     bgr      = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
 
+                    # Remove hot pixels before alignment so they don't corrupt
+                    # the registration transform or survive sigma-clipping.
+                    bgr = _fix_hot_pixels(bgr)
+
                     # Normalise sky background to reference level before alignment.
                     # Frames from bright/murky sessions are shifted additively so
                     # they don't bias the integrated stack sky level.
@@ -653,8 +700,11 @@ class StackProcessor:
                     if frame_bg > 0 and ref_bg > 0:
                         bgr = np.clip(bgr + (ref_bg - frame_bg), 0.0, None)
 
-                    gray8   = _to_gray8(bgr)
-                    warp    = _register(ref_gray8, gray8)
+                    frame_lum = (0.299 * bgr[:,:,2]
+                               + 0.587 * bgr[:,:,1]
+                               + 0.114 * bgr[:,:,0])
+                    gray8 = _to_gray8(bgr)
+                    warp  = _register(ref_gray8, gray8, ref_lum, frame_lum)
                     if warp is None:
                         continue
 
@@ -723,6 +773,10 @@ class StackProcessor:
             progress_cb(86, "Colour calibration", n_selected, total)
             _chk()
             stacked = _color_calibrate(stacked)
+
+            # ── SCNR — remove excess green from OSC Bayer sensor ───────────────
+            progress_cb(87, "Green noise reduction (SCNR)", n_selected, total)
+            stacked = _scnr_green(stacked)
 
             # ── Save linear FITS ───────────────────────────────────────────────
             fits_path = str(Path(output_path).with_suffix('.fits'))
