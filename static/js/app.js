@@ -219,6 +219,7 @@ function handleStackDone(ev) {
     frames_accepted: ev.frames_accepted,
     frames_total:    ev.frames_total,
     output_path:     ev.output_path,
+    max_frames:      ev.max_frames || stackData[sn]?.max_frames || 500,
   });
   _refreshStackFooter(sn);
 }
@@ -562,6 +563,7 @@ async function queueStack(sessionName, force = false) {
       stage: 'Queued…',
       frames_total: body.fits_count || 0,
       frames_accepted: 0,
+      max_frames: body.max_frames || maxFrames,
     });
     _refreshStackFooter(sessionName);
   } catch {

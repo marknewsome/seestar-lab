@@ -303,6 +303,7 @@ def _run_stack_job(job: dict) -> None:
             "output_path":     output_path,
             "frames_accepted": result["frames_accepted"],
             "frames_total":    result["frames_total"],
+            "max_frames":      max_frames,
         })
     except StackCancelled:
         db.fail_stack_job(session_name, "Cancelled")
@@ -726,7 +727,7 @@ def api_stack_start():
     output_dir  = session["paths"][0] if session.get("paths") else OUTPUT_DIR
     output_path = os.path.join(output_dir, "seestar_stacked.jpg")
 
-    if not db.queue_stack_job(session_name, force=force):
+    if not db.queue_stack_job(session_name, force=force, max_frames=max_frames):
         return jsonify({"error": "job already queued or running", "status": "already_queued"}), 409
 
     _stack_queue.put({
@@ -2323,6 +2324,7 @@ if __name__ == "__main__":
                 "session_name": sj["session_name"],
                 "fits_files":   fits_files,
                 "output_path":  os.path.join(output_dir, "seestar_stacked.jpg"),
+                "max_frames":   sj.get("max_frames", 500),
             })
     if pending_stack:
         print(f"[startup] Re-queued {len(pending_stack)} interrupted stack job(s).")

@@ -154,9 +154,15 @@ def init_db() -> None:
             "  error_msg       TEXT,"
             "  queued_at       TEXT NOT NULL,"
             "  started_at      TEXT,"
-            "  finished_at     TEXT"
+            "  finished_at     TEXT,"
+            "  max_frames      INTEGER DEFAULT 500"
             ");"
         )
+        # Migration: add max_frames to existing databases that predate this column
+        try:
+            conn.execute("ALTER TABLE stack_jobs ADD COLUMN max_frames INTEGER DEFAULT 500")
+        except Exception:
+            pass  # column already exists
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
@@ -404,7 +410,8 @@ def get_impact_gallery() -> list[dict]:
 
 # ── Stack jobs ─────────────────────────────────────────────────────────────────
 
-def queue_stack_job(session_name: str, force: bool = False) -> bool:
+def queue_stack_job(session_name: str, force: bool = False,
+                    max_frames: int = 500) -> bool:
     """
     Insert a pending stack_job row.
     Returns False (without inserting) if one already exists in a non-error state
@@ -421,8 +428,8 @@ def queue_stack_job(session_name: str, force: bool = False) -> bool:
             """
             INSERT INTO stack_jobs
                 (session_name, status, pct, stage, frames_total, frames_accepted,
-                 output_path, error_msg, queued_at)
-            VALUES (?, 'pending', 0, '', 0, 0, NULL, NULL, datetime('now'))
+                 output_path, error_msg, queued_at, max_frames)
+            VALUES (?, 'pending', 0, '', 0, 0, NULL, NULL, datetime('now'), ?)
             ON CONFLICT(session_name) DO UPDATE SET
                 status          = 'pending',
                 pct             = 0,
@@ -433,9 +440,10 @@ def queue_stack_job(session_name: str, force: bool = False) -> bool:
                 error_msg       = NULL,
                 queued_at       = datetime('now'),
                 started_at      = NULL,
-                finished_at     = NULL
+                finished_at     = NULL,
+                max_frames      = excluded.max_frames
             """,
-            (session_name,),
+            (session_name, max_frames),
         )
     return True
 
