@@ -347,7 +347,7 @@ def _weighted_sigma_clip(
     sigma_low: float  = 2.0,
     sigma_high: float = 3.0,
     n_iter: int       = 3,
-    chunk_rows: int   = 128,
+    chunk_rows: int   = 64,
 ) -> np.ndarray:
     """
     Weighted sigma-clipped mean, chunked over rows to bound peak RAM.
