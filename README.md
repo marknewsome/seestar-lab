@@ -176,6 +176,20 @@ reduces alignment and integration time proportionally.  For a 5 000-frame librar
 `max_frames = 500`, only 10 % of frames are read in pass 2 and copied to the SSD — the rest
 are never touched after pass 1.
 
+### Memory usage
+
+The integration array is pre-allocated as a single `float32` block of shape
+`(n_accepted, H, W, 3)` and each aligned frame is written directly into its slot.  This
+avoids the Python-list-then-`np.stack` pattern that peaks at 2× frame-data RAM (list and
+contiguous copy coexist briefly).  At 500 frames of 1920 × 1080 × 3 × float32 the peak is
+~12 GB rather than ~24 GB.  If WSL2 is still memory-constrained, raise its limit in
+`%USERPROFILE%\.wslconfig`:
+
+```ini
+[wsl2]
+memory=20GB
+```
+
 ### Cancel
 
 A **Cancel** button appears while stacking is active.  It signals the pipeline to stop
