@@ -16,7 +16,9 @@ track-path composite.
 | **Session browser** | Scans the data directory and displays every observation session as a card with thumbnail, dates, sub-count, and video hours |
 | **Session thumbnails** | Best-quality image from each session (enhanced JPEG, stacked output, or cover frame) shown on the card; hover-zooms to a larger view; user can pin a preferred thumbnail that survives rescans |
 | **Image gallery** | Seestar-stacked JPEGs for non-`_sub` comet sessions are browsable via prev/next arrows on the card thumbnail and a full-screen lightbox |
-| **Sub-frame stacking** | One-click pipeline stacks raw `.fit` sub-frames: quality selection, ECC alignment, sigma-clip mean, background gradient removal, auto-crop, colour stretch, denoising, and sharpening |
+| **User ratings** | Three-state satisfaction dot on every session card and bingo card: Satisfied (green) / Want more time (amber) / Priority re-image (red). Click to cycle; persists across rescans. "Re-image" filter in the Observing Planner surfaces want-more and priority targets. |
+| **Observing notes** | Free-text textarea on each session card for conditions, issues, and goals. Saves automatically on blur or Ctrl+Enter. A truncated snippet with full-text tooltip appears on bingo cards. |
+| **Sub-frame stacking** | Two-pass pipeline stacks raw `.fit` sub-frames: sharpness-ranked quality selection, local SSD copy of selected frames, per-frame sky background normalisation, ECC alignment, weighted sigma-clip integration, background gradient removal, auto-crop, colour stretch, denoising, and sharpening. Configurable frame cap (`max_frames`); cancelable at any point. |
 | **Comet wizard** | Step-by-step pipeline for `_sub` comet folders: frame selection, stretch/parameter tuning with live preview, stars-fixed animation, comet-nucleus-fixed animation, track composite, and annotated frame review |
 | **Catalog scoreboard** | Messier and Caldwell bingo-card views show which objects have been captured, with progress bar and type filters |
 | **Poster printing** | One-click 13×19" landscape poster of the full Messier or Caldwell catalog: captured objects show their thumbnail, uncaptured show a muted placeholder; designed for photo printers |
@@ -152,21 +154,38 @@ stacked JPEG is saved and displayed as the session thumbnail.
 
 | # | Stage | Details |
 |---|---|---|
-| 1 | **Quality selection** | Laplacian-variance sharpness scored on the centre quarter of each frame; frames below 40 % of the median score are rejected.  Minimum 3 accepted frames required. |
-| 2 | **ECC registration** | `cv2.findTransformECC` with `MOTION_EUCLIDEAN` aligns each frame to the reference (sharpest accepted frame).  Falls back to phase correlation if ECC fails. |
-| 3 | **Sigma-clip mean stack** | Frames are stacked into a 3-D array; per-pixel MAD-based sigma clipping (σ = 2.5) rejects hot pixels, cosmic rays, and satellite trails before taking the mean. |
-| 4 | **Background subtraction** | An 8 × 8 grid samples 20th-percentile pixel values across the image; a degree-2 2-D polynomial is fit to the grid and subtracted to remove gradient vignetting. |
-| 5 | **Auto-crop** | The valid-pixel overlap mask is computed from all alignment transforms; a tight bounding rectangle (12 px margin) removes the dark rotation artefact borders. |
-| 6 | **Auto-stretch** | Percentile black/white point clipping followed by a √γ stretch mimics PixInsight's Screen Transfer Function for natural colour rendition. |
-| 7 | **Denoise + sharpen** | `cv2.bilateralFilter` smooths noise while preserving edges; a weighted unsharp mask enhances fine detail. |
+| 1 | **Pass 1 — quality scan** | Each FITS file is read once (raw Bayer uint16 only, no debayer). Laplacian-variance sharpness is scored on the centre quarter. Sequential I/O — the drive head moves forward through the file tree. |
+| 2 | **Frame selection** | Frames below 40 % of the median sharpness score are rejected. The surviving frames are sorted by score descending and capped at `max_frames` (default 500). They are then re-sorted to original on-disk order so pass 2 reads are as sequential as possible. |
+| 2b | **SSD copy** | The selected frames (≤ `max_frames` files) are copied to a local temp directory before pass 2. All subsequent I/O reads from fast local storage regardless of where the source library lives. The temp dir is cleaned up automatically on completion, error, or cancel. |
+| 3 | **Pass 2 — registration** | Each selected frame is debayered (RGGB → BGR), sky background is normalised to the reference frame's level (additive shift), and aligned to the sharpest accepted frame via `cv2.findTransformECC` (`MOTION_EUCLIDEAN`). Falls back to phase correlation if ECC fails. |
+| 4 | **Weighted sigma-clip integration** | Per-frame quality weights (FWHM, eccentricity, SNR via SEP) drive a MAD-based sigma-clip (σ = 2.5) that rejects hot pixels, cosmic rays, and satellite trails. Processing is chunked (128 rows at a time) to bound peak RAM. |
+| 5 | **2× upsample** | Lanczos-4 resize to match the Seestar's own stacked-image resolution. |
+| 6 | **Background subtraction** | A 16 × 16 grid samples 20th-percentile pixel values; a degree-2 2-D polynomial is fit and subtracted to remove gradient vignetting. |
+| 7 | **Auto-crop** | The intersection of all valid-pixel masks is computed from the alignment warps; a tight bounding rectangle removes dark rotation-artefact borders. |
+| 8 | **Colour calibration** | Background neutralisation + star white-balance via SEP source extraction. |
+| 9 | **Auto-stretch** | PixInsight-style MTF Screen Transfer Function per channel for natural colour rendition. |
+| 10 | **Denoise + sharpen** | NLM denoising followed by a weighted unsharp mask. |
+| 11 | **Save** | Linear float32 FITS (`.fits`) written alongside the final `seestar_stacked.jpg` (JPEG quality 95). |
 
-Output is written to `seestar_stacked.jpg` inside the session's output directory and
-automatically registered as the session thumbnail — visible immediately without a rescan.
+Output is registered as the session thumbnail immediately — visible without a rescan.
 
-### Re-running
+### max_frames
 
-A **Re-run** button replaces the Stack button once a job has completed or failed, allowing
-re-stacking (e.g. after adjusting quality parameters).
+The `max_frames` input (default 500) caps how many frames enter pass 2.  Setting it lower
+reduces alignment and integration time proportionally.  For a 5 000-frame library with
+`max_frames = 500`, only 10 % of frames are read in pass 2 and copied to the SSD — the rest
+are never touched after pass 1.
+
+### Cancel
+
+A **Cancel** button appears while stacking is active.  It signals the pipeline to stop
+cleanly after the current frame finishes.  The DB is marked as cancelled and the stack footer
+reverts to idle state; no partial output is written.
+
+### Re-stack
+
+A **Re-stack** button replaces the Stack button once a job has completed or failed, allowing
+re-stacking (e.g. after adjusting `max_frames` or changing source frames).
 
 ---
 
@@ -481,18 +500,21 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 |---|---|---|
 | `GET` | `/api/catalog/<type>` | JSON: Messier or Caldwell catalog with capture status |
 
-### Session thumbnails
+### Session thumbnails, ratings, and notes
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/session/<name>/images` | JSON: all image files for a session + current pinned thumbnail path |
 | `POST` | `/api/session/<name>/pin-thumbnail` | Pin a specific image as the session thumbnail (persists across rescans) |
+| `POST` | `/api/session/<name>/rate` | Set user rating — body: `{"rating": "satisfied"|"want_more"|"priority"|null}` |
+| `POST` | `/api/session/<name>/notes` | Set observing notes — body: `{"notes": str}` |
 
 ### Sub-frame stacking
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/stack/start` | Queue stacking — body: `{"session_name": str, "force": bool}` |
+| `POST` | `/api/stack/start` | Queue stacking — body: `{"session_name": str, "force": bool, "max_frames": int}` |
+| `POST` | `/api/stack/cancel` | Cancel active job — body: `{"session_name": str}` |
 | `GET` | `/api/stack/status` | JSON: all stack job statuses keyed by session name |
 | `GET` | `/api/stack/image/<session_name>` | Serve full-size stacked JPEG |
 
@@ -567,7 +589,7 @@ startup; new columns are added with `ALTER TABLE` for backwards compatibility.
 
 | Table | Purpose |
 |---|---|
-| `sessions` | One row per observation object (M42, Solar, etc.); includes `pinned_thumbnail` column that survives rescans |
+| `sessions` | One row per observation object (M42, Solar, etc.); includes `pinned_thumbnail`, `user_rating`, and `notes` columns that survive rescans |
 | `scanned_dirs` | Directory paths + mtimes for differential scanning |
 | `meta` | Key-value store (last scan time, data dir) |
 | `stack_jobs` | One row per sub-frame stacking job; tracks status, progress percentage, pipeline stage, frame counts, and output path |

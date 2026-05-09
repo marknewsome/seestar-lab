@@ -121,6 +121,7 @@ API ROUTE SUMMARY
 
   Stacking
     POST /api/stack/start          Queue a stacking job
+    POST /api/stack/cancel         Cancel the active stacking job
     GET  /api/stack/status/<name>  Get stack job status
     GET  /api/stack/result/<name>  Serve the stacked JPEG
 
@@ -251,6 +252,8 @@ def start_scan(force: bool = False) -> bool:
 # ── Stack job queue ───────────────────────────────────────────────────────────
 
 _stack_queue: queue.Queue = queue.Queue()
+_stack_cancel_flags: dict[str, threading.Event] = {}
+_stack_cancel_lock = threading.Lock()
 
 
 def _run_stack_job(job: dict) -> None:
@@ -260,6 +263,10 @@ def _run_stack_job(job: dict) -> None:
     fits_files   = job["fits_files"]
     output_path  = job["output_path"]
     max_frames   = job.get("max_frames", 500)
+
+    cancel_flag = threading.Event()
+    with _stack_cancel_lock:
+        _stack_cancel_flags[session_name] = cancel_flag
 
     db.start_stack_job(session_name)
 
@@ -277,6 +284,7 @@ def _run_stack_job(job: dict) -> None:
 
     try:
         result = StackProcessor().run(fits_files, output_path, progress_cb,
+                                      cancel_cb=cancel_flag.is_set,
                                       max_frames=max_frames)
         db.finish_stack_job(
             session_name, output_path,
@@ -318,6 +326,9 @@ def _run_stack_job(job: dict) -> None:
             "frames_accepted": 0,
             "frames_total":    len(fits_files),
         })
+    finally:
+        with _stack_cancel_lock:
+            _stack_cancel_flags.pop(session_name, None)
 
 
 def _stack_worker_loop() -> None:
@@ -732,6 +743,21 @@ def api_stack_start():
 def api_stack_status():
     """Return all stack job statuses keyed by session_name."""
     return jsonify(db.get_all_stack_jobs())
+
+
+@app.route("/api/stack/cancel", methods=["POST"])
+def api_stack_cancel():
+    """Signal the active stacking job to stop cleanly."""
+    body = request.get_json(silent=True) or {}
+    session_name = body.get("session_name", "").strip()
+    if not session_name:
+        return jsonify({"error": "session_name required"}), 400
+    with _stack_cancel_lock:
+        flag = _stack_cancel_flags.get(session_name)
+    if flag is None:
+        return jsonify({"error": "no active job for that session"}), 404
+    flag.set()
+    return jsonify({"status": "cancelling"})
 
 
 @app.route("/api/stack/image/<path:session_name>")

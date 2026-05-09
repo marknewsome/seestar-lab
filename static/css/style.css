@@ -1230,6 +1230,18 @@ main {
 }
 .btn-stack-rerun:hover { background: var(--surface); color: var(--text); }
 
+.btn-stack-cancel {
+  font-size: 0.72rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 5px;
+  border: 1px solid #7f2020;
+  background: transparent;
+  color: #d06060;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.btn-stack-cancel:hover { background: #7f2020; color: #fff; }
+
 .stack-progress-wrap {
   height: 3px;
   background: var(--border);

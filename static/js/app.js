@@ -196,14 +196,16 @@ async function loadStackData() {
 
 function handleStackProgress(ev) {
   const sn = ev.session_name;
-  stackData[sn] = Object.assign(stackData[sn] || {}, {
+  const update = {
     session_name:    sn,
     status:          ev.status || 'running',
     pct:             ev.pct,
     stage:           ev.stage,
     frames_accepted: ev.frames_accepted,
     frames_total:    ev.frames_total,
-  });
+  };
+  if (ev.status === 'error') update.error_msg = ev.stage;
+  stackData[sn] = Object.assign(stackData[sn] || {}, update);
   _refreshStackFooter(sn);
 }
 
@@ -567,6 +569,16 @@ async function queueStack(sessionName, force = false) {
   }
 }
 
+async function cancelStack(sessionName) {
+  try {
+    await fetch('/api/stack/cancel', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ session_name: sessionName }),
+    });
+  } catch { /* ignore — server will broadcast cancelled state via SSE */ }
+}
+
 function buildStackFooter(sessionName) {
   const job     = stackData[sessionName];
   const sn_js   = sessionName.replace(/'/g, "\\'");
@@ -627,6 +639,12 @@ function buildStackFooter(sessionName) {
          onclick="queueStack('${sn_js}')">Stack</button>`
     : `<button id="stack-btn-${idSuffix}" class="btn-stack" disabled>Stacking…</button>`;
 
+  const cancelBtn = isActive
+    ? `<button class="btn-stack-cancel"
+         onclick="cancelStack('${sn_js}')"
+         title="Stop stacking after current frame">Cancel</button>`
+    : '';
+
   const restackBtn = (isDone || isError)
     ? `<button class="btn-stack-rerun"
          onclick="queueStack('${sn_js}', true)"
@@ -644,6 +662,7 @@ function buildStackFooter(sessionName) {
       <div class="stack-btn-group">
         ${mfInput}
         ${restackBtn}
+        ${cancelBtn}
         ${stackBtn}
       </div>
     </div>

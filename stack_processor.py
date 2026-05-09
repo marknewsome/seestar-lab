@@ -7,6 +7,8 @@ Pipeline:
   2. Frame selection   — reject below 40 % of median sharpness; keep top max_frames
                          by score.  Files re-sorted to original on-disk order so
                          pass 2 is as sequential as possible on spinning drives.
+  2b. SSD copy         — selected frames copied to a local temp dir so all pass-2
+                         reads come from fast local storage, not the source drive.
   3. Registration pass — heavy pass on accepted files only: read FITS, debayer,
                          normalise sky background to reference, align (astroalign →
                          ECC → phase-correlation), measure SEP frame metrics.
@@ -591,142 +593,166 @@ class StackProcessor:
                     n_selected, total)
         _chk()
 
-        # ── Pass 2: debayer + register + metrics (selected files only) ─────────
-        # Reads only n_selected files (≤ max_frames), in original filename order.
-        # For a 5 000-frame library with max_frames=500, this reads 10 % of files.
-
-        # Reference frame: the sharpest among the selected set
-        ref_sharp_idx = max(range(n_selected),
-                            key=lambda i: sharpness[selected_idx[i]])
-
-        progress_cb(26, "Loading reference frame (pass 2/2)", n_selected, total)
-        ref_raw, _ = _read_fits(selected_files[ref_sharp_idx])
-        ref_bgr    = _debayer(ref_raw, bayer_pattern).astype(np.float32) / 65535.0
-        ref_gray8  = _to_gray8(ref_bgr)
-        h, w       = ref_bgr.shape[:2]
-        ref_bg     = _sky_background(ref_bgr)
-
-        frames:  list[np.ndarray] = [ref_bgr]
-        masks:   list[np.ndarray] = [np.ones((h, w), dtype=bool)]
-        metrics: list[dict]       = [_frame_metrics(ref_bgr)]
-
-        for fi, fpath in enumerate(selected_files):
+        # ── Copy selected frames to local SSD temp dir ─────────────────────────
+        # Pass 2 (debayer + alignment) is CPU-heavy and revisits each selected
+        # file at least once.  Copying to a local temp dir before that pass
+        # means all pass-2 reads come from a fast local drive rather than the
+        # source (which may be a slow spinning drive or a network mount).
+        # Only the ~max_frames selected files are copied; the rest are never read.
+        tmp_dir = tempfile.mkdtemp(prefix="seestar_stack_")
+        try:
+            progress_cb(25, f"Copying {n_selected} frames to local temp dir…",
+                        n_selected, total)
             _chk()
-            if fi == ref_sharp_idx:
-                continue
-            pct = 26 + int(44 * (fi + 1) / n_selected)
-            progress_cb(pct, f"Aligning {fi + 1}/{n_selected}", n_selected, total)
-            try:
-                raw, _   = _read_fits(fpath)
-                bgr      = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
+            local_files: list[str] = []
+            for ci, src in enumerate(selected_files):
+                _chk()
+                dst = os.path.join(tmp_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                local_files.append(dst)
+                if (ci + 1) % 25 == 0 or ci + 1 == n_selected:
+                    progress_cb(25, f"Copying: {ci + 1}/{n_selected}",
+                                n_selected, total)
+            selected_files = local_files
 
-                # Normalise sky background to reference level before alignment.
-                # Frames from bright/murky sessions are shifted additively so
-                # they don't bias the integrated stack sky level.
-                frame_bg = _sky_background(bgr)
-                if frame_bg > 0 and ref_bg > 0:
-                    bgr = np.clip(bgr + (ref_bg - frame_bg), 0.0, None)
+            # ── Pass 2: debayer + register + metrics (selected files only) ─────
+            # Reads only n_selected files (≤ max_frames), in original filename order.
+            # For a 5 000-frame library with max_frames=500, this reads 10 % of files.
 
-                gray8   = _to_gray8(bgr)
-                warp    = _register(ref_gray8, gray8)
-                if warp is None:
+            # Reference frame: the sharpest among the selected set
+            ref_sharp_idx = max(range(n_selected),
+                                key=lambda i: sharpness[selected_idx[i]])
+
+            progress_cb(26, "Loading reference frame (pass 2/2)", n_selected, total)
+            ref_raw, _ = _read_fits(selected_files[ref_sharp_idx])
+            ref_bgr    = _debayer(ref_raw, bayer_pattern).astype(np.float32) / 65535.0
+            ref_gray8  = _to_gray8(ref_bgr)
+            h, w       = ref_bgr.shape[:2]
+            ref_bg     = _sky_background(ref_bgr)
+
+            frames:  list[np.ndarray] = [ref_bgr]
+            masks:   list[np.ndarray] = [np.ones((h, w), dtype=bool)]
+            metrics: list[dict]       = [_frame_metrics(ref_bgr)]
+
+            for fi, fpath in enumerate(selected_files):
+                _chk()
+                if fi == ref_sharp_idx:
                     continue
+                pct = 26 + int(44 * (fi + 1) / n_selected)
+                progress_cb(pct, f"Aligning {fi + 1}/{n_selected}", n_selected, total)
+                try:
+                    raw, _   = _read_fits(fpath)
+                    bgr      = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
 
-                aligned = cv2.warpAffine(
-                    bgr, warp, (w, h),
-                    flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
-                    borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                    # Normalise sky background to reference level before alignment.
+                    # Frames from bright/murky sessions are shifted additively so
+                    # they don't bias the integrated stack sky level.
+                    frame_bg = _sky_background(bgr)
+                    if frame_bg > 0 and ref_bg > 0:
+                        bgr = np.clip(bgr + (ref_bg - frame_bg), 0.0, None)
+
+                    gray8   = _to_gray8(bgr)
+                    warp    = _register(ref_gray8, gray8)
+                    if warp is None:
+                        continue
+
+                    aligned = cv2.warpAffine(
+                        bgr, warp, (w, h),
+                        flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                    )
+                    ones  = np.ones((h, w), dtype=np.float32)
+                    valid = cv2.warpAffine(
+                        ones, warp, (w, h),
+                        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                    ) > 0.5
+
+                    frames.append(aligned)
+                    masks.append(valid)
+                    metrics.append(_frame_metrics(aligned))
+                except Exception:
+                    pass
+
+            if len(frames) < MIN_FRAMES:
+                raise RuntimeError(
+                    f"Only {len(frames)} frames registered successfully (need {MIN_FRAMES})"
                 )
-                ones  = np.ones((h, w), dtype=np.float32)
-                valid = cv2.warpAffine(
-                    ones, warp, (w, h),
-                    flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
-                    borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-                ) > 0.5
 
-                frames.append(aligned)
-                masks.append(valid)
-                metrics.append(_frame_metrics(aligned))
-            except Exception:
-                pass
+            # ── Integration ────────────────────────────────────────────────────
+            progress_cb(70, f"Integrating {len(frames)} frames (weighted σ-clip)",
+                        n_selected, total)
+            _chk()
 
-        if len(frames) < MIN_FRAMES:
-            raise RuntimeError(
-                f"Only {len(frames)} frames registered successfully (need {MIN_FRAMES})"
+            raw_weights = np.array([_compute_weight(m) for m in metrics], dtype=np.float32)
+            if raw_weights.sum() == 0:
+                raw_weights = np.ones(len(frames), dtype=np.float32)
+
+            stack_arr = np.stack(frames, axis=0)
+            del frames
+
+            stacked = _weighted_sigma_clip(stack_arr, raw_weights)
+            del stack_arr
+
+            all_valid_native = masks[0].copy()
+            for m in masks[1:]:
+                all_valid_native &= m
+
+            # ── 2× upsample ───────────────────────────────────────────────────
+            progress_cb(77, "Upsampling 2×", n_selected, total)
+            oh, ow  = h * DRIZZLE_SCALE, w * DRIZZLE_SCALE
+            stacked = cv2.resize(stacked, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
+            all_valid = cv2.resize(
+                all_valid_native.astype(np.uint8), (ow, oh),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+
+            # ── Background subtraction ─────────────────────────────────────────
+            progress_cb(80, "Removing background gradient", n_selected, total)
+            _chk()
+            stacked = _subtract_background(stacked, grid=16)
+
+            # ── Crop ───────────────────────────────────────────────────────────
+            progress_cb(84, "Cropping to valid overlap region", n_selected, total)
+            stacked = _auto_crop(stacked, all_valid)
+
+            # ── Colour calibration ─────────────────────────────────────────────
+            progress_cb(86, "Colour calibration", n_selected, total)
+            _chk()
+            stacked = _color_calibrate(stacked)
+
+            # ── Save linear FITS ───────────────────────────────────────────────
+            fits_path = str(Path(output_path).with_suffix('.fits'))
+            progress_cb(88, "Saving linear FITS", n_selected, total)
+            _write_fits(fits_path, stacked, Path(output_path).stem)
+
+            # ── Stretch ────────────────────────────────────────────────────────
+            progress_cb(89, "Auto-stretch", n_selected, total)
+            _chk()
+            stacked = _auto_stretch(stacked)
+
+            # ── Denoise + sharpen ──────────────────────────────────────────────
+            progress_cb(93, "Noise reduction and sharpening", n_selected, total)
+            _chk()
+            stacked_u8 = (stacked * 255).astype(np.uint8)
+            stacked_u8 = _denoise_sharpen(stacked_u8)
+
+            # ── Save JPEG ──────────────────────────────────────────────────────
+            progress_cb(97, "Saving JPEG", n_selected, total)
+            out_dir = os.path.dirname(os.path.abspath(output_path))
+            os.makedirs(out_dir, exist_ok=True)
+            ok = cv2.imwrite(
+                str(output_path), stacked_u8,
+                [cv2.IMWRITE_JPEG_QUALITY, 95],
             )
+            if not ok:
+                raise RuntimeError(f"Failed to write JPEG to {output_path}")
 
-        # ── Integration ────────────────────────────────────────────────────────
-        progress_cb(70, f"Integrating {len(frames)} frames (weighted σ-clip)",
-                    n_selected, total)
-        _chk()
-
-        raw_weights = np.array([_compute_weight(m) for m in metrics], dtype=np.float32)
-        if raw_weights.sum() == 0:
-            raw_weights = np.ones(len(frames), dtype=np.float32)
-
-        stack_arr = np.stack(frames, axis=0)
-        del frames
-
-        stacked = _weighted_sigma_clip(stack_arr, raw_weights)
-        del stack_arr
-
-        all_valid_native = masks[0].copy()
-        for m in masks[1:]:
-            all_valid_native &= m
-
-        # ── 2× upsample ───────────────────────────────────────────────────────
-        progress_cb(77, "Upsampling 2×", n_selected, total)
-        oh, ow  = h * DRIZZLE_SCALE, w * DRIZZLE_SCALE
-        stacked = cv2.resize(stacked, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
-        all_valid = cv2.resize(
-            all_valid_native.astype(np.uint8), (ow, oh),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(bool)
-
-        # ── Background subtraction ─────────────────────────────────────────────
-        progress_cb(80, "Removing background gradient", n_selected, total)
-        _chk()
-        stacked = _subtract_background(stacked, grid=16)
-
-        # ── Crop ───────────────────────────────────────────────────────────────
-        progress_cb(84, "Cropping to valid overlap region", n_selected, total)
-        stacked = _auto_crop(stacked, all_valid)
-
-        # ── Colour calibration ─────────────────────────────────────────────────
-        progress_cb(86, "Colour calibration", n_selected, total)
-        _chk()
-        stacked = _color_calibrate(stacked)
-
-        # ── Save linear FITS ───────────────────────────────────────────────────
-        fits_path = str(Path(output_path).with_suffix('.fits'))
-        progress_cb(88, "Saving linear FITS", n_selected, total)
-        _write_fits(fits_path, stacked, Path(output_path).stem)
-
-        # ── Stretch ────────────────────────────────────────────────────────────
-        progress_cb(89, "Auto-stretch", n_selected, total)
-        _chk()
-        stacked = _auto_stretch(stacked)
-
-        # ── Denoise + sharpen ──────────────────────────────────────────────────
-        progress_cb(93, "Noise reduction and sharpening", n_selected, total)
-        _chk()
-        stacked_u8 = (stacked * 255).astype(np.uint8)
-        stacked_u8 = _denoise_sharpen(stacked_u8)
-
-        # ── Save JPEG ──────────────────────────────────────────────────────────
-        progress_cb(97, "Saving JPEG", n_selected, total)
-        out_dir = os.path.dirname(os.path.abspath(output_path))
-        os.makedirs(out_dir, exist_ok=True)
-        ok = cv2.imwrite(
-            str(output_path), stacked_u8,
-            [cv2.IMWRITE_JPEG_QUALITY, 95],
-        )
-        if not ok:
-            raise RuntimeError(f"Failed to write JPEG to {output_path}")
-
-        progress_cb(100, "Done", n_selected, total)
-        return {
-            "frames_total":    total,
-            "frames_accepted": n_selected,
-            "output_path":     output_path,
-        }
+            progress_cb(100, "Done", n_selected, total)
+            return {
+                "frames_total":    total,
+                "frames_accepted": n_selected,
+                "output_path":     output_path,
+            }
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
