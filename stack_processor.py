@@ -36,6 +36,7 @@ temp copies are never read again (they are cleaned up in the finally block).
 """
 
 import os
+import re
 import shutil
 import tempfile
 import warnings
@@ -675,9 +676,13 @@ class StackProcessor:
                 f"Need at least {MIN_FRAMES} FITS files to stack, found {total}"
             )
 
-        # Persistent cache dir alongside the output FITS — populated after a
-        # successful run so the next re-stack can skip the copy entirely.
-        cache_dir = str(Path(output_path).parent / '.frame_cache')
+        # Persistent frame cache on local SSD — always under tempfile.gettempdir()
+        # so it stays on local storage regardless of where the output FITS lives
+        # (e.g. network share, external drive).  Keyed by the session directory
+        # name so each session gets its own cache.
+        session_key = re.sub(r'[^\w\-]', '_', Path(output_path).parent.name)
+        cache_dir   = os.path.join(tempfile.gettempdir(),
+                                   'seestar_cache', session_key)
 
         # ── Copy all source frames to local SSD temp dir ──────────────────────
         # If use_cache=True and a valid cache exists, skip the copy and read
