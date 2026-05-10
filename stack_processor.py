@@ -385,51 +385,37 @@ def _weighted_sigma_clip(
 # ── Background subtraction ────────────────────────────────────────────────────
 
 def _subtract_background(img: np.ndarray, grid: int = 16) -> np.ndarray:
-    """Degree-2 2D polynomial background per channel, sampled on a grid×grid mesh."""
+    """
+    SEP sigma-clipped mesh background subtraction.
+
+    SEP iteratively rejects bright pixels within each cell (sigma-clipping),
+    making it robust against extended nebulosity or galaxies that fill a large
+    fraction of the frame — unlike a percentile-of-cell approach which treats
+    galaxy signal as part of the background.
+
+    Falls back to a simple per-channel median subtraction if SEP is unavailable.
+    """
     h, w   = img.shape[:2]
     result = img.copy()
-    cell_h = max(h // grid, 1)
-    cell_w = max(w // grid, 1)
 
+    try:
+        import sep
+        # Box size: ~1/20 of the frame so the mesh has ~400 cells but each
+        # cell is large enough to contain sky even in galaxy-dominated fields.
+        bw = max(w // 20, 32)
+        bh = max(h // 20, 32)
+        for c in range(3):
+            data = np.ascontiguousarray(img[:, :, c].astype(np.float64))
+            bkg  = sep.Background(data, bw=bw, bh=bh, fw=3, fh=3)
+            result[:, :, c] = (data - bkg.back()).astype(np.float32)
+        return result
+    except Exception:
+        pass
+
+    # Fallback: subtract per-channel median (removes pedestal, no gradient fix)
     for c in range(3):
-        ch          = img[:, :, c]
-        ys, xs, vals = [], [], []
-        for gy in range(grid):
-            for gx in range(grid):
-                y0, y1 = gy * cell_h, min((gy + 1) * cell_h, h)
-                x0, x1 = gx * cell_w, min((gx + 1) * cell_w, w)
-                patch  = ch[y0:y1, x0:x1].ravel()
-                if patch.size == 0:
-                    continue
-                ys.append((y0 + y1) * 0.5 / h)
-                xs.append((x0 + x1) * 0.5 / w)
-                vals.append(float(np.percentile(patch, 20)))
-
-        if len(vals) < 6:
-            continue
-
-        ys_   = np.asarray(ys,   dtype=np.float64)
-        xs_   = np.asarray(xs,   dtype=np.float64)
-        vals_ = np.asarray(vals, dtype=np.float64)
-        A = np.column_stack([
-            np.ones_like(xs_), xs_, ys_,
-            xs_**2, xs_ * ys_, ys_**2,
-        ])
-        try:
-            coef, _, _, _ = np.linalg.lstsq(A, vals_, rcond=None)
-        except Exception:
-            continue
-
-        yy, xx   = np.mgrid[0:h, 0:w]
-        yy       = yy.astype(np.float32) / h
-        xx       = xx.astype(np.float32) / w
-        bg_model = (coef[0]
-                    + coef[1] * xx + coef[2] * yy
-                    + coef[3] * xx**2 + coef[4] * xx * yy + coef[5] * yy**2
-                    ).astype(np.float32)
-        sub = ch - bg_model
-        sub -= sub.min()
-        result[:, :, c] = sub
+        ch = img[:, :, c]
+        result[:, :, c] = ch - float(np.median(ch[ch > 0])) if (ch > 0).any() else ch
 
     return result
 
