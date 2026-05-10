@@ -825,8 +825,10 @@ class StackProcessor:
             stack_arr[0] = ref_bgr  # float32 → float16 truncation is automatic
             n_accepted   = 1
 
-            masks:    list[np.ndarray] = [np.ones((h, w), dtype=bool)]
-            stk_metrics: list[dict]   = [sel_metrics[ref_rank_idx]]
+            # Running valid-pixel intersection — one bool array instead of a list
+            # of N arrays (saves ~2.5 GB at 1200 frames vs storing all masks).
+            all_valid_native = np.ones((h, w), dtype=bool)
+            stk_metrics: list[dict] = [sel_metrics[ref_rank_idx]]
 
             for fi, fpath in enumerate(selected_files):
                 _chk()
@@ -860,7 +862,7 @@ class StackProcessor:
 
                     stack_arr[n_accepted] = aligned
                     n_accepted += 1
-                    masks.append(valid)
+                    all_valid_native &= valid   # fold into running intersection
                     stk_metrics.append(sel_metrics[fi])
                 except Exception:
                     pass
@@ -917,10 +919,6 @@ class StackProcessor:
 
             stacked = _weighted_sigma_clip(stack_arr, raw_weights)
             del stack_arr
-
-            all_valid_native = masks[0].copy()
-            for m in masks[1:]:
-                all_valid_native &= m
 
             # ── 2× upsample ───────────────────────────────────────────────────
             progress_cb(82, "Upsampling 2×", n_accepted, total)
