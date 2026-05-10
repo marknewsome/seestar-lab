@@ -516,20 +516,28 @@ _STF_MIDTONE_TARGET = 0.12
 
 
 def _auto_stretch(img: np.ndarray) -> np.ndarray:
-    """PixInsight-style MTF auto-stretch, per channel."""
+    """
+    PixInsight-style MTF auto-stretch, per channel.
+
+    Uses ALL pixels (not just positive) for background estimation so the
+    stretch works correctly after SEP background subtraction, where the sky
+    sits near zero with roughly equal positive and negative noise wings.
+    """
     result = np.zeros_like(img, dtype=np.float32)
     m_tgt  = _STF_MIDTONE_TARGET
 
     for c in range(3):
-        ch  = img[:, :, c].ravel()
-        sky = ch[ch > 0] if (ch > 0).any() else ch
+        ch = img[:, :, c].ravel()
 
-        med   = float(np.median(sky))
-        mad   = float(np.median(np.abs(sky - med)))
+        # Estimate background level and noise from all pixels
+        med   = float(np.median(ch))
+        mad   = float(np.median(np.abs(ch - med)))
         sigma = mad * 1.4826
-        c0    = max(0.0, med - 2.8 * sigma)
-        hi    = float(np.percentile(sky, 99.9))
-        span  = max(hi - c0, 1e-10)
+
+        # Shadow clipping point: 2.8σ below background median
+        c0 = med - 2.8 * sigma
+        hi = float(np.percentile(ch, 99.9))
+        span = max(hi - c0, 1e-10)
 
         x     = np.clip((img[:, :, c] - c0) / span, 0.0, 1.0)
         med_n = float(np.clip((med - c0) / span, 1e-6, 1.0 - 1e-6))
@@ -963,15 +971,11 @@ class StackProcessor:
             _write_fits(fits_path, stacked, Path(output_path).stem)
 
             # ════════════════════════════════════════════════════════════════
-            # STEP 10 — preview JPEG (stretch + SCNR + denoise, never linear)
-            # SCNR and all colour/aesthetic operations belong here only.
+            # STEP 10 — preview JPEG (stretch + denoise, never linear)
             # ════════════════════════════════════════════════════════════════
             progress_cb(90, "Auto-stretch (preview)", n_accepted, total)
             _chk()
             preview = _auto_stretch(stacked.copy())
-
-            progress_cb(93, "SCNR — green noise reduction (preview)", n_accepted, total)
-            preview = _scnr_green(preview)
 
             progress_cb(95, "Noise reduction and sharpening (preview)", n_accepted, total)
             _chk()
