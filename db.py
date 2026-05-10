@@ -158,11 +158,15 @@ def init_db() -> None:
             "  max_frames      INTEGER DEFAULT 500"
             ");"
         )
-        # Migration: add max_frames to existing databases that predate this column
-        try:
-            conn.execute("ALTER TABLE stack_jobs ADD COLUMN max_frames INTEGER DEFAULT 500")
-        except Exception:
-            pass  # column already exists
+        # Migrations for columns added after initial schema
+        for migration in [
+            "ALTER TABLE stack_jobs ADD COLUMN max_frames INTEGER DEFAULT 500",
+            "ALTER TABLE stack_jobs ADD COLUMN use_cache  INTEGER DEFAULT 0",
+        ]:
+            try:
+                conn.execute(migration)
+            except Exception:
+                pass  # column already exists
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
@@ -411,7 +415,7 @@ def get_impact_gallery() -> list[dict]:
 # ── Stack jobs ─────────────────────────────────────────────────────────────────
 
 def queue_stack_job(session_name: str, force: bool = False,
-                    max_frames: int = 500) -> bool:
+                    max_frames: int = 500, use_cache: bool = False) -> bool:
     """
     Insert a pending stack_job row.
     Returns False (without inserting) if one already exists in a non-error state
@@ -428,8 +432,8 @@ def queue_stack_job(session_name: str, force: bool = False,
             """
             INSERT INTO stack_jobs
                 (session_name, status, pct, stage, frames_total, frames_accepted,
-                 output_path, error_msg, queued_at, max_frames)
-            VALUES (?, 'pending', 0, '', 0, 0, NULL, NULL, datetime('now'), ?)
+                 output_path, error_msg, queued_at, max_frames, use_cache)
+            VALUES (?, 'pending', 0, '', 0, 0, NULL, NULL, datetime('now'), ?, ?)
             ON CONFLICT(session_name) DO UPDATE SET
                 status          = 'pending',
                 pct             = 0,
@@ -441,9 +445,10 @@ def queue_stack_job(session_name: str, force: bool = False,
                 queued_at       = datetime('now'),
                 started_at      = NULL,
                 finished_at     = NULL,
-                max_frames      = excluded.max_frames
+                max_frames      = excluded.max_frames,
+                use_cache       = excluded.use_cache
             """,
-            (session_name, max_frames),
+            (session_name, max_frames, int(use_cache)),
         )
     return True
 

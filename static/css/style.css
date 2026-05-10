@@ -1296,6 +1296,17 @@ main {
 }
 .stack-log-link:hover { text-decoration: underline; color: var(--accent); }
 
+.stack-cache-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.stack-cache-input { cursor: pointer; }
+
 .stack-error {
   font-size: 0.74rem;
   color: #f87171;

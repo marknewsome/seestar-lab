@@ -539,15 +539,18 @@ function buildCard(s) {
 // ── Stack footer ──────────────────────────────────────────────────────────────
 
 async function queueStack(sessionName, force = false) {
-  const btn = document.getElementById(`stack-btn-${cardId(sessionName).slice(5)}`);
-  const mfEl = document.getElementById(`stack-mf-${cardId(sessionName).slice(5)}`);
+  const sfx       = cardId(sessionName).slice(5);
+  const btn       = document.getElementById(`stack-btn-${sfx}`);
+  const mfEl      = document.getElementById(`stack-mf-${sfx}`);
+  const cacheEl   = document.getElementById(`stack-cache-${sfx}`);
   const maxFrames = mfEl ? (parseInt(mfEl.value, 10) || 500) : 500;
+  const useCache  = cacheEl ? cacheEl.checked : false;
   if (btn) { btn.disabled = true; btn.textContent = 'Queuing…'; }
   try {
     const res  = await fetch('/api/stack/start', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ session_name: sessionName, force, max_frames: maxFrames }),
+      body:    JSON.stringify({ session_name: sessionName, force, max_frames: maxFrames, use_cache: useCache }),
     });
     const body = await res.json();
     if (!res.ok) {
@@ -653,6 +656,13 @@ function buildStackFooter(sessionName) {
          title="Stop stacking after current frame">Cancel</button>`
     : '';
 
+  const cacheCheck = (isDone || isError)
+    ? `<label class="stack-cache-label" title="Skip copy — reuse frames from the last run">
+         <input type="checkbox" id="stack-cache-${idSuffix}" class="stack-cache-input" checked />
+         Skip copy
+       </label>`
+    : '';
+
   const restackBtn = (isDone || isError)
     ? `<button class="btn-stack-rerun"
          onclick="queueStack('${sn_js}', true)"
@@ -669,6 +679,7 @@ function buildStackFooter(sessionName) {
       ${frameInfo}
       <div class="stack-btn-group">
         ${mfInput}
+        ${cacheCheck}
         ${restackBtn}
         ${cancelBtn}
         ${stackBtn}

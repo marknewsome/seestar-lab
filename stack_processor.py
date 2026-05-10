@@ -659,6 +659,7 @@ class StackProcessor:
         progress_cb: Callable[[int, str, int, int], None],
         cancel_cb:   Optional[Callable[[], bool]] = None,
         max_frames:  int = DEFAULT_MAX_FRAMES,
+        use_cache:   bool = False,
     ) -> dict:
 
         def _chk():
@@ -678,6 +679,7 @@ class StackProcessor:
             'bayer_pattern':  '',
             'max_frames':     max_frames,
             'elapsed_s':      0.0,
+            'used_cache':     False,
         }
 
         total = len(fits_files)
@@ -687,25 +689,43 @@ class StackProcessor:
                 f"Need at least {MIN_FRAMES} FITS files to stack, found {total}"
             )
 
+        # Persistent cache dir alongside the output FITS — populated after a
+        # successful run so the next re-stack can skip the copy entirely.
+        cache_dir = str(Path(output_path).parent / '.frame_cache')
+
         # ── Copy all source frames to local SSD temp dir ──────────────────────
-        # Both passes read entirely from local storage so spinning-drive or
-        # network-mount latency never affects either the quality scan or the
-        # alignment pass.  All files are copied sequentially once; the temp
-        # dir is cleaned up in the finally block regardless of outcome.
-        tmp_dir = tempfile.mkdtemp(prefix="seestar_stack_")
+        # If use_cache=True and a valid cache exists, skip the copy and read
+        # directly from cache.  Otherwise copy to a temp dir; on success the
+        # temp dir is promoted to cache (renamed) so future re-stacks are free.
+        tmp_dir = None
+        if use_cache and os.path.isdir(cache_dir):
+            cached = sorted(
+                f for f in os.listdir(cache_dir)
+                if Path(f).suffix.lower() in FITS_EXT
+            )
+            if len(cached) >= MIN_FRAMES:
+                fits_files = [os.path.join(cache_dir, f) for f in cached]
+                run_stats['used_cache'] = True
+                run_stats['total']      = len(fits_files)
+                total = len(fits_files)
+                progress_cb(10, f"Using {total} cached frames (skipping copy)", 0, total)
+
+        if not run_stats['used_cache']:
+            tmp_dir = tempfile.mkdtemp(prefix="seestar_stack_")
         try:
-            progress_cb(1, f"Copying {total} frames to local temp dir…", 0, total)
-            _chk()
-            local_files: list[str] = []
-            for ci, src in enumerate(fits_files):
+            if not run_stats['used_cache']:
+                progress_cb(1, f"Copying {total} frames to local temp dir…", 0, total)
                 _chk()
-                dst = os.path.join(tmp_dir, os.path.basename(src))
-                shutil.copy2(src, dst)
-                local_files.append(dst)
-                if (ci + 1) % 50 == 0 or ci + 1 == total:
-                    progress_cb(1 + int(9 * (ci + 1) / total),
-                                f"Copying: {ci + 1}/{total}", 0, total)
-            fits_files = local_files
+                local_files: list[str] = []
+                for ci, src in enumerate(fits_files):
+                    _chk()
+                    dst = os.path.join(tmp_dir, os.path.basename(src))
+                    shutil.copy2(src, dst)
+                    local_files.append(dst)
+                    if (ci + 1) % 50 == 0 or ci + 1 == total:
+                        progress_cb(1 + int(9 * (ci + 1) / total),
+                                    f"Copying: {ci + 1}/{total}", 0, total)
+                fits_files = local_files
 
             # ════════════════════════════════════════════════════════════════
             # STAGE A — fast quality filter (Bayer only, no debayer)
@@ -981,6 +1001,16 @@ class StackProcessor:
             log_path = str(Path(output_path).with_suffix('.log'))
             _write_stack_log(log_path, run_stats, output_path)
 
+            # Promote temp dir → persistent cache so the next re-stack is free.
+            if tmp_dir is not None:
+                try:
+                    if os.path.isdir(cache_dir):
+                        shutil.rmtree(cache_dir)
+                    shutil.move(tmp_dir, cache_dir)
+                    tmp_dir = None  # transferred; don't delete in finally
+                except Exception:
+                    pass  # cache promotion failed — not fatal
+
             progress_cb(100, "Done", n_accepted, total)
             return {
                 "frames_total":    total,
@@ -989,4 +1019,5 @@ class StackProcessor:
                 "log_path":        log_path,
             }
         finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)

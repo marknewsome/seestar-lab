@@ -263,6 +263,7 @@ def _run_stack_job(job: dict) -> None:
     fits_files   = job["fits_files"]
     output_path  = job["output_path"]
     max_frames   = job.get("max_frames", 500)
+    use_cache    = bool(job.get("use_cache", False))
 
     cancel_flag = threading.Event()
     with _stack_cancel_lock:
@@ -285,7 +286,8 @@ def _run_stack_job(job: dict) -> None:
     try:
         result = StackProcessor().run(fits_files, output_path, progress_cb,
                                       cancel_cb=cancel_flag.is_set,
-                                      max_frames=max_frames)
+                                      max_frames=max_frames,
+                                      use_cache=use_cache)
         db.finish_stack_job(
             session_name, output_path,
             result["frames_accepted"], result["frames_total"],
@@ -698,6 +700,7 @@ def api_stack_start():
     session_name = body.get("session_name", "").strip()
     force        = bool(body.get("force", False))
     max_frames   = int(body.get("max_frames", 500))
+    use_cache    = bool(body.get("use_cache", False))
 
     if not session_name:
         return jsonify({"error": "session_name required"}), 400
@@ -727,7 +730,8 @@ def api_stack_start():
     output_dir  = session["paths"][0] if session.get("paths") else OUTPUT_DIR
     output_path = os.path.join(output_dir, "seestar_stacked.jpg")
 
-    if not db.queue_stack_job(session_name, force=force, max_frames=max_frames):
+    if not db.queue_stack_job(session_name, force=force, max_frames=max_frames,
+                              use_cache=use_cache):
         return jsonify({"error": "job already queued or running", "status": "already_queued"}), 409
 
     _stack_queue.put({
@@ -735,9 +739,11 @@ def api_stack_start():
         "fits_files":   fits_files,
         "output_path":  output_path,
         "max_frames":   max_frames,
+        "use_cache":    use_cache,
     })
     return jsonify({"status": "queued", "fits_count": len(fits_files),
-                    "max_frames": max_frames, "output": output_path})
+                    "max_frames": max_frames, "use_cache": use_cache,
+                    "output": output_path})
 
 
 @app.route("/api/stack/status")
@@ -2325,6 +2331,7 @@ if __name__ == "__main__":
                 "fits_files":   fits_files,
                 "output_path":  os.path.join(output_dir, "seestar_stacked.jpg"),
                 "max_frames":   sj.get("max_frames", 500),
+                "use_cache":    bool(sj.get("use_cache", 0)),
             })
     if pending_stack:
         print(f"[startup] Re-queued {len(pending_stack)} interrupted stack job(s).")
