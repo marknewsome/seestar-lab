@@ -99,6 +99,18 @@ function handleEvent(ev) {
       hideProgressBar();
       break;
 
+    case 'stack_queued':
+      stackData[ev.session_name] = Object.assign(stackData[ev.session_name] || {}, {
+        session_name: ev.session_name,
+        status: 'pending',
+        pct: 0,
+        stage: 'Queued…',
+        frames_total: ev.fits_count || 0,
+        frames_accepted: 0,
+      });
+      _refreshStackFooter(ev.session_name);
+      break;
+
     case 'stack_progress':
       handleStackProgress(ev);
       break;
@@ -588,14 +600,16 @@ function buildStackFooter(sessionName) {
   const job     = stackData[sessionName];
   const sn_js   = sessionName.replace(/'/g, "\\'");
   const idSuffix = sessionName.replace(/[^a-z0-9]/gi, '_');
-  const status  = job?.status;
-  const isActive = status === 'pending' || status === 'running';
-  const isDone   = status === 'done';
-  const isError  = status === 'error';
+  const status    = job?.status;
+  const isQueued  = status === 'pending';
+  const isRunning = status === 'running';
+  const isActive  = isQueued || isRunning;
+  const isDone    = status === 'done';
+  const isError   = status === 'error';
 
-  // Progress bar row
+  // Progress bar row (running) or queued chip (pending)
   let progressRow = '';
-  if (isActive) {
+  if (isRunning) {
     const pct   = job.pct || 0;
     const stage = esc(job.stage || 'Working…');
     const counts = (job.frames_total > 0)
@@ -606,6 +620,8 @@ function buildStackFooter(sessionName) {
         <div class="stack-progress-fill" style="width:${pct}%"></div>
       </div>
       <div class="stack-stage">${stage}${esc(counts)} ${pct}%</div>`;
+  } else if (isQueued) {
+    progressRow = `<div class="stack-queued-row">⏳ Queued — waiting for active stack to finish</div>`;
   }
 
   // Result thumbnail + view link + log link
@@ -643,14 +659,16 @@ function buildStackFooter(sessionName) {
        </label>`
     : `<span class="stack-mf-label">top ${job.frames_accepted || mfVal} frames</span>`;
 
-  const stackBtn = isActive
+  const stackBtn = isRunning
     ? `<button id="stack-btn-${idSuffix}" class="btn-stack" disabled>Stacking…</button>`
+    : isQueued
+    ? `<button id="stack-btn-${idSuffix}" class="btn-stack" disabled>Queued…</button>`
     : (!isDone && !isError)
-      ? `<button id="stack-btn-${idSuffix}" class="btn-stack"
-           onclick="queueStack('${sn_js}')">Stack</button>`
-      : '';
+    ? `<button id="stack-btn-${idSuffix}" class="btn-stack"
+         onclick="queueStack('${sn_js}')">Stack</button>`
+    : '';
 
-  const cancelBtn = isActive
+  const cancelBtn = isRunning
     ? `<button class="btn-stack-cancel"
          onclick="cancelStack('${sn_js}')"
          title="Stop stacking after current frame">Cancel</button>`

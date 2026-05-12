@@ -1260,6 +1260,13 @@ main {
   color: var(--accent);
 }
 
+.stack-queued-row {
+  font-size: 0.74rem;
+  color: #c8922a;
+  animation: detecting-pulse 1.6s ease-in-out infinite;
+  animation-timing-function: ease-in-out;
+}
+
 .stack-result {
   display: flex;
   align-items: center;

@@ -741,6 +741,11 @@ def api_stack_start():
         "max_frames":   max_frames,
         "use_cache":    use_cache,
     })
+    _broadcast({
+        "type":         "stack_queued",
+        "session_name": session_name,
+        "fits_count":   len(fits_files),
+    })
     return jsonify({"status": "queued", "fits_count": len(fits_files),
                     "max_frames": max_frames, "use_cache": use_cache,
                     "output": output_path})
