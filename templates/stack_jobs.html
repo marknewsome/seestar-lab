@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stack Queue — Seestar Lab</title>
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <style>
+    .sj-page { max-width: 860px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+    .sj-section-title {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      margin: 1.8rem 0 0.6rem;
+      padding-bottom: 0.3rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .sj-empty {
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      padding: 0.6rem 0;
+    }
+    /* ── Job rows ── */
+    .sj-row {
+      display: grid;
+      grid-template-columns: minmax(0,1fr) 90px 110px 80px 90px auto;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.55rem 0.4rem;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.8rem;
+    }
+    .sj-row:last-child { border-bottom: none; }
+    .sj-name {
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .sj-name a { color: var(--text); text-decoration: none; }
+    .sj-name a:hover { color: var(--accent); }
+    .sj-badge {
+      display: inline-block;
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .sj-badge-running  { background: #1a3a5c; color: var(--accent); }
+    .sj-badge-pending  { background: #3a2a00; color: #c8922a; animation: detecting-pulse 1.6s ease-in-out infinite; }
+    .sj-badge-done     { background: #0d2e1a; color: #4caf7a; }
+    .sj-badge-error    { background: #2e0d0d; color: #cf6679; }
+    .sj-badge-cancelled{ background: #1e1e1e; color: var(--text-muted); }
+    .sj-time {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    .sj-frames {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+      text-align: right;
+    }
+    .sj-stage {
+      font-size: 0.72rem;
+      color: var(--accent);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .sj-links {
+      display: flex;
+      gap: 0.4rem;
+      justify-content: flex-end;
+    }
+    .sj-link {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      padding: 0.1rem 0.35rem;
+      border: 1px solid var(--border-hi);
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .sj-link:hover { color: var(--accent); border-color: var(--accent); }
+    /* ── Progress bar (inline, for running row) ── */
+    .sj-progress-wrap {
+      grid-column: 1 / -1;
+      height: 2px;
+      background: var(--border);
+      border-radius: 1px;
+      overflow: hidden;
+      margin-top: -0.3rem;
+    }
+    .sj-progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 1px;
+      transition: width 0.4s ease;
+    }
+    /* ── Header row ── */
+    .sj-header {
+      display: grid;
+      grid-template-columns: minmax(0,1fr) 90px 110px 80px 90px auto;
+      gap: 0.6rem;
+      padding: 0 0.4rem 0.3rem;
+      font-size: 0.67rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+    }
+    .sj-dur { white-space: nowrap; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div class="brand">
+      <span class="brand-icon">✦</span>
+      <span class="brand-name">Seestar Lab</span>
+    </div>
+    <nav class="site-nav">
+      <a class="nav-link" href="/">Sessions</a>
+      <a class="nav-link" href="/catalog/messier">Messier</a>
+      <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+      <a class="nav-link" href="/activity">Activity</a>
+      <a class="nav-link" href="/comet">Comet</a>
+      <a class="nav-link" href="/solar">Solar</a>
+      <a class="nav-link" href="/lunar">Lunar</a>
+      <a class="nav-link" href="/planner">Planner</a>
+      <a class="nav-link" href="/capture">Capture</a>
+      <a class="nav-link active" href="/stack/jobs">Queue</a>
+    </nav>
+  </div>
+</header>
+
+<main class="sj-page">
+  <h1 style="font-size:1.1rem;margin:0 0 0.2rem">Stack Queue &amp; History</h1>
+  <p style="font-size:0.78rem;color:var(--text-muted);margin:0 0 0.5rem">
+    One record per session — shows the most recent run for each object.
+  </p>
+
+  <div class="sj-section-title">Active</div>
+  <div id="sj-active"></div>
+
+  <div class="sj-section-title">History</div>
+  <div id="sj-history"></div>
+</main>
+
+<script>
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso + (iso.endsWith('Z') ? '' : 'Z'));
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+       + ' ' + d.toLocaleDateString([], {month:'short', day:'numeric'});
+}
+
+function fmtDur(startIso, endIso) {
+  if (!startIso || !endIso) return '—';
+  const s = (new Date(endIso + 'Z') - new Date(startIso + 'Z')) / 1000;
+  if (s < 60)  return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m ${Math.round(s%60)}s`;
+  return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+}
+
+function badge(status) {
+  const labels = {running:'Running', pending:'Queued', done:'Done', error:'Error', cancelled:'Cancelled'};
+  const cls    = {running:'running', pending:'pending', done:'done', error:'error', cancelled:'cancelled'};
+  const st = status || 'unknown';
+  return `<span class="sj-badge sj-badge-${cls[st]||'error'}">${esc(labels[st]||st)}</span>`;
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
+let allJobs = {};
+
+function renderActiveRow(j) {
+  const pct   = j.pct || 0;
+  const stage = j.stage || (j.status === 'pending' ? 'Waiting…' : 'Working…');
+  return `
+  <div class="sj-row" id="sjrow-${CSS.escape(j.session_name)}">
+    <div class="sj-name"><a href="/?highlight=${encodeURIComponent(j.session_name)}">${esc(j.session_name)}</a></div>
+    <div>${badge(j.status)}</div>
+    <div class="sj-stage">${esc(stage)} ${j.status==='running' ? pct+'%' : ''}</div>
+    <div class="sj-frames">${j.frames_accepted||0} / ${j.frames_total||'?'}</div>
+    <div class="sj-time">${fmtTime(j.queued_at)}</div>
+    <div class="sj-links"></div>
+    ${j.status==='running' ? `<div class="sj-progress-wrap"><div class="sj-progress-fill" style="width:${pct}%"></div></div>` : ''}
+  </div>`;
+}
+
+function renderHistoryRow(j) {
+  const hasLog = !!j.output_path;
+  const hasImg = j.status === 'done' && !!j.output_path;
+  const links = [
+    hasImg ? `<a class="sj-link" href="/api/stack/image/${encodeURIComponent(j.session_name)}" target="_blank">Image</a>` : '',
+    hasLog ? `<a class="sj-link" href="/api/stack/log/${encodeURIComponent(j.session_name)}" target="_blank">Log</a>` : '',
+  ].filter(Boolean).join('');
+
+  const errorTip = j.error_msg ? ` title="${esc(j.error_msg)}"` : '';
+  const frames = j.frames_total
+    ? `${j.frames_accepted||0} / ${j.frames_total}`
+    : '—';
+
+  return `
+  <div class="sj-row" id="sjrow-${CSS.escape(j.session_name)}">
+    <div class="sj-name"${errorTip}><a href="/?highlight=${encodeURIComponent(j.session_name)}">${esc(j.session_name)}</a></div>
+    <div>${badge(j.status)}</div>
+    <div class="sj-time">${fmtTime(j.finished_at || j.started_at)}</div>
+    <div class="sj-frames">${esc(frames)}</div>
+    <div class="sj-dur sj-time">${fmtDur(j.started_at, j.finished_at)}</div>
+    <div class="sj-links">${links}</div>
+  </div>`;
+}
+
+const HISTORY_HEADER = `
+<div class="sj-header">
+  <div>Session</div><div>Status</div><div>Finished</div>
+  <div style="text-align:right">Frames</div><div>Duration</div><div></div>
+</div>`;
+
+function render() {
+  const jobs = Object.values(allJobs);
+  const active  = jobs.filter(j => j.status === 'running' || j.status === 'pending')
+                      .sort((a,b) => {
+                        // running first, then pending by queued_at
+                        if (a.status !== b.status) return a.status === 'running' ? -1 : 1;
+                        return (a.queued_at||'') < (b.queued_at||'') ? -1 : 1;
+                      });
+  const history = jobs.filter(j => j.status !== 'running' && j.status !== 'pending')
+                      .sort((a,b) => (b.finished_at||b.queued_at||'') < (a.finished_at||a.queued_at||'') ? -1 : 1);
+
+  const aEl = document.getElementById('sj-active');
+  const hEl = document.getElementById('sj-history');
+
+  aEl.innerHTML = active.length
+    ? active.map(renderActiveRow).join('')
+    : '<div class="sj-empty">No active jobs.</div>';
+
+  hEl.innerHTML = history.length
+    ? HISTORY_HEADER + history.map(renderHistoryRow).join('')
+    : '<div class="sj-empty">No completed jobs yet.</div>';
+}
+
+// ── Initial load ──────────────────────────────────────────────────────────────
+async function load() {
+  try {
+    const r = await fetch('/api/stack/status');
+    if (r.ok) allJobs = await r.json();
+  } catch {}
+  render();
+}
+load();
+
+// ── SSE live updates ──────────────────────────────────────────────────────────
+const evtSrc = new EventSource('/api/events');
+evtSrc.onmessage = e => {
+  let ev;
+  try { ev = JSON.parse(e.data); } catch { return; }
+  const sn = ev.session_name;
+  if (!sn) return;
+
+  switch (ev.type) {
+    case 'stack_queued':
+      allJobs[sn] = Object.assign(allJobs[sn] || {session_name: sn}, {
+        status: 'pending', pct: 0, stage: 'Queued…',
+        frames_total: ev.fits_count || 0, frames_accepted: 0,
+      });
+      render();
+      break;
+
+    case 'stack_progress':
+      allJobs[sn] = Object.assign(allJobs[sn] || {session_name: sn}, {
+        status: ev.status || 'running',
+        pct: ev.pct,
+        stage: ev.stage,
+        frames_accepted: ev.frames_accepted,
+        frames_total:    ev.frames_total,
+      });
+      render();
+      break;
+
+    case 'stack_done':
+      allJobs[sn] = Object.assign(allJobs[sn] || {session_name: sn}, {
+        status: 'done', pct: 100, stage: 'Done',
+        frames_accepted: ev.frames_accepted,
+        frames_total:    ev.frames_total,
+        output_path:     ev.output_path,
+        finished_at:     new Date().toISOString().replace('Z',''),
+      });
+      render();
+      break;
+  }
+};
+</script>
+</body>
+</html>

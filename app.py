@@ -757,6 +757,12 @@ def api_stack_status():
     return jsonify(db.get_all_stack_jobs())
 
 
+@app.route("/stack/jobs")
+def stack_jobs_page():
+    """Queue and history page for all stack jobs."""
+    return render_template("stack_jobs.html")
+
+
 @app.route("/api/stack/cancel", methods=["POST"])
 def api_stack_cancel():
     """Signal the active stacking job to stop cleanly."""
