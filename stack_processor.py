@@ -515,54 +515,371 @@ def _auto_crop(img: np.ndarray, valid_mask: np.ndarray, margin: int = 12) -> np.
 _STF_MIDTONE_TARGET = 0.12
 
 
-def _auto_stretch(img: np.ndarray) -> np.ndarray:
+def _auto_stretch(img: np.ndarray, Q: float = 8.0) -> np.ndarray:
     """
-    PixInsight-style MTF auto-stretch, per channel.
+    Per-channel asinh stretch for preview JPEGs.
 
-    Uses ALL pixels (not just positive) for background estimation so the
-    stretch works correctly after SEP background subtraction, where the sky
-    sits near zero with roughly equal positive and negative noise wings.
+    Black point = per-channel median (sky background for sky-dominated images).
+    arcsinh(x·Q) / arcsinh(Q) is linear near zero so noise excursions just
+    above the sky median stay dark, while bright galaxy/star signal is
+    compressed logarithmically.  Power-law (gamma) stretches tiny noise
+    spikes above sky into visible gray; asinh does not.
+    Q controls aggressiveness: 5 = gentle, 8 = moderate, 15 = aggressive.
     """
     result = np.zeros_like(img, dtype=np.float32)
-    m_tgt  = _STF_MIDTONE_TARGET
-
+    denom  = float(np.arcsinh(Q))
     for c in range(3):
-        ch = img[:, :, c].ravel()
-
-        # Estimate background level and noise from all pixels
-        med   = float(np.median(ch))
-        mad   = float(np.median(np.abs(ch - med)))
-        sigma = mad * 1.4826
-
-        # Shadow clipping point: 2.8σ below background median
-        c0 = med - 2.8 * sigma
-        hi = float(np.percentile(ch, 99.9))
-        span = max(hi - c0, 1e-10)
-
-        x     = np.clip((img[:, :, c] - c0) / span, 0.0, 1.0)
-        med_n = float(np.clip((med - c0) / span, 1e-6, 1.0 - 1e-6))
-
-        denom_m = 2.0 * med_n * m_tgt - m_tgt - med_n
-        m = float(med_n * (m_tgt - 1.0) / denom_m) if abs(denom_m) > 1e-10 else 0.5
-        m = max(1e-4, min(1.0 - 1e-4, m))
-
-        denom = (2.0 * m - 1.0) * x - m
-        denom = np.where(np.abs(denom) > 1e-10, denom, np.sign(denom + 1e-30) * 1e-10)
-        result[:, :, c] = np.clip((m - 1.0) * x / denom, 0.0, 1.0)
+        ch   = img[:, :, c]
+        lo   = float(np.median(ch))            # sky background → black
+        hi   = float(np.percentile(ch, 99.9))  # bright stars → white
+        span = max(hi - lo, 1e-10)
+        linear = np.clip((ch - lo) / span, 0.0, 1.0)
+        result[:, :, c] = np.arcsinh(linear * Q) / denom
 
     return result
+
+
+# ── Siril CLI post-processing ─────────────────────────────────────────────────
+
+SIRIL_CLI          = "/mnt/c/Program Files/Siril/bin/siril-cli.exe"
+SIRIL_WIN_WORK_BASE = "/mnt/c/Temp"   # Windows-accessible temp root for Siril jobs
+
+
+def _siril_postprocess(fits_path: str, jpeg_path: str,
+                       progress_cb: Optional[Callable] = None) -> bool:
+    """
+    Call the Windows Siril CLI to produce a finished JPEG from a linear FITS.
+
+    Pipeline: background extraction (degree-1 polynomial) → photometric colour
+    calibration → autostretch → save JPEG.  Falls back silently to our own
+    preview pipeline if Siril is not installed or the script fails.
+
+    Returns True if Siril succeeded, False if fallback is needed.
+    """
+    import subprocess, tempfile, shlex
+
+    if progress_cb is None:
+        progress_cb = lambda p, msg, *a: None
+
+    if not os.path.isfile(SIRIL_CLI):
+        return False
+
+    # wslpath converts Linux paths to Windows UNC / drive paths
+    def to_win(path: str) -> str:
+        try:
+            return subprocess.check_output(
+                ["wslpath", "-w", path], text=True
+            ).strip()
+        except Exception:
+            return path
+
+    fits_win = to_win(fits_path)
+    jpeg_win = to_win(os.path.splitext(jpeg_path)[0])  # Siril appends .jpg itself
+
+    script = (
+        'requires 1.2.0\n'
+        f'load "{fits_win}"\n'
+        'autostretch\n'
+        f'savejpg "{jpeg_win}" 95\n'
+    )
+
+    with tempfile.NamedTemporaryFile(suffix='.ssf', mode='w',
+                                     delete=False, dir='/tmp') as f:
+        f.write(script)
+        script_path = f.name
+
+    script_win = to_win(script_path)
+
+    try:
+        progress_cb(0, "Siril: background extraction + calibration + stretch")
+        result = subprocess.run(
+            [SIRIL_CLI, "-s", script_win],
+            capture_output=True, text=True, timeout=120,
+        )
+        os.unlink(script_path)
+
+        if result.returncode != 0:
+            import logging
+            logging.warning(f"Siril exited {result.returncode}: {result.stderr[:300]}")
+            return False
+
+        # Siril writes <name>.jpg — make sure it landed where we expect
+        expected = os.path.splitext(jpeg_path)[0] + '.jpg'
+        if os.path.isfile(expected) and expected != jpeg_path:
+            os.replace(expected, jpeg_path)
+
+        return True
+
+    except Exception as exc:
+        import logging
+        logging.warning(f"Siril post-processing failed: {exc}")
+        try:
+            os.unlink(script_path)
+        except Exception:
+            pass
+        return False
+
+
+# ── Siril full pipeline (register + stack + preview) ─────────────────────────
+
+def _siril_full_stack(
+    selected_files: list[str],
+    bayer_pattern: str,
+    output_fits: str,
+    progress_cb: Optional[Callable] = None,
+) -> bool:
+    """
+    Use Siril CLI for CFA registration + sigma-clip stacking, then debayer the
+    result in Python to produce a 3-channel linear color FITS at output_fits.
+
+    Siril pipeline (all in CFA/Bayer space):
+      convert light -out=pp_light   → CFA frames indexed as light_ sequence
+      register light_               → star-pattern alignment (sequence r_light_)
+      stack r_light_ rej 3 3        → sigma-clip integration, additive+scale norm
+                                       saves stacked.fit (1-ch float32 Bayer)
+
+    Python post-step: read stacked.fit → debayer → sky-pedestal subtract → save
+    3-channel float32 FITS to output_fits.
+
+    JPEG generation is NOT done here; call _siril_postprocess or the GraXpert
+    pipeline separately on the resulting color FITS.
+
+    Returns True on success, False if Siril is unavailable or the run fails.
+    """
+    import subprocess, shutil, logging
+
+    if not os.path.isfile(SIRIL_CLI):
+        return False
+
+    if progress_cb is None:
+        progress_cb = lambda p, msg, *a: None
+
+    def to_win(path: str) -> str:
+        try:
+            return subprocess.check_output(
+                ["wslpath", "-w", path], text=True
+            ).strip()
+        except Exception:
+            return path
+
+    work_dir = os.path.join(SIRIL_WIN_WORK_BASE, f"seestar_siril_{int(time.time())}")
+
+    try:
+        os.makedirs(work_dir, exist_ok=True)
+
+        # Debayer each selected frame in Python and write 3-channel float32 FITS.
+        # Registering raw CFA Bayer frames creates systematic color cross-talk:
+        # sub-pixel shifts misalign the GRBG grid, and averaged shifted Bayer
+        # patterns produce the purple/green diagonal band artifact.  Pre-debayering
+        # gives Siril proper RGB images so registration and stacking are colour-clean.
+        n = len(selected_files)
+        progress_cb(0, f"Siril: debayering and writing {n} frames to work dir…")
+        try:
+            from astropy.io import fits as _fits
+        except ImportError:
+            logging.warning("astropy not available for pre-debayer write")
+            return False
+
+        for i, src in enumerate(selected_files):
+            raw, _ = _read_fits(src)
+            bgr = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
+            rgb = bgr[:, :, ::-1].transpose(2, 0, 1)          # (3, H, W) RGB
+            hdu = _fits.PrimaryHDU(rgb.astype(np.float32))
+            hdu.header['BUNIT']   = 'normalized'
+            hdu.header['COLORMD'] = 'RGB'
+            hdu.writeto(os.path.join(work_dir, f"light_{i:05d}.fit"), overwrite=True)
+            if (i + 1) % 50 == 0 or i + 1 == n:
+                progress_cb(
+                    int(20 * (i + 1) / n),
+                    f"Siril: debayered {i + 1}/{n} frames",
+                )
+
+        work_win = to_win(work_dir)
+
+        # Register and stack pre-debayered RGB FITS.  Siril v1.4 uses r_ prefix.
+        script = (
+            f'requires 1.2.0\n'
+            f'cd "{work_win}"\n'
+            f'setext fit\n'
+            f'convert light -out=pp_light\n'
+            f'register light_\n'
+            f'stack r_light_ rej 3 3 -norm=addscale -out=stacked\n'
+        )
+
+        script_path = os.path.join(work_dir, "stack.ssf")
+        with open(script_path, 'w') as f:
+            f.write(script)
+
+        logging.info(f"Siril full stack: {n} frames  work={work_dir}")
+        progress_cb(20, f"Siril: registering and stacking {n} frames…")
+
+        proc = subprocess.run(
+            [SIRIL_CLI, "-s", to_win(script_path)],
+            capture_output=True, text=True, timeout=7200,
+        )
+
+        if proc.returncode != 0:
+            logging.warning(
+                f"Siril full stack exit {proc.returncode}\n"
+                f"stdout: {proc.stdout[-1000:]}\n"
+                f"stderr: {proc.stderr[-400:]}"
+            )
+            return False
+
+        stacked_local = os.path.join(work_dir, "stacked.fit")
+        if not os.path.isfile(stacked_local):
+            logging.warning("Siril stack: stacked.fit not found in work dir")
+            return False
+
+        # Read stacked color FITS (already 3-channel — we pre-debayered each frame).
+        progress_cb(85, "Processing stacked color image…")
+        try:
+            from astropy.io import fits as _fits
+            with _fits.open(stacked_local) as hdul:
+                data = hdul[0].data.astype(np.float32)   # (3, H, W) RGB float32
+
+            if data.ndim == 3 and data.shape[0] == 3:
+                bgr = data[::-1].transpose(1, 2, 0).copy()   # RGB→BGR, (H,W,3)
+            elif data.ndim == 2:
+                # Still mono — fallback debayer (shouldn't happen with pre-debayered input)
+                cfa_u16 = np.clip(data * 65535.0, 0, 65535).astype(np.uint16)
+                bgr = _debayer(cfa_u16, bayer_pattern).astype(np.float32) / 65535.0
+            else:
+                logging.warning(f"Siril stack: unexpected FITS shape {data.shape}")
+                return False
+
+            # Crop the registration border using per-row IQR of the green channel.
+            # Partial-coverage border rows have higher pixel-to-pixel variance than
+            # fully-stacked sky rows; galaxy rows also spike but they're in the
+            # middle third so we only scan the outer third from each edge.
+            # FITS row 0 = bottom of the actual image, so "top border" = high rows.
+            g_fits = data[1]   # green plane in FITS orientation (row 0 = image bottom)
+            H_f    = g_fits.shape[0]
+            row_iqr = (np.percentile(g_fits, 75, axis=1)
+                     - np.percentile(g_fits, 25, axis=1))
+            mid_iqr   = float(np.median(row_iqr[H_f // 3 : 2 * H_f // 3]))
+            border_thr = 1.5 * mid_iqr
+            outer      = H_f // 3
+
+            top_crop = H_f
+            for i in range(H_f - 1, H_f - outer, -1):
+                if row_iqr[i] <= border_thr:
+                    top_crop = i + 1
+                    break
+            bot_crop = 0
+            for i in range(0, outer):
+                if row_iqr[i] <= border_thr:
+                    bot_crop = i
+                    break
+
+            # Apply column crop with the same zero-based mask
+            lum_cols = bgr.sum(axis=2)
+            valid_cols = np.where(lum_cols.min(axis=0) > 0)[0]
+            c0 = int(valid_cols[0])  if valid_cols.size else 0
+            c1 = int(valid_cols[-1]) + 1 if valid_cols.size else bgr.shape[1]
+
+            bgr = bgr[bot_crop:top_crop, c0:c1]
+
+            # Subtract per-channel 5th-percentile so sky sits near 0
+            for c in range(3):
+                sky = float(np.percentile(bgr[:, :, c], 5))
+                bgr[:, :, c] = np.clip(bgr[:, :, c] - sky, 0.0, None)
+
+            _write_fits(output_fits, bgr, Path(output_fits).stem)
+        except Exception as exc:
+            logging.warning(f"Siril stack: FITS-read/write failed: {exc}")
+            return False
+
+        progress_cb(100, "Siril stacking complete")
+        return True
+
+    except subprocess.TimeoutExpired:
+        logging.warning("Siril full stack timed out after 2 hours")
+        return False
+    except Exception as exc:
+        logging.warning(f"Siril full stack error: {exc}")
+        return False
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ── AI denoising (GraXpert) ───────────────────────────────────────────────────
+
+def _graxpert_denoise(img_bgr: np.ndarray, strength: float = 0.8) -> np.ndarray:
+    """
+    GraXpert AI denoising on a linear float32 BGR image in [0, 1].
+    Downloads the ONNX model on first call; uses CUDA if available.
+    Falls back silently to the original image on any error.
+
+    Monkey-patches graxpert.ai_model_handling.run_in_process to a no-op so
+    that inference runs in-process rather than in a forked child.  GraXpert
+    forks to guard against ROCm crashes, but the fork corrupts the CUDA
+    context on WSL2 (CUDA is not fork-safe), causing GPU=-1 failures.
+    Running in-process is safe for CUDA/TensorRT providers.
+    """
+    try:
+        import graxpert.ai_model_handling as _gxh
+        from graxpert.denoising import denoise as _gx_denoise
+        from graxpert.ai_model_handling import (
+            denoise_ai_models_dir, ai_model_path_from_version,
+            download_version, latest_version, list_local_versions,
+        )
+        from graxpert.s3_secrets import denoise_bucket_name
+
+        # Bypass the fork-based subprocess wrapper — run inference in-process
+        # so the CUDA session (created in-process) stays on the same CUDA ctx.
+        _orig_run_in_process = _gxh.run_in_process
+        _gxh.run_in_process = lambda fn: fn()
+
+        try:
+            local = list_local_versions(denoise_ai_models_dir)
+            if local:
+                ai_version = sorted(local, key=lambda v: v['version'])[-1]['version']
+            else:
+                ai_version = latest_version(denoise_ai_models_dir, denoise_bucket_name)
+                download_version(denoise_ai_models_dir, denoise_bucket_name, ai_version)
+
+            ai_path = ai_model_path_from_version(denoise_ai_models_dir, ai_version)
+
+            # GraXpert expects (H, W, 3) float32 RGB in [0, 1]
+            rgb    = np.clip(img_bgr[:, :, ::-1], 0.0, 1.0).astype(np.float32)
+            result = _gx_denoise(rgb, ai_path, strength, batch_size=8, ai_gpu_acceleration=True)
+        finally:
+            _gxh.run_in_process = _orig_run_in_process
+
+        if result is None:
+            return img_bgr
+        return result[:, :, ::-1].astype(np.float32)   # RGB → BGR
+    except Exception:
+        return img_bgr
 
 
 # ── Enhancement ───────────────────────────────────────────────────────────────
 
 def _denoise_sharpen(img: np.ndarray) -> np.ndarray:
-    """NLM colour denoising + unsharp-mask sharpening. img: uint8 BGR."""
-    denoised  = cv2.fastNlMeansDenoisingColored(
-        img, None, h=6, hColor=6,
-        templateWindowSize=7, searchWindowSize=21,
-    )
-    blurred   = cv2.GaussianBlur(denoised, (0, 0), 1.2)
-    sharpened = cv2.addWeighted(denoised, 1.6, blurred, -0.6, 0)
+    """
+    Chroma Gaussian + unsharp-mask sharpening.  img: uint8 BGR.
+
+    Runs on the stretch uint8 image to kill residual speckles that GraXpert
+    leaves in the linear domain.  Applies moderate luma smoothing + heavy
+    chroma smoothing, then a gentle unsharp mask for apparent sharpness.
+    """
+    ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+
+    # Luma: gentle smoothing suppresses bright luma speckles in dark sky areas
+    y_dn  = cv2.GaussianBlur(y,  (7,  7),  2)
+
+    # Chroma: aggressive blur kills all residual coloured Bayer speckles
+    cr_dn = cv2.GaussianBlur(cr, (31, 31), 10)
+    cb_dn = cv2.GaussianBlur(cb, (31, 31), 10)
+
+    denoised = cv2.cvtColor(cv2.merge([y_dn, cr_dn, cb_dn]), cv2.COLOR_YCrCb2BGR)
+
+    # Gentle unsharp mask — just enough to restore star and core sharpness
+    # without amplifying residual noise.
+    blurred   = cv2.GaussianBlur(denoised, (0, 0), 1.5)
+    sharpened = cv2.addWeighted(denoised, 1.4, blurred, -0.4, 0)
     return sharpened
 
 
@@ -823,6 +1140,86 @@ class StackProcessor:
             _chk()
 
             # ════════════════════════════════════════════════════════════════
+            # SIRIL PATH — let Siril handle registration, stacking, and preview
+            #
+            # Siril is a well-tested astronomical image processor.  We hand it
+            # the quality-filtered frame list and it does:
+            #   convert light → debayer CFA Bayer frames
+            #   register      → star-pattern alignment
+            #   stack rej     → sigma-clip integration with additive scaling
+            #   autostretch   → preview stretch
+            #   savejpg       → final JPEG
+            #
+            # If Siril is unavailable (SIRIL_CLI not found) or the run fails,
+            # we fall through to our own Python pipeline below.
+            # ════════════════════════════════════════════════════════════════
+            fits_path = str(Path(output_path).with_suffix('.fits'))
+            out_dir   = os.path.dirname(os.path.abspath(output_path))
+            os.makedirs(out_dir, exist_ok=True)
+
+            progress_cb(37,
+                        f"Siril: register + stack ({n_selected} frames)…",
+                        n_selected, total)
+            siril_stack_ok = _siril_full_stack(
+                selected_files, bayer_pattern, fits_path,
+                progress_cb=lambda p, msg, *_a: progress_cb(
+                    37 + int(p * 0.50), msg, n_selected, total
+                ),
+            )
+            if siril_stack_ok:
+                run_stats['aligned']        = n_selected
+                run_stats['rejected_align'] = 0
+
+                # Generate preview JPEG from the color FITS Siril produced.
+                # Try Siril autostretch first; fall back to our own pipeline.
+                progress_cb(87, "Post-processing preview…", n_selected, total)
+                siril_preview_ok = _siril_postprocess(
+                    fits_path, str(output_path),
+                    progress_cb=lambda p, msg, *_a: progress_cb(
+                        87 + int(p * 0.10), msg, n_selected, total
+                    ),
+                )
+                if not siril_preview_ok:
+                    # Fallback: GraXpert + asinh stretch
+                    try:
+                        from astropy.io import fits as _fits
+                        with _fits.open(fits_path) as hdul:
+                            d = hdul[0].data.astype(np.float32)
+                        bgr_prev = d[::-1].transpose(1, 2, 0).copy() if d.ndim == 3 and d.shape[0] == 3 else d
+                        bgr_prev = _graxpert_denoise(bgr_prev, strength=1.0)
+                        bgr_prev = _scnr_green(bgr_prev)
+                        preview  = _auto_stretch(bgr_prev)
+                        preview_u8 = (preview * 255).astype(np.uint8)
+                        preview_u8 = _denoise_sharpen(preview_u8)
+                        cv2.imwrite(str(output_path), preview_u8,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    except Exception:
+                        pass
+
+                run_stats['elapsed_s'] = round(time.monotonic() - t_start, 1)
+                log_path = str(Path(output_path).with_suffix('.log'))
+                _write_stack_log(log_path, run_stats, output_path)
+                if tmp_dir is not None:
+                    try:
+                        if os.path.isdir(cache_dir):
+                            shutil.rmtree(cache_dir)
+                        shutil.move(tmp_dir, cache_dir)
+                        tmp_dir = None
+                    except Exception:
+                        pass
+                progress_cb(100, "Done", n_selected, total)
+                return {
+                    "frames_total":    total,
+                    "frames_accepted": n_selected,
+                    "output_path":     output_path,
+                    "log_path":        log_path,
+                }
+
+            # Siril unavailable or failed — fall through to built-in pipeline
+            progress_cb(37, "Siril not available; using built-in pipeline",
+                        n_selected, total)
+
+            # ════════════════════════════════════════════════════════════════
             # STEP 4 — align remaining frames (astroalign with guardrails)
             # No per-frame normalization here — normalization happens globally
             # after all frames are aligned.
@@ -837,54 +1234,108 @@ class StackProcessor:
             ref_lum    = _lum_for_registration(ref_lum_raw)
             h, w = ref_bgr.shape[:2]
 
-            # Pre-allocate stack array in float16 to halve peak RAM.
-            # float16 gives ~3 significant decimal digits on [0,1] data — more
-            # than enough for stacking; sigma-clip operates in float32 per chunk.
-            stack_arr = np.zeros((n_selected, h, w, 3), dtype=np.float16)
-            stack_arr[0] = ref_bgr  # float32 → float16 truncation is automatic
-            n_accepted   = 1
+            # ════════════════════════════════════════════════════════════════
+            # STEPS 4–8 — batch align + integrate
+            #
+            # Process BATCH_SIZE frames at a time so peak RAM is O(BATCH_SIZE)
+            # rather than O(n_selected).  Each batch is sigma-clip integrated
+            # into a float32 frame; batches are combined via weighted sum
+            # (weight = accepted frame count).  Sky normalisation happens
+            # per-frame against the reference-frame sky level so it works
+            # correctly across batch boundaries.
+            # ════════════════════════════════════════════════════════════════
+            ref_sky = (float(np.percentile(ref_bgr[ref_bgr > 0], 25))
+                       if (ref_bgr > 0).any() else 0.0)
 
-            # Running valid-pixel intersection — one bool array instead of a list
-            # of N arrays (saves ~2.5 GB at 1200 frames vs storing all masks).
+            BATCH_SIZE       = 400
+            n_batches        = (n_selected + BATCH_SIZE - 1) // BATCH_SIZE
+            weighted_sum     = None          # float32 H×W×3 running accumulator
+            n_accepted       = 0
             all_valid_native = np.ones((h, w), dtype=bool)
-            stk_metrics: list[dict] = [sel_metrics[ref_rank_idx]]
 
-            for fi, fpath in enumerate(selected_files):
-                _chk()
-                if fi == ref_rank_idx:
+            for b_idx in range(n_batches):
+                batch_start = b_idx * BATCH_SIZE
+                batch_end   = min(batch_start + BATCH_SIZE, n_selected)
+                batch_fis   = range(batch_start, batch_end)
+
+                batch_arr     = np.zeros((len(batch_fis), h, w, 3), dtype=np.float16)
+                batch_valid   = np.ones((h, w), dtype=bool)
+                batch_metrics: list[dict] = []
+                n_batch       = 0
+
+                for fi in batch_fis:
+                    _chk()
+                    fpath = selected_files[fi]
+                    pct   = 37 + int(38 * (fi + 1) / n_selected)
+                    progress_cb(pct,
+                                f"Aligning {fi + 1}/{n_selected} "
+                                f"(batch {b_idx + 1}/{n_batches})",
+                                n_selected, total)
+                    try:
+                        if fi == ref_rank_idx:
+                            bgr   = ref_bgr.copy()
+                            valid = np.ones((h, w), dtype=bool)
+                        else:
+                            raw, _        = _read_fits(fpath)
+                            bgr           = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
+                            frame_lum_raw = (0.299 * bgr[:, :, 2]
+                                           + 0.587 * bgr[:, :, 1]
+                                           + 0.114 * bgr[:, :, 0])
+                            frame_lum     = _lum_for_registration(frame_lum_raw)
+                            gray8 = _to_gray8(bgr)
+                            warp  = _register(ref_gray8, gray8, ref_lum, frame_lum)
+                            if warp is None:
+                                continue
+
+                            bgr   = cv2.warpAffine(
+                                bgr, warp, (w, h),
+                                flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                            )
+                            ones  = np.ones((h, w), dtype=np.float32)
+                            valid = cv2.warpAffine(
+                                ones, warp, (w, h),
+                                flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                            ) > 0.5
+
+                        # Normalise each frame's sky to the reference sky level
+                        frame_sky = (float(np.percentile(bgr[bgr > 0], 25))
+                                     if (bgr > 0).any() else 0.0)
+                        if frame_sky > 0 and ref_sky > 0:
+                            bgr = np.clip(bgr + (ref_sky - frame_sky), 0.0, None)
+
+                        batch_arr[n_batch] = bgr
+                        n_batch += 1
+                        batch_valid  &= valid
+                        batch_metrics.append(sel_metrics[fi])
+                    except Exception:
+                        pass
+
+                if n_batch < 1:
                     continue
-                pct = 37 + int(38 * (fi + 1) / n_selected)
-                progress_cb(pct, f"Aligning {fi + 1}/{n_selected}", n_selected, total)
-                try:
-                    raw, _        = _read_fits(fpath)
-                    bgr           = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
-                    frame_lum_raw = (0.299 * bgr[:,:,2]
-                                   + 0.587 * bgr[:,:,1]
-                                   + 0.114 * bgr[:,:,0])
-                    frame_lum     = _lum_for_registration(frame_lum_raw)
-                    gray8 = _to_gray8(bgr)
-                    warp  = _register(ref_gray8, gray8, ref_lum, frame_lum)
-                    if warp is None:
-                        continue
 
-                    aligned = cv2.warpAffine(
-                        bgr, warp, (w, h),
-                        flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
-                        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-                    )
-                    ones  = np.ones((h, w), dtype=np.float32)
-                    valid = cv2.warpAffine(
-                        ones, warp, (w, h),
-                        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
-                        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-                    ) > 0.5
+                # Sigma-clip integrate this batch → one float32 frame
+                progress_cb(
+                    37 + int(38 * batch_end / n_selected),
+                    f"Integrating batch {b_idx + 1}/{n_batches} ({n_batch} frames)",
+                    n_accepted + n_batch, total,
+                )
+                _chk()
+                raw_weights = np.array([_compute_weight(m) for m in batch_metrics],
+                                       dtype=np.float32)
+                if raw_weights.sum() == 0:
+                    raw_weights = np.ones(n_batch, dtype=np.float32)
 
-                    stack_arr[n_accepted] = aligned
-                    n_accepted += 1
-                    all_valid_native &= valid   # fold into running intersection
-                    stk_metrics.append(sel_metrics[fi])
-                except Exception:
-                    pass
+                batch_result = _weighted_sigma_clip(batch_arr[:n_batch], raw_weights)
+                del batch_arr
+
+                if weighted_sum is None:
+                    weighted_sum = n_batch * batch_result.astype(np.float32)
+                else:
+                    weighted_sum += n_batch * batch_result.astype(np.float32)
+                n_accepted       += n_batch
+                all_valid_native &= batch_valid
 
             n_dropped_align = n_selected - n_accepted
             run_stats['aligned']        = n_accepted
@@ -895,49 +1346,14 @@ class StackProcessor:
                         n_accepted, total)
             _chk()
 
-            if n_accepted < MIN_FRAMES:
+            if n_accepted < MIN_FRAMES or weighted_sum is None:
                 raise RuntimeError(
                     f"Only {n_accepted}/{n_selected} frames registered successfully "
                     f"(need {MIN_FRAMES}) — check that frames overlap the reference field"
                 )
 
-            stack_arr = stack_arr[:n_accepted]
-
-            # ════════════════════════════════════════════════════════════════
-            # STEPS 5–6 — global sky normalization (additive, post-alignment)
-            # Compute per-frame sky level from aligned data, then shift each
-            # frame by (global_median_sky - frame_sky).  Done after alignment
-            # so estimates are accurate and corrections are consistent across
-            # the ensemble.
-            # ════════════════════════════════════════════════════════════════
-            progress_cb(75, "Global sky normalization…", n_accepted, total)
-            _chk()
-            frame_skies = np.array([
-                float(np.percentile(stack_arr[i][stack_arr[i] > 0], 25))
-                if (stack_arr[i] > 0).any() else 0.0
-                for i in range(n_accepted)
-            ], dtype=np.float32)
-            global_sky = float(np.median(frame_skies))
-            for i in range(n_accepted):
-                if frame_skies[i] > 0:
-                    stack_arr[i] = np.clip(
-                        stack_arr[i] + (global_sky - frame_skies[i]), 0.0, None
-                    )
-
-            # ════════════════════════════════════════════════════════════════
-            # STEPS 7–8 — sigma-clip across normalized stack → weighted mean
-            # ════════════════════════════════════════════════════════════════
-            progress_cb(77, f"Integrating {n_accepted} frames (weighted σ-clip mean)",
-                        n_accepted, total)
-            _chk()
-
-            raw_weights = np.array([_compute_weight(m) for m in stk_metrics],
-                                   dtype=np.float32)
-            if raw_weights.sum() == 0:
-                raw_weights = np.ones(n_accepted, dtype=np.float32)
-
-            stacked = _weighted_sigma_clip(stack_arr, raw_weights)
-            del stack_arr
+            stacked = weighted_sum / n_accepted
+            del weighted_sum
 
             # ── 2× upsample ───────────────────────────────────────────────────
             progress_cb(82, "Upsampling 2×", n_accepted, total)
@@ -949,48 +1365,76 @@ class StackProcessor:
             ).astype(bool)
 
             # ── Background subtraction ─────────────────────────────────────────
-            progress_cb(84, "Removing background gradient", n_accepted, total)
-            _chk()
-            stacked = _subtract_background(stacked, grid=16)
-
             # ── Crop ───────────────────────────────────────────────────────────
-            progress_cb(86, "Cropping to valid overlap region", n_accepted, total)
-            stacked = _auto_crop(stacked, all_valid)
+            # Background subtraction is NOT applied to the stacked image here.
+            # For large extended objects (M101, M31, etc.) SEP mesh cells are
+            # far smaller than the galaxy disk and would subtract signal as sky.
+            # The FITS is delivered as raw linear data; Siril/PixInsight handle
+            # background removal better with proper large-object masking.
+            # The preview path uses its own pre-crop snapshot (preview_source).
+            progress_cb(84, "Cropping to valid overlap region", n_accepted, total)
+            preview_source = stacked.copy()
+            stacked        = _auto_crop(stacked, all_valid)
+            preview_source = _auto_crop(preview_source, all_valid)
 
             # ── Colour calibration ─────────────────────────────────────────────
             progress_cb(87, "Colour calibration", n_accepted, total)
             _chk()
-            stacked = _color_calibrate(stacked)
+            stacked        = _color_calibrate(stacked)
+            preview_source = _color_calibrate(preview_source)
 
             # ════════════════════════════════════════════════════════════════
             # STEP 9 — save linear master FITS (primary output)
-            # The FITS is the deliverable; JPEG is preview only.
+            # Subtract per-channel sky pedestal (global constant) so sky pixels
+            # sit near 0.  This is not background-gradient removal — it's just
+            # removing the DC offset so Siril/PixInsight autostretch works
+            # correctly.  A scalar subtraction cannot distort the galaxy shape.
             # ════════════════════════════════════════════════════════════════
             fits_path = str(Path(output_path).with_suffix('.fits'))
             progress_cb(89, "Saving linear master FITS", n_accepted, total)
-            _write_fits(fits_path, stacked, Path(output_path).stem)
+            fits_data = stacked.copy()
+            for c in range(3):
+                sky = float(np.percentile(fits_data[:, :, c], 5))
+                fits_data[:, :, c] = np.clip(fits_data[:, :, c] - sky, 0.0, None)
+            _write_fits(fits_path, fits_data, Path(output_path).stem)
 
             # ════════════════════════════════════════════════════════════════
-            # STEP 10 — preview JPEG (stretch + denoise, never linear)
+            # STEP 10 — preview JPEG
+            # Try Siril CLI first (background extraction + PCC + autostretch).
+            # Fall back to our own GraXpert+asinh pipeline if Siril is absent.
             # ════════════════════════════════════════════════════════════════
-            progress_cb(90, "Auto-stretch (preview)", n_accepted, total)
-            _chk()
-            preview = _auto_stretch(stacked.copy())
-
-            progress_cb(95, "Noise reduction and sharpening (preview)", n_accepted, total)
-            _chk()
-            preview_u8 = (preview * 255).astype(np.uint8)
-            preview_u8 = _denoise_sharpen(preview_u8)
-
-            progress_cb(97, "Saving preview JPEG", n_accepted, total)
             out_dir = os.path.dirname(os.path.abspath(output_path))
             os.makedirs(out_dir, exist_ok=True)
-            ok = cv2.imwrite(
-                str(output_path), preview_u8,
-                [cv2.IMWRITE_JPEG_QUALITY, 95],
+
+            progress_cb(90, "Post-processing preview (Siril)", n_accepted, total)
+            _chk()
+            siril_ok = _siril_postprocess(
+                fits_path, str(output_path),
+                progress_cb=lambda p, msg, *a: progress_cb(
+                    90 + int(p * 0.09), msg, n_accepted, total
+                ),
             )
-            if not ok:
-                raise RuntimeError(f"Failed to write preview JPEG to {output_path}")
+
+            if not siril_ok:
+                # Fallback: GraXpert + asinh stretch + chroma denoising
+                progress_cb(90, "AI denoising (GraXpert)", n_accepted, total)
+                _chk()
+                preview_source = _graxpert_denoise(preview_source, strength=1.0)
+                preview_source = _scnr_green(preview_source)
+
+                progress_cb(95, "Auto-stretch (preview)", n_accepted, total)
+                _chk()
+                preview    = _auto_stretch(preview_source)
+                preview_u8 = (preview * 255).astype(np.uint8)
+                preview_u8 = _denoise_sharpen(preview_u8)
+
+                progress_cb(97, "Saving preview JPEG", n_accepted, total)
+                ok = cv2.imwrite(
+                    str(output_path), preview_u8,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95],
+                )
+                if not ok:
+                    raise RuntimeError(f"Failed to write preview JPEG to {output_path}")
 
             run_stats['elapsed_s'] = round(time.monotonic() - t_start, 1)
             log_path = str(Path(output_path).with_suffix('.log'))
@@ -1016,3 +1460,69 @@ class StackProcessor:
         finally:
             if tmp_dir is not None:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def rerender_preview(fits_path: str, jpeg_path: str,
+                     progress_cb: Optional[Callable] = None) -> str:
+    """
+    Regenerate the preview JPEG from an already-stacked FITS file.
+
+    Applies the full current preview pipeline (GraXpert, SCNR, asinh stretch,
+    chroma denoising, unsharp mask) without re-running frame alignment.
+    Useful for tuning the preview without an 80-minute re-stack.
+
+    Returns the path of the written JPEG.
+    """
+    if progress_cb is None:
+        progress_cb = lambda p, msg, *a: None
+
+    progress_cb(5, "Loading FITS", 0, 0)
+    try:
+        from astropy.io import fits as _fits
+        with _fits.open(fits_path) as hdul:
+            data = hdul[0].data.astype(np.float32)
+    except Exception as e:
+        raise RuntimeError(f"Cannot read FITS: {e}")
+
+    if data.ndim == 3 and data.shape[0] == 3:
+        # FITS plane order is RGB → convert to BGR float32
+        bgr = data[::-1].transpose(1, 2, 0).copy()
+    elif data.ndim == 3 and data.shape[2] == 3:
+        bgr = data[:, :, ::-1].copy()
+    else:
+        raise RuntimeError(f"Unexpected FITS shape: {data.shape}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(jpeg_path)), exist_ok=True)
+
+    progress_cb(10, "Post-processing (Siril)", 0, 0)
+    siril_ok = _siril_postprocess(fits_path, jpeg_path,
+                                   progress_cb=lambda p, msg, *a: progress_cb(
+                                       10 + int(p * 0.85), msg, 0, 0))
+    if siril_ok:
+        progress_cb(100, "Done", 0, 0)
+        return jpeg_path
+
+    # Fallback: our own pipeline
+    progress_cb(20, "Colour calibration", 0, 0)
+    bgr = _color_calibrate(bgr)
+
+    progress_cb(40, "AI denoising (GraXpert)", 0, 0)
+    bgr = _graxpert_denoise(bgr, strength=1.0)
+
+    progress_cb(70, "SCNR green suppression", 0, 0)
+    bgr = _scnr_green(bgr)
+
+    progress_cb(80, "Auto-stretch", 0, 0)
+    preview = _auto_stretch(bgr)
+
+    progress_cb(90, "Noise reduction and sharpening", 0, 0)
+    preview_u8 = (preview * 255).astype(np.uint8)
+    preview_u8 = _denoise_sharpen(preview_u8)
+
+    progress_cb(97, "Saving JPEG", 0, 0)
+    ok = cv2.imwrite(jpeg_path, preview_u8, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not ok:
+        raise RuntimeError(f"Failed to write JPEG to {jpeg_path}")
+
+    progress_cb(100, "Done", 0, 0)
+    return jpeg_path

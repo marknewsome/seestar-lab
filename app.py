@@ -792,6 +792,52 @@ def api_stack_log(session_name: str):
     return send_file(log_path, mimetype="text/plain")
 
 
+@app.route("/api/stack/rerender/<path:session_name>", methods=["POST"])
+def api_stack_rerender(session_name: str):
+    """
+    Regenerate the preview JPEG from the existing stacked FITS without
+    re-running frame alignment.  Applies the current preview pipeline
+    (GraXpert, SCNR, asinh stretch, chroma denoising).
+    Runs in a background thread; poll /api/stack/status for progress.
+    """
+    job = db.get_stack_job(session_name)
+    if not job or not job.get("output_path"):
+        abort(404, "No completed stack job for this session")
+
+    from pathlib import Path
+    output_path = job["output_path"]
+    fits_path   = str(Path(output_path).with_suffix('.fits'))
+    if not os.path.isfile(fits_path):
+        abort(404, "FITS file not found — run a full stack first")
+
+    def _rerender_worker():
+        from stack_processor import rerender_preview
+        db.start_stack_job(session_name)
+
+        def progress_cb(pct, stage, *_):
+            db.update_stack_job_progress(session_name, pct, stage, 0, 0)
+            _stack_broadcast({
+                "type": "stack_progress",
+                "session": session_name,
+                "pct": pct,
+                "stage": stage,
+            })
+
+        try:
+            rerender_preview(fits_path, output_path, progress_cb)
+            db.finish_stack_job(session_name, output_path, 0, 0)
+            _stack_broadcast({"type": "stack_done", "session": session_name,
+                               "pct": 100, "stage": "Re-render complete"})
+        except Exception as exc:
+            db.fail_stack_job(session_name, str(exc))
+            _stack_broadcast({"type": "stack_progress", "session": session_name,
+                               "pct": -1, "stage": f"Error: {exc}"})
+
+    t = threading.Thread(target=_rerender_worker, daemon=True)
+    t.start()
+    return jsonify({"status": "rerender_started", "session": session_name})
+
+
 @app.route("/impacts")
 def impacts() -> str:
     return render_template("impacts.html", data_dir=DATA_DIR)

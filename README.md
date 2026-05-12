@@ -18,7 +18,7 @@ track-path composite.
 | **Image gallery** | Seestar-stacked JPEGs for non-`_sub` comet sessions are browsable via prev/next arrows on the card thumbnail and a full-screen lightbox |
 | **User ratings** | Three-state satisfaction dot on every session card and bingo card: Satisfied (green) / Want more time (amber) / Priority re-image (red). Click to cycle; persists across rescans. "Re-image" filter in the Observing Planner surfaces want-more and priority targets. |
 | **Observing notes** | Free-text textarea on each session card for conditions, issues, and goals. Saves automatically on blur or Ctrl+Enter. A truncated snippet with full-text tooltip appears on bingo cards. |
-| **Sub-frame stacking** | Two-pass pipeline stacks raw `.fit` sub-frames: sharpness-ranked quality selection, local SSD copy of selected frames, per-frame sky background normalisation, ECC alignment, weighted sigma-clip integration, background gradient removal, auto-crop, colour stretch, denoising, and sharpening. Configurable frame cap (`max_frames`); cancelable at any point. |
+| **Sub-frame stacking** | Hybrid pipeline stacks raw `.fit` sub-frames: sharpness + SEP quality selection in Python, per-frame pre-debayer to 3-channel RGB FITS, then Siril CLI for registration and sigma-clip stacking, followed by IQR border crop and JPEG generation. Configurable frame cap (`max_frames`); cancelable at any point. |
 | **Comet wizard** | Step-by-step pipeline for `_sub` comet folders: frame selection, stretch/parameter tuning with live preview, stars-fixed animation, comet-nucleus-fixed animation, track composite, and annotated frame review |
 | **Catalog scoreboard** | Messier and Caldwell bingo-card views show which objects have been captured, with progress bar and type filters |
 | **Poster printing** | One-click 13×19" landscape poster of the full Messier or Caldwell catalog: captured objects show their thumbnail, uncaptured show a muted placeholder; designed for photo printers |
@@ -77,7 +77,7 @@ on startup, then idles until the user requests a rescan or transit detection.
 app.py               Flask routes, SSE broadcaster, stack job queue, comet job queue
 scanner.py           Filesystem crawler; builds and diffs session records
 db.py                SQLite persistence (sessions, scanned dirs, stack jobs, meteor impacts)
-stack_processor.py   Sub-frame stacking pipeline (registration, sigma-clip, stretch, denoise)
+stack_processor.py   Sub-frame stacking pipeline (quality selection, pre-debayer, Siril registration+stack, IQR crop)
 comet_processor.py   Comet animation pipeline (star alignment, nucleus detection, animations, track composite)
 catalogs.py          Messier / Caldwell catalog data and DSO type/group mappings
 object_catalog.py    Object-type detection (solar/lunar/planet/comet/messier/…) and descriptions
@@ -152,42 +152,46 @@ stacked JPEG is saved and displayed as the session thumbnail.
 
 ### Pipeline stages
 
-| # | Stage | Details |
-|---|---|---|
-| 1 | **SSD copy** | All source frames are copied sequentially to a local temp directory before any processing begins. The source drive (spinning or network mount) is read exactly once; every subsequent operation reads from local SSD. The temp dir is cleaned up automatically on completion, error, or cancel. |
-| 2 | **Pass 1 — quality scan** | Each temp-dir FITS file is read once (raw Bayer uint16 only, no debayer). Laplacian-variance sharpness is scored on the centre quarter. Fully sequential SSD reads — no more drive-head noise during the scan. |
-| 3 | **Frame selection** | Frames below 40 % of the median sharpness score are rejected. The surviving frames are sorted by score descending and capped at `max_frames` (default 500), then re-sorted to original on-disk order for pass 2. |
-| 4 | **Pass 2 — registration** | Each selected frame is debayered (RGGB → BGR), sky background is normalised to the reference frame's level (additive shift), and aligned to the sharpest accepted frame via `cv2.findTransformECC` (`MOTION_EUCLIDEAN`). Falls back to phase correlation if ECC fails. |
-| 4 | **Weighted sigma-clip integration** | Per-frame quality weights (FWHM, eccentricity, SNR via SEP) drive a MAD-based sigma-clip (σ = 2.5) that rejects hot pixels, cosmic rays, and satellite trails. Processing is chunked (128 rows at a time) to bound peak RAM. |
-| 5 | **2× upsample** | Lanczos-4 resize to match the Seestar's own stacked-image resolution. |
-| 6 | **Background subtraction** | A 16 × 16 grid samples 20th-percentile pixel values; a degree-2 2-D polynomial is fit and subtracted to remove gradient vignetting. |
-| 7 | **Auto-crop** | The intersection of all valid-pixel masks is computed from the alignment warps; a tight bounding rectangle removes dark rotation-artefact borders. |
-| 8 | **Colour calibration** | Background neutralisation + star white-balance via SEP source extraction. |
-| 9 | **Auto-stretch** | PixInsight-style MTF Screen Transfer Function per channel for natural colour rendition. |
-| 10 | **Denoise + sharpen** | NLM denoising followed by a weighted unsharp mask. |
-| 11 | **Save** | Linear float32 FITS (`.fits`) written alongside the final `seestar_stacked.jpg` (JPEG quality 95). |
+The pipeline is split between Python (quality selection and pre-debayering) and the
+[Siril](https://siril.org/) CLI (registration and stacking).  Siril must be installed on
+Windows and reachable at `C:\Program Files\Siril\bin\siril-cli.exe` from WSL2.
+
+| # | Stage | Who | Details |
+|---|---|---|---|
+| 1 | **Sharpness scan** | Python | Each FITS file is read as raw Bayer uint16. Laplacian-variance sharpness is scored on the centre quarter. |
+| 2 | **SEP quality metrics** | Python | Source Extractor Python (SEP) measures FWHM, eccentricity, and SNR per frame. Combined with sharpness to rank frames. |
+| 3 | **Frame selection** | Python | Frames below 40 % of median sharpness are rejected. Survivors are sorted by combined score and capped at `max_frames` (default 500). |
+| 4 | **Pre-debayer** | Python | Each selected frame is debayered to BGR, converted to float32/65535, transposed to 3-channel (R,G,B) FITS, and written to `C:\Temp\seestar_siril_{ts}\light_NNNNN.fit`. Siril receives proper colour images — no Bayer-grid registration artifacts. |
+| 5 | **Convert + Register** | Siril | `convert light -out=pp_light` collects all `light*.fit` files into a Siril sequence. `register light_` computes inter-frame transforms using star-pattern matching. |
+| 6 | **Sigma-clip stack** | Siril | `stack r_light_ rej 3 3 -norm=addscale -out=stacked` integrates frames with additive-scale normalisation and 3σ rejection, suppressing hot pixels, cosmic rays, and satellite trails. |
+| 7 | **IQR border crop** | Python | Per-row inter-quartile range of the green channel identifies partial-coverage border rows left by registration. Rows with IQR > 1.5 × median IQR of the image centre are trimmed from top and bottom; leftmost/rightmost fully-covered columns are found by luminance mask. |
+| 8 | **Sky pedestal subtract** | Python | Global sky level removed. |
+| 9 | **Save FITS** | Python | Linear float32 colour FITS written alongside the output directory. |
+| 10 | **JPEG preview** | Siril / GraXpert | `_siril_postprocess` applies Siril autostretch and saves JPEG quality 95. Falls back to GraXpert AI denoising + asinh stretch if Siril is unavailable. |
 
 Output is registered as the session thumbnail immediately — visible without a rescan.
 
+Work files (~24 MB × 500 frames ≈ 12 GB) are written to `C:\Temp` and cleaned up on
+completion, error, or cancel.
+
 ### max_frames
 
-The `max_frames` input (default 500) caps how many frames enter pass 2.  Setting it lower
-reduces alignment and integration time proportionally.  For a 5 000-frame library with
-`max_frames = 500`, only 10 % of frames are read in pass 2 and copied to the SSD — the rest
-are never touched after pass 1.
+The `max_frames` input (default 500) caps how many frames pass stage 3.  SNR scales as
+√N, so returns diminish quickly: 500 → 1000 frames is only +41 % gain.  The quality filter
+selects the best frames first, so adding more frames means including lower-quality subs.  A
+practical sweet spot is **1 500 frames** for a rich session like M 101.
 
 ### Memory usage
 
-The integration array is pre-allocated as a single `float32` block of shape
-`(n_accepted, H, W, 3)` and each aligned frame is written directly into its slot.  This
-avoids the Python-list-then-`np.stack` pattern that peaks at 2× frame-data RAM (list and
-contiguous copy coexist briefly).  At 500 frames of 1920 × 1080 × 3 × float32 the peak is
-~12 GB rather than ~24 GB.  If WSL2 is still memory-constrained, raise its limit in
-`%USERPROFILE%\.wslconfig`:
+The main in-process cost is the pre-debayer loop (one frame at a time — O(1) RAM).  Siril
+handles the registration and integration natively, so WSL2 peak RAM is modest compared to
+the old Python pipeline.  Disk space for work files is the main constraint: allow ~25 MB per
+frame (≈ 12 GB for 500 frames).  If WSL2 memory pressure is observed elsewhere, set a
+limit in `%USERPROFILE%\.wslconfig`:
 
 ```ini
 [wsl2]
-memory=20GB
+memory=16GB
 ```
 
 ### Cancel

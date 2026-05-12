@@ -11,6 +11,15 @@ fi
 
 source "$VENV/bin/activate"
 
+# onnxruntime-gpu on WSL2: need nvidia pip-package libs on LD_LIBRARY_PATH
+# and CUDA_VISIBLE_DEVICES set so onnxruntime can enumerate the device.
+NVIDIA_LIB_DIR="$VENV/lib/python3.12/site-packages/nvidia"
+for lib_dir in "$NVIDIA_LIB_DIR"/*/lib; do
+    [ -d "$lib_dir" ] && export LD_LIBRARY_PATH="$lib_dir:${LD_LIBRARY_PATH:-}"
+done
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
 # Load .env if present
 if [ -f "$SCRIPT_DIR/.env" ]; then
     set -a

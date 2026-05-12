@@ -29,14 +29,14 @@
 ## Sub-Frame Stacking
 
 - One-click pipeline for `_sub` session folders containing raw `.fit` sub-frames
-- 7-stage pipeline runs entirely on CPU — no GPU required:
-  1. Quality selection (Laplacian sharpness scoring)
-  2. ECC image registration
-  3. Sigma-clip mean stack
-  4. Background gradient removal
-  5. Auto-crop of alignment artefacts
-  6. Auto-stretch (percentile clip + gamma)
-  7. Bilateral denoise + unsharp mask
+- Hybrid pipeline: Python for quality selection, **Siril CLI** for registration + stacking:
+  1. Laplacian sharpness + SEP (FWHM / eccentricity / SNR) quality scoring
+  2. Frame selection — top N by combined score (default 500)
+  3. Pre-debayer each frame to 3-channel RGB FITS (prevents Bayer-grid registration artefacts)
+  4. Siril: star-pattern registration → additive-scale sigma-clip stack (3σ)
+  5. IQR-based border crop (detects partial-coverage rows by pixel-to-pixel variance)
+  6. Siril autostretch → JPEG preview (GraXpert AI denoise as fallback)
+- GPU-accelerated via CUDA when available; 500 frames in ~31 minutes
 - Live progress via Server-Sent Events; stacked JPEG appears as the session thumbnail immediately
 
 ---
