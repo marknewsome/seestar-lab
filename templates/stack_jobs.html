@@ -25,7 +25,7 @@
     /* ── Job rows ── */
     .sj-row {
       display: grid;
-      grid-template-columns: minmax(0,1fr) 90px 110px 80px 90px auto;
+      grid-template-columns: minmax(0,1fr) 90px 110px 80px 90px 120px;
       align-items: center;
       gap: 0.6rem;
       padding: 0.55rem 0.4rem;
@@ -55,6 +55,15 @@
     .sj-badge-pending  { background: #3a2a00; color: #c8922a; animation: detecting-pulse 1.6s ease-in-out infinite; }
     .sj-badge-done     { background: #0d2e1a; color: #4caf7a; }
     .sj-badge-error    { background: #2e0d0d; color: #cf6679; }
+    .sj-error-msg {
+      grid-column: 1 / -1;
+      font-size: 0.71rem;
+      color: #cf6679;
+      padding: 0.1rem 0 0.2rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .sj-badge-cancelled{ background: #1e1e1e; color: var(--text-muted); }
     .sj-time {
       font-size: 0.72rem;
@@ -199,26 +208,30 @@ function renderActiveRow(j) {
 }
 
 function renderHistoryRow(j) {
-  const hasLog = !!j.output_path;
   const hasImg = j.status === 'done' && !!j.output_path;
+  const hasLog = !!j.output_path;
   const links = [
     hasImg ? `<a class="sj-link" href="/api/stack/image/${encodeURIComponent(j.session_name)}" target="_blank">Image</a>` : '',
     hasLog ? `<a class="sj-link" href="/api/stack/log/${encodeURIComponent(j.session_name)}" target="_blank">Log</a>` : '',
   ].filter(Boolean).join('');
 
-  const errorTip = j.error_msg ? ` title="${esc(j.error_msg)}"` : '';
   const frames = j.frames_total
     ? `${j.frames_accepted||0} / ${j.frames_total}`
     : '—';
 
+  const errorRow = (j.status === 'error' && j.error_msg)
+    ? `<div class="sj-error-msg">✕ ${esc(j.error_msg)}</div>`
+    : '';
+
   return `
   <div class="sj-row" id="sjrow-${CSS.escape(j.session_name)}">
-    <div class="sj-name"${errorTip}><a href="/?highlight=${encodeURIComponent(j.session_name)}">${esc(j.session_name)}</a></div>
+    <div class="sj-name"><a href="/?highlight=${encodeURIComponent(j.session_name)}">${esc(j.session_name)}</a></div>
     <div>${badge(j.status)}</div>
     <div class="sj-time">${fmtTime(j.finished_at || j.started_at)}</div>
     <div class="sj-frames">${esc(frames)}</div>
     <div class="sj-dur sj-time">${fmtDur(j.started_at, j.finished_at)}</div>
     <div class="sj-links">${links}</div>
+    ${errorRow}
   </div>`;
 }
 
