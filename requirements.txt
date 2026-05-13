@@ -1,7 +1,17 @@
 flask>=3.0.0
 python-dotenv>=1.0.0
+numpy>=1.26.0
 astropy>=6.0.0
 Pillow>=10.0.0
-opencv-python>=4.9.0
+opencv-python-headless>=4.9.0  # headless avoids conflict with graxpert's opencv dep
 scipy>=1.12.0
-ultralytics>=8.0.0   # optional — YOLO second-stage transit validation
+sep-pjw>=1.3.0                 # Source Extractor Python (NumPy 2.x-compatible fork)
+astroalign>=2.4.0              # comet wizard star alignment
+graxpert>=3.0.0                # AI background extraction + denoising
+
+# GPU acceleration — install the GPU build of onnxruntime for CUDA denoising.
+# CPU-only works but is much slower for GraXpert inference.
+# onnxruntime-gpu>=1.18.0      # uncomment if you have an NVIDIA GPU
+
+# Optional — YOLO second-stage transit validation (large download)
+# ultralytics>=8.0.0
