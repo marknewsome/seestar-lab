@@ -1198,12 +1198,21 @@ class StackProcessor:
             progress_cb(37,
                         f"Siril: register + stack ({n_selected} frames)…",
                         n_selected, total)
-            siril_stack_ok = _siril_full_stack(
+            siril_installed = os.path.isfile(SIRIL_CLI)
+            siril_stack_ok  = _siril_full_stack(
                 selected_files, bayer_pattern, fits_path,
                 progress_cb=lambda p, msg, *_a: progress_cb(
                     37 + int(p * 0.50), msg, n_selected, total
                 ),
             )
+            if siril_installed and not siril_stack_ok:
+                # Siril is present but the run failed (disk space, script error,
+                # etc.).  The error was already surfaced via progress_cb — raise
+                # now so the job is marked as failed rather than silently falling
+                # through to the Python pipeline.
+                raise RuntimeError(
+                    "Siril stacking failed — check the Stack Queue log for details"
+                )
             if siril_stack_ok:
                 run_stats['aligned']        = n_selected
                 run_stats['rejected_align'] = 0
@@ -1253,8 +1262,8 @@ class StackProcessor:
                     "log_path":        log_path,
                 }
 
-            # Siril unavailable or failed — fall through to built-in pipeline
-            progress_cb(37, "Siril not available; using built-in pipeline",
+            # Siril not installed — fall through to built-in pipeline
+            progress_cb(37, "Siril not installed; using built-in pipeline",
                         n_selected, total)
 
             # ════════════════════════════════════════════════════════════════
