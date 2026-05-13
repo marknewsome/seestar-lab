@@ -550,9 +550,10 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
     """
     Call the Windows Siril CLI to produce a finished JPEG from a linear FITS.
 
-    Pipeline: background extraction (degree-1 polynomial) → photometric colour
-    calibration → autostretch → save JPEG.  Falls back silently to our own
-    preview pipeline if Siril is not installed or the script fails.
+    Pipeline: autostretch → save JPEG.  Background extraction and GraXpert
+    denoising are applied upstream (in _siril_full_stack) on the linear FITS
+    before this function is called.  Falls back silently to our own preview
+    pipeline if Siril is not installed or the script fails.
 
     Returns True if Siril succeeded, False if fallback is needed.
     """
@@ -780,10 +781,18 @@ def _siril_full_stack(
 
             bgr = bgr[bot_crop:top_crop, c0:c1]
 
-            # Subtract per-channel 5th-percentile so sky sits near 0
-            for c in range(3):
-                sky = float(np.percentile(bgr[:, :, c], 5))
-                bgr[:, :, c] = np.clip(bgr[:, :, c] - sky, 0.0, None)
+            # Per-channel SEP background subtraction: fits a sigma-clipped 2D mesh
+            # to each channel independently, equalising sky levels across R/G/B and
+            # removing vignetting gradients without treating nebula/galaxy as sky.
+            bgr = _subtract_background(bgr)
+            bgr = np.clip(bgr, 0.0, None)
+
+            # GraXpert AI denoising on the linear image (before any stretch).
+            # Linear data has Gaussian noise characteristics; denoising here gives
+            # the model clean signal to work with rather than nonlinearly amplified
+            # shadow noise.  Falls back silently if GraXpert is unavailable.
+            progress_cb(97, "AI denoising (GraXpert)")
+            bgr = _graxpert_denoise(bgr, strength=0.8)
 
             _write_fits(output_fits, bgr, Path(output_fits).stem)
         except Exception as exc:
