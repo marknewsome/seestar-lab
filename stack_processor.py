@@ -668,12 +668,37 @@ def _siril_full_stack(
     try:
         os.makedirs(work_dir, exist_ok=True)
 
+        # Pre-flight disk-space check.
+        # Each pre-debayered frame is (H × W × 3 channels × 4 bytes float32).
+        # With -noout registration only the transforms are stored — no second copy
+        # of each frame — so the input frames are the dominant cost.
+        n = len(selected_files)
+        if n > 0:
+            import shutil as _shutil
+            sample_raw, _ = _read_fits(selected_files[0])
+            h_s, w_s = sample_raw.shape[:2]
+            bytes_per_frame = h_s * w_s * 3 * 4          # float32 RGB
+            needed_bytes    = bytes_per_frame * n * 1.15  # 15 % buffer
+            free_bytes      = _shutil.disk_usage(SIRIL_WIN_WORK_BASE).free
+            if needed_bytes > free_bytes:
+                needed_gb = needed_bytes / 1024**3
+                free_gb   = free_bytes   / 1024**3
+                logging.warning(
+                    f"Siril full stack: insufficient disk space — "
+                    f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB free on "
+                    f"{SIRIL_WIN_WORK_BASE}.  Reduce max_frames or free disk space."
+                )
+                progress_cb(0,
+                    f"Disk space error: need {needed_gb:.1f} GB, "
+                    f"only {free_gb:.1f} GB free — reduce frame count or free space"
+                )
+                return False
+
         # Debayer each selected frame in Python and write 3-channel float32 FITS.
         # Registering raw CFA Bayer frames creates systematic color cross-talk:
         # sub-pixel shifts misalign the GRBG grid, and averaged shifted Bayer
         # patterns produce the purple/green diagonal band artifact.  Pre-debayering
         # gives Siril proper RGB images so registration and stacking are colour-clean.
-        n = len(selected_files)
         progress_cb(0, f"Siril: debayering and writing {n} frames to work dir…")
         try:
             from astropy.io import fits as _fits
@@ -698,12 +723,16 @@ def _siril_full_stack(
         work_win = to_win(work_dir)
 
         # Register and stack pre-debayered RGB FITS.  Siril v1.4 uses r_ prefix.
+        # -noout on register stores transforms in r_light_.seq without writing
+        # registered frame files — halves disk usage vs default behaviour which
+        # writes a full second copy of every frame.  Stack applies transforms
+        # on-the-fly from the seq file.
         script = (
             f'requires 1.2.0\n'
             f'cd "{work_win}"\n'
             f'setext fit\n'
             f'convert light -out=pp_light\n'
-            f'register light_\n'
+            f'register light_ -noout\n'
             f'stack r_light_ rej 3 3 -norm=addscale -out=stacked\n'
         )
 
