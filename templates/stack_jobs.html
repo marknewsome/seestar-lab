@@ -104,16 +104,14 @@
       border-radius: 1px;
       transition: width 0.4s ease;
     }
-    /* ── Header row ── */
-    .sj-header {
-      display: grid;
-      grid-template-columns: minmax(0,1fr) 90px 110px 80px 90px auto;
-      gap: 0.6rem;
-      padding: 0 0.4rem 0.3rem;
+    /* ── Header row — inherits sj-row grid so columns stay in sync ── */
+    .sj-header-row {
       font-size: 0.67rem;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      padding-top: 0;
     }
     .sj-dur { white-space: nowrap; }
   </style>
@@ -225,9 +223,13 @@ function renderHistoryRow(j) {
 }
 
 const HISTORY_HEADER = `
-<div class="sj-header">
-  <div>Session</div><div>Status</div><div>Finished</div>
-  <div style="text-align:right">Frames</div><div>Duration</div><div></div>
+<div class="sj-row sj-header-row">
+  <div>Session</div>
+  <div>Status</div>
+  <div>Finished</div>
+  <div class="sj-frames">Frames</div>
+  <div>Duration</div>
+  <div></div>
 </div>`;
 
 function render() {
