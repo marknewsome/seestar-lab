@@ -678,8 +678,11 @@ def _siril_full_stack(
             sample_raw, _ = _read_fits(selected_files[0])
             h_s, w_s = sample_raw.shape[:2]
             bytes_per_frame = h_s * w_s * 3 * 4          # float32 RGB
-            needed_bytes    = bytes_per_frame * n * 1.15  # 15 % buffer
-            free_bytes      = _shutil.disk_usage(SIRIL_WIN_WORK_BASE).free
+            # Budget: input frames + Siril registration output (r_light_ copy)
+            # Registration writes a second full copy of every frame; 2.3× gives
+            # both copies plus a 15 % buffer.
+            needed_bytes = bytes_per_frame * n * 2.3
+            free_bytes   = _shutil.disk_usage(SIRIL_WIN_WORK_BASE).free
             if needed_bytes > free_bytes:
                 needed_gb = needed_bytes / 1024**3
                 free_gb   = free_bytes   / 1024**3
@@ -690,7 +693,7 @@ def _siril_full_stack(
                 )
                 progress_cb(0,
                     f"Disk space error: need {needed_gb:.1f} GB, "
-                    f"only {free_gb:.1f} GB free — reduce frame count or free space"
+                    f"only {free_gb:.1f} GB free — reduce max_frames or free space on C:"
                 )
                 return False
 
@@ -723,16 +726,15 @@ def _siril_full_stack(
         work_win = to_win(work_dir)
 
         # Register and stack pre-debayered RGB FITS.  Siril v1.4 uses r_ prefix.
-        # -noout on register stores transforms in r_light_.seq without writing
-        # registered frame files — halves disk usage vs default behaviour which
-        # writes a full second copy of every frame.  Stack applies transforms
-        # on-the-fly from the seq file.
+        # Omit 'convert': our files are already named light_NNNNN.fit which is
+        # Siril's native sequence format — convert would just write a redundant
+        # third copy of every frame (~23 MB each).  Siril detects the sequence
+        # automatically after 'cd' + 'setext fit'.
         script = (
             f'requires 1.2.0\n'
             f'cd "{work_win}"\n'
             f'setext fit\n'
-            f'convert light -out=pp_light\n'
-            f'register light_ -noout\n'
+            f'register light_\n'
             f'stack r_light_ rej 3 3 -norm=addscale -out=stacked\n'
         )
 
