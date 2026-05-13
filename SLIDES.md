@@ -35,9 +35,12 @@
   3. Pre-debayer each frame to 3-channel RGB FITS (prevents Bayer-grid registration artefacts)
   4. Siril: star-pattern registration → additive-scale sigma-clip stack (3σ)
   5. IQR-based border crop (detects partial-coverage rows by pixel-to-pixel variance)
-  6. Siril autostretch → JPEG preview (GraXpert AI denoise as fallback)
-- GPU-accelerated via CUDA when available; 500 frames in ~31 minutes
-- Live progress via Server-Sent Events; stacked JPEG appears as the session thumbnail immediately
+  6. SEP per-channel 2D mesh background subtraction (sigma-clipped; handles gradients)
+  7. **GraXpert AI denoising on the linear stack** (before stretching — optimal noise model)
+  8. Siril autostretch → JPEG preview
+- GPU-accelerated via CUDA when available; 500 frames ~19 min, 1500 frames ~1h 6m
+- Stack queue visible at `/stack/jobs` — history, durations, log and image links
+- Live progress via Server-Sent Events; queued jobs show pulsing amber indicator
 
 ---
 

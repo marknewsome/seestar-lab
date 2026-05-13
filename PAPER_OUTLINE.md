@@ -102,11 +102,35 @@ or JOSS (Journal of Open Source Software)
   - FITS row 0 = image bottom — scan from H-1 downward to find top border
 - Figure: row-IQR profile illustrating the detection
 
-### 3.6 Results
+### 3.6 Per-Channel Background Subtraction
 
-- M 101 (Pinwheel Galaxy): 500 sub-frames, 10 s each = 83 min total integration
-- Pipeline runtime: ~31 min end-to-end on WSL2 with CUDA-accelerated GraXpert denoising
-- Output: spiral arms clearly resolved, star colours preserved, clean background
+- Goal: equalise R/G/B sky levels and remove smooth vignetting gradients
+- Tool: SEP (Source Extractor Python) sigma-clipped background mesh, ~20 × 20 cells per channel
+- Sigma-clipping iteratively rejects bright pixels within each cell — nebulosity and galaxy
+  signal are excluded from the sky estimate (unlike percentile-of-cell, which is biased by
+  any extended emission filling a large fraction of the frame)
+- Applied per-channel independently: corrects both global sky pedestal and inter-channel
+  colour balance simultaneously
+- Motivation: the original single-scalar 5th-percentile subtract was channel-unaware,
+  producing residual blue/green cast (visible in M 20 Trifid comparison)
+
+### 3.7 AI Denoising on Linear Data
+
+- GraXpert ONNX model (v3.x) applied to the linear background-subtracted float32 stack
+- Key ordering decision: denoise BEFORE stretching
+  - Linear data: read noise is Gaussian, background is flat → optimal conditions for the model
+  - Stretched data: nonlinear amplification of shadows transforms Gaussian noise into
+    asymmetric, spatially varying noise — model performance degrades
+- GPU-accelerated via CUDA (onnxruntime-gpu); ~74 s on a consumer NVIDIA card
+- Falls back silently to undenoised FITS if GraXpert unavailable
+
+### 3.8 Results
+
+- M 101 (Pinwheel Galaxy): 500 sub-frames in ~19 min; 1500 frames in ~1h 6m
+- M 20 (Trifid Nebula): 60 frames in ~2 min — both red emission and blue reflection lobes
+  visible after per-channel background correction
+- Full object set processed in a single session: M 1, 20, 27, 31, 36, 42, 97, 101, 108 — all
+  queued sequentially; no interference between jobs
 - SNR discussion: 500 vs. 1000 vs. 1500 frames; diminishing returns curve; quality-filter
   effect (adding frames includes lower-quality subs)
 
@@ -154,15 +178,24 @@ or JOSS (Journal of Open Source Software)
 
 ## 6. Supporting Features
 
-### 6.1 Observing Planner
+### 6.1 Stack Queue and Job History
+
+- Serialised single-worker queue: multiple `_sub` sessions can be queued simultaneously
+  without interference; jobs run one at a time
+- `/stack/jobs` page: live-updated SSE view of active queue and per-session history
+  (frame counts, wall-clock duration, log and image links)
+- Queued-but-not-running cards show a pulsing amber indicator in the session browser;
+  Cancel only exposed for the running job (cancelling a pending job is a no-op)
+
+### 6.3 Observing Planner
 
 - Rise/set times and altitude curves using astropy for configured observer lat/lon
 
-### 6.2 Live RTSP Capture
+### 6.4 Live RTSP Capture
 
 - MJPEG proxy (Flask) for in-browser stream view; independent ffmpeg -c copy recording
 
-### 6.3 Catalog Scoreboards and Poster Printing
+### 6.5 Catalog Scoreboards and Poster Printing
 
 - Bingo-card grids for Messier/Caldwell; 13×19" print-optimised poster layout
 

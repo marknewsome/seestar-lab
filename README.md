@@ -29,6 +29,7 @@ track-path composite.
 | **Live Capture** | RTSP stream viewer and recorder. Add one or more Seestar RTSP URLs; view the live MJPEG feed in the browser; optionally record to `SEESTAR_DATA_DIR/captures/` with auto-named MP4 files. Stream configs are persisted in browser localStorage. |
 | **Observing Planner** | Visibility planner for DSO and solar-system objects: shows rise/set times, altitude curves, and optimal observing windows for the configured observer location. |
 | **Result persistence** | Completed solar and lunar timelapse results are saved in browser localStorage (keyed by directory, 30-day TTL). Returning to a previously-rendered directory shows the results without re-rendering. A "Forget" button clears the saved state; "Re-render" re-runs Pass 2+3 using the cached disk-detection data. |
+| **Stack queue** | `/stack/jobs` shows all stacking jobs: active (running job with live progress bar + queued jobs with pulsing indicator) and history (completed/failed jobs with frame counts, wall-clock duration, and links to the result image and run log). Live-updated via SSE. |
 
 ---
 
@@ -165,9 +166,10 @@ Windows and reachable at `C:\Program Files\Siril\bin\siril-cli.exe` from WSL2.
 | 5 | **Convert + Register** | Siril | `convert light -out=pp_light` collects all `light*.fit` files into a Siril sequence. `register light_` computes inter-frame transforms using star-pattern matching. |
 | 6 | **Sigma-clip stack** | Siril | `stack r_light_ rej 3 3 -norm=addscale -out=stacked` integrates frames with additive-scale normalisation and 3σ rejection, suppressing hot pixels, cosmic rays, and satellite trails. |
 | 7 | **IQR border crop** | Python | Per-row inter-quartile range of the green channel identifies partial-coverage border rows left by registration. Rows with IQR > 1.5 × median IQR of the image centre are trimmed from top and bottom; leftmost/rightmost fully-covered columns are found by luminance mask. |
-| 8 | **Sky pedestal subtract** | Python | Global sky level removed. |
-| 9 | **Save FITS** | Python | Linear float32 colour FITS written alongside the output directory. |
-| 10 | **JPEG preview** | Siril / GraXpert | `_siril_postprocess` applies Siril autostretch and saves JPEG quality 95. Falls back to GraXpert AI denoising + asinh stretch if Siril is unavailable. |
+| 8 | **Background subtraction** | Python | SEP sigma-clipped 2D mesh fit (~20 × 20 cells) applied per channel independently. Equalises R/G/B sky levels and removes vignetting gradients. Sigma-clipping prevents nebula or galaxy signal from biasing the sky estimate. |
+| 9 | **AI denoising** | GraXpert | GraXpert ONNX model denoises the linear float32 stack before any stretch is applied. Linear data has Gaussian noise characteristics; denoising here gives the model cleaner signal than nonlinearly stretched output would. GPU-accelerated via CUDA when available (~74 s on an NVIDIA card). |
+| 10 | **Save FITS** | Python | Denoised linear float32 colour FITS written alongside the output directory. |
+| 11 | **JPEG preview** | Siril | `_siril_postprocess` applies Siril autostretch and saves JPEG quality 95. Falls back to asinh stretch if Siril is unavailable. |
 
 Output is registered as the session thumbnail immediately — visible without a rescan.
 
