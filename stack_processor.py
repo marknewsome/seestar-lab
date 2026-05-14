@@ -670,18 +670,18 @@ def _siril_full_stack(
 
         # Pre-flight disk-space check.
         # Each pre-debayered frame is (H × W × 3 channels × 4 bytes float32).
-        # With -noout registration only the transforms are stored — no second copy
-        # of each frame — so the input frames are the dominant cost.
+        # Input frames are uint16 (~12 MB each); Siril writes registered frames
+        # as float32 (~23 MB each).  Budget for both before writing anything.
         n = len(selected_files)
         if n > 0:
             import shutil as _shutil
             sample_raw, _ = _read_fits(selected_files[0])
             h_s, w_s = sample_raw.shape[:2]
-            bytes_per_frame = h_s * w_s * 3 * 4          # float32 RGB
-            # Budget: input frames + Siril registration output (r_light_ copy)
-            # Registration writes a second full copy of every frame; 2.3× gives
-            # both copies plus a 15 % buffer.
-            needed_bytes = bytes_per_frame * n * 2.3
+            # Input frames written as uint16 (2 bytes/pixel); Siril writes
+            # registered frames as float32 (4 bytes/pixel).  15 % buffer on top.
+            input_bytes  = h_s * w_s * 3 * 2 * n          # uint16 input
+            reg_bytes    = h_s * w_s * 3 * 4 * n          # float32 registration output
+            needed_bytes = (input_bytes + reg_bytes) * 1.15
             free_bytes   = _shutil.disk_usage(SIRIL_WIN_WORK_BASE).free
             if needed_bytes > free_bytes:
                 needed_gb = needed_bytes / 1024**3
@@ -711,10 +711,9 @@ def _siril_full_stack(
 
         for i, src in enumerate(selected_files):
             raw, _ = _read_fits(src)
-            bgr = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
+            bgr = _debayer(raw, bayer_pattern)                 # uint16 [0,65535]
             rgb = bgr[:, :, ::-1].transpose(2, 0, 1)          # (3, H, W) RGB
-            hdu = _fits.PrimaryHDU(rgb.astype(np.float32))
-            hdu.header['BUNIT']   = 'normalized'
+            hdu = _fits.PrimaryHDU(rgb.astype(np.uint16))
             hdu.header['COLORMD'] = 'RGB'
             hdu.writeto(os.path.join(work_dir, f"light_{i:05d}.fit"), overwrite=True)
             if (i + 1) % 50 == 0 or i + 1 == n:
