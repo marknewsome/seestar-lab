@@ -18,7 +18,7 @@ track-path composite.
 | **Image gallery** | Seestar-stacked JPEGs for non-`_sub` comet sessions are browsable via prev/next arrows on the card thumbnail and a full-screen lightbox |
 | **User ratings** | Three-state satisfaction dot on every session card and bingo card: Satisfied (green) / Want more time (amber) / Priority re-image (red). Click to cycle; persists across rescans. "Re-image" filter in the Observing Planner surfaces want-more and priority targets. |
 | **Observing notes** | Free-text textarea on each session card for conditions, issues, and goals. Saves automatically on blur or Ctrl+Enter. A truncated snippet with full-text tooltip appears on bingo cards. |
-| **Sub-frame stacking** | Hybrid pipeline stacks raw `.fit` sub-frames: sharpness + SEP quality selection in Python, per-frame pre-debayer to 3-channel RGB FITS, then Siril CLI for registration and sigma-clip stacking, followed by IQR border crop and JPEG generation. Configurable frame cap (`max_frames`); cancelable at any point. |
+| **Sub-frame stacking** | Hybrid pipeline stacks raw `.fit` sub-frames: sharpness + SEP quality selection in Python, per-frame pre-debayer to 3-channel RGB FITS, then Siril CLI for registration and sigma-clip stacking, followed by IQR border crop and JPEG generation. Configurable frame cap (`max_frames`); cancelable at any point. Full post-processing tuning via the **Stack Wizard** (`/stack/wizard/<session>`). |
 | **Comet wizard** | Step-by-step pipeline for `_sub` comet folders: frame selection, stretch/parameter tuning with live preview, stars-fixed animation, comet-nucleus-fixed animation, track composite, and annotated frame review |
 | **Catalog scoreboard** | Messier and Caldwell bingo-card views show which objects have been captured, with progress bar and type filters |
 | **Poster printing** | One-click 13×19" landscape poster of the full Messier or Caldwell catalog: captured objects show their thumbnail, uncaptured show a muted placeholder; designed for photo printers |
@@ -169,7 +169,7 @@ Windows and reachable at `C:\Program Files\Siril\bin\siril-cli.exe` from WSL2.
 | 8 | **Background subtraction** | Python | SEP sigma-clipped 2D mesh background subtraction applied per channel. `bg_mesh_scale` controls mesh coarseness: higher = fewer, larger cells (better for large galaxies like M101 where fine cells over-subtract galaxy signal); 0 = skip entirely. |
 | 9 | **AI denoising** | GraXpert | GraXpert ONNX model denoises the linear float32 stack before any stretch is applied. Linear data has Gaussian noise characteristics; denoising here gives the model cleaner signal than nonlinearly stretched output would. GPU-accelerated via CUDA when available. Whether GraXpert ran (or fell back) is recorded in the run log. |
 | 10 | **Save FITS** | Python | Denoised linear float32 colour FITS written alongside the output directory for later re-rendering without a full restack. |
-| 11 | **JPEG preview** | Python | Per-channel asinh stretch (Q=6), YCrCb chroma + luma Gaussian denoise, gentle unsharp mask; JPEG quality 95. Output is vertically flipped to match Seestar app orientation. |
+| 11 | **JPEG preview** | Python | Per-channel asinh stretch (Q=8, black_pct=40, white_pct=99.9), YCrCb chroma + luma Gaussian denoise, unsharp mask; JPEG quality 95. Output is vertically flipped to match Seestar app orientation. All params tunable in the Stack Wizard. |
 
 Output is registered as the session thumbnail immediately — visible without a rescan.
 
@@ -207,14 +207,42 @@ A **Cancel** button appears while stacking is active.  It signals the pipeline t
 cleanly after the current frame finishes.  The DB is marked as cancelled and the stack footer
 reverts to idle state; no partial output is written.
 
+### Stack Wizard
+
+Navigate to `/stack/wizard/<session_name>` for a dedicated post-processing tuning UI.
+All parameters are exposed as numeric inputs in the left panel; the right panel shows the
+current preview image with a before/after comparison slider.
+
+| Control | Description |
+|---|---|
+| **Re-render preview** | Applies current params to the saved linear FITS — seconds, not minutes |
+| **Full re-stack** | Reprocesses sub-frames from scratch with the new `max_frames` / `min_quality` |
+| **Revert** | Restores the params that were active before the last re-render or preset load |
+| **Compare slider** | Side-by-side overlay of the current render and the immediately preceding one |
+| **Presets** | Save/load named parameter sets to browser localStorage (shared across all sessions) |
+| **Ollama AI analysis** | Sends the current JPEG to a local Ollama vision model; streams back a diagnosis and suggested parameter changes |
+| **Download** | Export as JPEG (with EXIF metadata) or 16-bit TIFF; frames accepted, integration time, and all processing params baked in |
+
+**Tunable post-processing parameters:**
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `bg_mesh_scale` | 20 | 0 = skip; 8 = coarse (large galaxies like M101); 40 = fine (compact nebulae) |
+| `stretch_q` | 8.0 | Asinh shadow aggressiveness (4 = gentle, 15 = aggressive) |
+| `black_pct` | 40 | Black-point percentile |
+| `white_pct` | 99.9 | White-reference percentile; lower = brighter core (99.5 works well for M101) |
+| `luma_k` / `luma_sig` | 9 / 2.0 | Luma Gaussian denoise kernel and sigma |
+| `chroma_k` / `chroma_sig` | 31 / 10 | Chroma Gaussian denoise kernel and sigma |
+| `unsharp_gain` / `unsharp_sig` | 1.35 / 1.5 | Unsharp mask strength and blur radius |
+
 ### Re-stack and Re-render
 
 A **Re-stack** button replaces the Stack button once a job has completed or failed, allowing
 re-stacking (e.g. after adjusting `max_frames`, `min_quality`, or `bg_mesh_scale`).
 
 **Re-render** reprocesses the saved linear FITS through background subtraction, GraXpert
-denoising, stretch, and sharpening — without rerunning the full alignment stack.  Useful
-for tuning `bg_mesh_scale` or comparing stretch settings in seconds rather than hours.
+denoising, stretch, and sharpening — without rerunning the full alignment stack.  Available
+both from the session card and from the Stack Wizard.
 
 ---
 
@@ -511,6 +539,8 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 | `GET` | `/lunar` | Lunar timelapse wizard |
 | `GET` | `/planner` | Observing planner |
 | `GET` | `/capture` | Live RTSP capture page |
+| `GET` | `/stack/jobs` | Stack queue and job history |
+| `GET` | `/stack/wizard/<session_name>` | Stack Wizard — full post-processing tuning UI |
 
 ### Sessions & scanning
 
@@ -544,10 +574,13 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 |---|---|---|
 | `POST` | `/api/stack/start` | Queue stacking — body: `{"session_name": str, "force": bool, "max_frames": int, "bg_mesh_scale": int, "min_quality": float, "skip_copy": bool}` |
 | `POST` | `/api/stack/cancel` | Cancel active job — body: `{"session_name": str}` |
-| `POST` | `/api/stack/rerender` | Re-render from saved linear FITS — body: `{"session_name": str, "bg_mesh_scale": int}` |
+| `POST` | `/api/stack/rerender/<session_name>` | Re-render from saved linear FITS — body: `{bg_mesh_scale, stretch_q, black_pct, white_pct, luma_k, luma_sig, chroma_k, chroma_sig, unsharp_gain, unsharp_sig}` |
 | `GET` | `/api/stack/status` | JSON: all stack job statuses keyed by session name |
 | `GET` | `/api/stack/image/<session_name>` | Serve full-size stacked JPEG |
+| `GET` | `/api/stack/image/previous/<session_name>` | Serve the JPEG from immediately before the last re-render (for before/after compare) |
 | `GET` | `/api/stack/log/<session_name>` | Serve plain-text run log |
+| `GET` | `/api/stack/download/<session_name>` | Download stacked result — `?format=jpeg` (with EXIF) or `?format=tiff` (16-bit with tags) |
+| `POST` | `/api/stack/analyze/<session_name>` | Send current JPEG to Ollama vision model; stream back SSE diagnosis + suggested params |
 
 ### Comet wizard
 

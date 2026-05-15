@@ -37,9 +37,13 @@
   5. IQR-based border crop (detects partial-coverage rows by pixel-to-pixel variance)
   6. SEP per-channel 2D mesh background subtraction — `bg_mesh_scale` tunes cell size (coarse for large galaxies, fine for compact nebulae; 0 = skip)
   7. **GraXpert AI denoising on the linear stack** (before stretching — optimal noise model; outcome logged)
-  8. Asinh stretch (Q=6) + YCrCb denoise + unsharp mask → JPEG, vertically flipped to match Seestar orientation
+  8. Asinh stretch + YCrCb denoise + unsharp mask → JPEG, vertically flipped to match Seestar orientation
 - GPU-accelerated via CUDA; 3000 frames ~87 min on consumer hardware
-- **Re-render** reprocesses saved linear FITS without a full restack — try different `bg_mesh_scale` in seconds
+- **Stack Wizard** (`/stack/wizard/<session>`) — dedicated tuning UI: all post-processing knobs exposed
+  (stretch Q, black/white point %, luma/chroma denoise, unsharp mask, bg mesh scale)
+- **Re-render** applies changed params to saved linear FITS in seconds — no full restack
+- **Ollama AI analysis** — sends current preview to a local vision model; suggests parameter changes
+- **Download** — JPEG with EXIF metadata or 16-bit TIFF; frames, integration time, params baked in
 - Stack queue at `/stack/jobs` — history, durations, log and image links; live SSE progress
 
 ---

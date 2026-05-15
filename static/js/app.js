@@ -606,20 +606,30 @@ async function cancelStack(sessionName) {
 }
 
 async function rerenderStack(sessionName) {
-  const idSuffix = sessionName.replace(/[^a-z0-9]/gi, '_');
-  const bgInput  = document.getElementById('stack-bg-' + idSuffix);
-  const bgMeshScale = bgInput ? parseInt(bgInput.value, 10) : 20;
+  const sfx   = sessionName.replace(/[^a-z0-9]/gi, '_');
+  const saved = stackInputState[sessionName] || {};
+  const body  = {
+    bg_mesh_scale: parseInt(document.getElementById('stack-bg-' + sfx)?.value ?? saved.bg ?? 20, 10),
+  };
   try {
     await fetch('/api/stack/rerender/' + encodeURIComponent(sessionName), {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ bg_mesh_scale: bgMeshScale }),
+      body:    JSON.stringify(body),
     });
   } catch { /* SSE will report progress */ }
 }
 
 // Track which cards have the options panel open (survives footer rebuilds)
 const stackOptionsOpen = new Set();
+
+// Persist user-entered input values across footer rebuilds so SSE events
+// don't silently reset what the user typed.
+const stackInputState = {};
+function _saveStackInput(sessionName, key, val) {
+  if (!stackInputState[sessionName]) stackInputState[sessionName] = {};
+  stackInputState[sessionName][key] = val;
+}
 
 function toggleStackOptions(sessionName) {
   if (stackOptionsOpen.has(sessionName)) stackOptionsOpen.delete(sessionName);
@@ -639,10 +649,11 @@ function buildStackFooter(sessionName) {
   const isError   = status === 'error';
   const optOpen   = stackOptionsOpen.has(sessionName);
 
-  // ── Saved values ──────────────────────────────────────────────────────────
-  const mfVal = job?.max_frames    ?? 500;
-  const bgVal = job?.bg_mesh_scale ?? 20;
-  const mqVal = job?.min_quality   ?? 0.0;
+  // ── Input values: prefer what the user last typed over job-record defaults ─
+  const saved = stackInputState[sessionName] || {};
+  const mfVal = saved.mf ?? job?.max_frames    ?? 500;
+  const bgVal = saved.bg ?? job?.bg_mesh_scale ?? 20;
+  const mqVal = saved.mq ?? job?.min_quality   ?? 0.0;
 
   // ── Primary row controls ──────────────────────────────────────────────────
   const frameInfo = isDone
@@ -652,7 +663,8 @@ function buildStackFooter(sessionName) {
   const mfInput = (!isActive)
     ? `<label class="stack-mf-label" title="Best N frames to use (quality-ranked)">
          <input id="stack-mf-${sfx}" class="stack-mf-input" type="number"
-                value="${mfVal}" min="10" max="9999" step="50" />
+                value="${mfVal}" min="10" max="9999" step="50"
+                oninput="_saveStackInput('${sn_js}','mf',this.value)" />
          frames
        </label>`
     : `<span class="stack-mf-label">${job?.frames_accepted || mfVal}/${job?.frames_total || '?'} frames</span>`;
@@ -695,12 +707,14 @@ function buildStackFooter(sessionName) {
     <div class="stack-options-panel">
       <label class="stack-mf-label" title="Quality floor: frames scoring below this fraction of the best frame are rejected even if max_frames would include them. 0 = off, 0.5 = top half only.">
         <input id="stack-mq-${sfx}" class="stack-mf-input" type="number"
-               value="${mqVal}" min="0" max="0.95" step="0.05" />
+               value="${mqVal}" min="0" max="0.95" step="0.05"
+               oninput="_saveStackInput('${sn_js}','mq',this.value)" />
         min qual
       </label>
       <label class="stack-mf-label" title="Background mesh scale: higher = coarser (large galaxies like M101); lower = finer (compact nebulae). 0 = skip subtraction.">
         <input id="stack-bg-${sfx}" class="stack-mf-input" type="number"
-               value="${bgVal}" min="0" max="60" step="2" />
+               value="${bgVal}" min="0" max="60" step="2"
+               oninput="_saveStackInput('${sn_js}','bg',this.value)" />
         bg scale
       </label>
       ${(isDone || isError) ? `<label class="stack-cache-label" title="Reuse aligned frames from the last run — much faster re-stack">
@@ -726,6 +740,7 @@ function buildStackFooter(sessionName) {
   }
 
   // ── Result thumbnail ──────────────────────────────────────────────────────
+  const wizardUrl = `/stack/wizard/${encodeURIComponent(sessionName)}`;
   let resultRow = '';
   if (isDone && job.output_path) {
     resultRow = `
@@ -741,11 +756,17 @@ function buildStackFooter(sessionName) {
         <a class="stack-log-link"
            href="/api/stack/log/${encodeURIComponent(sessionName)}"
            target="_blank">View run log</a>
+        <a class="stack-log-link"
+           href="${wizardUrl}">Stack Wizard →</a>
       </div>`;
   }
 
   const errorRow = isError
     ? `<div class="stack-error">Error: ${esc(job.error_msg || 'unknown')}</div>`
+    : '';
+
+  const wizardLink = !isActive
+    ? `<a class="btn-stack-wizard" href="${wizardUrl}" title="Open full stacking wizard with all controls">Wizard →</a>`
     : '';
 
   return `<div class="stack-footer">
@@ -759,6 +780,7 @@ function buildStackFooter(sessionName) {
         ${restackBtn}
         ${cancelBtn}
         ${stackBtn}
+        ${wizardLink}
       </div>
     </div>
     ${optionsPanel}

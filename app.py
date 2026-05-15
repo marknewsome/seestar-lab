@@ -771,6 +771,46 @@ def stack_jobs_page():
     return render_template("stack_jobs.html")
 
 
+@app.route("/stack/wizard/<path:session_name>")
+def stack_wizard(session_name: str):
+    """Stacking wizard with all tuning knobs for a _sub session."""
+    from stack_processor import (
+        _STRETCH_Q, _STRETCH_BLACK_PCT, _STRETCH_WHITE_PCT,
+        _LUMA_BLUR_K, _LUMA_BLUR_SIG,
+        _CHROMA_BLUR_K, _CHROMA_BLUR_SIG,
+        _UNSHARP_GAIN, _UNSHARP_SIG,
+    )
+    job = db.get_stack_job(session_name)
+    from pathlib import Path
+    has_fits = False
+    if job and job.get("output_path"):
+        fits_path = str(Path(job["output_path"]).with_suffix(".fits"))
+        has_fits = os.path.isfile(fits_path)
+
+    defaults = dict(
+        bg_mesh_scale=20,
+        stretch_q=_STRETCH_Q,
+        black_pct=_STRETCH_BLACK_PCT,
+        white_pct=_STRETCH_WHITE_PCT,
+        luma_k=_LUMA_BLUR_K,
+        luma_sig=_LUMA_BLUR_SIG,
+        chroma_k=_CHROMA_BLUR_K,
+        chroma_sig=_CHROMA_BLUR_SIG,
+        unsharp_gain=_UNSHARP_GAIN,
+        unsharp_sig=_UNSHARP_SIG,
+    )
+    if job:
+        defaults["bg_mesh_scale"] = job.get("bg_mesh_scale") or 20
+
+    return render_template(
+        "stack_wizard.html",
+        session_name=session_name,
+        job=job,
+        has_fits=has_fits,
+        defaults=defaults,
+    )
+
+
 @app.route("/api/stack/cancel", methods=["POST"])
 def api_stack_cancel():
     """Signal the active stacking job to stop cleanly."""
@@ -829,8 +869,23 @@ def api_stack_rerender(session_name: str):
     if not os.path.isfile(fits_path):
         abort(404, "FITS file not found — run a full stack first")
 
+    from stack_processor import (
+        _STRETCH_Q, _STRETCH_BLACK_PCT, _STRETCH_WHITE_PCT,
+        _LUMA_BLUR_K, _LUMA_BLUR_SIG,
+        _CHROMA_BLUR_K, _CHROMA_BLUR_SIG,
+        _UNSHARP_GAIN, _UNSHARP_SIG,
+    )
     body = request.get_json(silent=True) or {}
-    bg_mesh_scale = int(body.get("bg_mesh_scale", 20))
+    bg_mesh_scale = int(body.get("bg_mesh_scale",  20))
+    stretch_q     = float(body.get("stretch_q",    _STRETCH_Q))
+    black_pct     = float(body.get("black_pct",    _STRETCH_BLACK_PCT))
+    white_pct     = float(body.get("white_pct",    _STRETCH_WHITE_PCT))
+    luma_k        = int(body.get("luma_k",         _LUMA_BLUR_K))
+    luma_sig      = float(body.get("luma_sig",     _LUMA_BLUR_SIG))
+    chroma_k      = int(body.get("chroma_k",       _CHROMA_BLUR_K))
+    chroma_sig    = float(body.get("chroma_sig",   _CHROMA_BLUR_SIG))
+    unsharp_gain  = float(body.get("unsharp_gain", _UNSHARP_GAIN))
+    unsharp_sig   = float(body.get("unsharp_sig",  _UNSHARP_SIG))
 
     frames_total    = job.get("frames_total", 0) or 0
     frames_accepted = job.get("frames_accepted", 0) or 0
@@ -854,7 +909,16 @@ def api_stack_rerender(session_name: str):
 
         try:
             rerender_preview(fits_path, output_path, progress_cb,
-                             bg_mesh_scale=bg_mesh_scale)
+                             bg_mesh_scale=bg_mesh_scale,
+                             stretch_q=stretch_q,
+                             black_pct=black_pct,
+                             white_pct=white_pct,
+                             luma_k=luma_k,
+                             luma_sig=luma_sig,
+                             chroma_k=chroma_k,
+                             chroma_sig=chroma_sig,
+                             unsharp_gain=unsharp_gain,
+                             unsharp_sig=unsharp_sig)
             db.finish_stack_job(session_name, output_path,
                                 frames_accepted, frames_total)
             _broadcast({"type": "stack_done", "session_name": session_name,
@@ -872,6 +936,300 @@ def api_stack_rerender(session_name: str):
     t = threading.Thread(target=_rerender_worker, daemon=True)
     t.start()
     return jsonify({"status": "rerender_started", "session": session_name})
+
+
+@app.route("/api/stack/image/previous/<path:session_name>")
+def api_stack_image_previous(session_name: str):
+    """Serve the previous render JPEG (saved before the last rerender)."""
+    job = db.get_stack_job(session_name)
+    if not job or not job.get("output_path"):
+        abort(404)
+    from pathlib import Path
+    prev = str(Path(job["output_path"]).with_name(
+        Path(job["output_path"]).stem + "_prev.jpg"))
+    if not os.path.isfile(prev):
+        abort(404)
+    return send_file(prev, mimetype="image/jpeg")
+
+
+@app.route("/api/stack/download/<path:session_name>")
+def api_stack_download(session_name: str):
+    """
+    Download the stacked result as JPEG (with EXIF) or 16-bit TIFF (with tags).
+    Query params: format=jpeg|tiff  (default jpeg)
+    Reads processing params from the run log so metadata reflects what was actually used.
+    """
+    import io, piexif
+    from PIL import Image
+
+    job = db.get_stack_job(session_name)
+    if not job or not job.get("output_path"):
+        abort(404, "No completed stack for this session")
+
+    jpeg_path = job["output_path"]
+    if not os.path.isfile(jpeg_path):
+        abort(404, "JPEG not found")
+
+    fmt = request.args.get("format", "jpeg").lower()
+
+    frames_accepted = job.get("frames_accepted") or 0
+    frames_total    = job.get("frames_total")    or 0
+    integration_sec = frames_accepted * 10
+    integration_str = (f"{integration_sec // 3600}h {(integration_sec % 3600) // 60}m"
+                       if integration_sec >= 3600
+                       else f"{integration_sec // 60}m {integration_sec % 60}s")
+
+    safe_name = session_name.replace("/", "_").replace(" ", "_")
+    now_str   = datetime.utcnow().strftime("%Y:%m:%d %H:%M:%S")
+    now_file  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    description = (
+        f"Seestar Lab — {session_name} | "
+        f"ZWO Seestar S50 | "
+        f"{frames_accepted}/{frames_total} frames | "
+        f"Integration: {integration_str}"
+    )
+
+    if fmt == "tiff":
+        import tifffile, numpy as np
+        from astropy.io import fits as _fits
+        from pathlib import Path as _P
+
+        fits_path = str(_P(jpeg_path).with_suffix(".fits"))
+        if not os.path.isfile(fits_path):
+            abort(404, "FITS not found — re-render first")
+
+        with _fits.open(fits_path) as hdul:
+            data = hdul[0].data.astype(np.float32)
+
+        # Normalise float32 → uint16
+        data = np.clip(data, 0, None)
+        for c in range(data.shape[0]):
+            ch_max = data[c].max()
+            if ch_max > 0:
+                data[c] /= ch_max
+        rgb16 = (data * 65535).astype(np.uint16)
+        # shape (3,H,W) → (H,W,3), flip vertically to match JPEG orientation
+        rgb16 = rgb16[::-1].transpose(1, 2, 0)[::-1]
+
+        buf = io.BytesIO()
+        metadata = tifffile.TiffWriter(buf)
+        metadata.write(
+            rgb16,
+            photometric="rgb",
+            description=description,
+            software="Seestar Lab",
+            metadata={"object": session_name,
+                      "telescope": "ZWO Seestar S50",
+                      "frames_accepted": frames_accepted,
+                      "frames_total": frames_total,
+                      "integration": integration_str},
+        )
+        metadata.close()
+        buf.seek(0)
+        filename = f"{safe_name}_{now_file}.tiff"
+        return Response(
+            buf.read(),
+            mimetype="image/tiff",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # ── JPEG with EXIF ────────────────────────────────────────────────────────
+    img = Image.open(jpeg_path)
+
+    user_comment = ("ASCII\x00\x00\x00" + description).encode()
+    exif_dict = {
+        "0th": {
+            piexif.ImageIFD.Make:             b"ZWO",
+            piexif.ImageIFD.Model:            b"Seestar S50",
+            piexif.ImageIFD.Software:         b"Seestar Lab",
+            piexif.ImageIFD.ImageDescription: description.encode(),
+            piexif.ImageIFD.DateTime:         now_str.encode(),
+            piexif.ImageIFD.Artist:           session_name.encode()[:64],
+        },
+        "Exif": {
+            piexif.ExifIFD.UserComment:       user_comment,
+            piexif.ExifIFD.DateTimeOriginal:  now_str.encode(),
+        },
+        "1st": {},
+    }
+    exif_bytes = piexif.dump(exif_dict)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95, exif=exif_bytes)
+    buf.seek(0)
+    filename = f"{safe_name}_{now_file}.jpg"
+    return Response(
+        buf.read(),
+        mimetype="image/jpeg",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+_OLLAMA_SYSTEM_PROMPT = """\
+You are an expert astrophotography image processing assistant for Seestar Lab.
+You analyze stacked images from a ZWO Seestar S50 telescope and suggest processing
+parameter improvements.
+
+The image went through this pipeline:
+  1. Sub-frame stacking (Siril sigma-clip, additive-scale normalisation)
+  2. Per-channel background subtraction (SEP mesh, tunable cell size)
+  3. GraXpert AI denoising on linear data
+  4. SCNR green suppression
+  5. Asinh stretch with black-point and white-point percentiles
+  6. YCrCb luma and chroma Gaussian denoising
+  7. Unsharp mask for sharpening
+
+PARAMETERS (all numeric):
+  bg_mesh_scale : 0=skip subtraction; 8=coarse (large galaxies like M31/M101);
+                  20=default; 40=fine (compact nebulae). Coarser for large objects.
+  stretch_q     : Asinh shadow aggressiveness 4–15. Higher lifts faint structure
+                  but amplifies background noise. Default 8.
+  black_pct     : Black-point percentile 0–60. Higher = darker background. Default 40.
+  white_pct     : White-reference percentile 99.0–99.99.
+                  LOWER = brighter galaxy core / highlights (more star clipping).
+                  99.9=default, 99.5=brighter core, 99.0=much brighter. Default 99.9.
+  luma_k        : Luma denoise kernel size (odd, 3–21). Larger = smoother but blurrier stars.
+  luma_sig      : Luma denoise sigma 0.5–5. Larger = more smoothing. Default 2.
+  unsharp_gain  : Sharpening strength 0–3. 0=off. Higher=crisper stars, risk of halos.
+  unsharp_sig   : Sharpening radius 0.5–3. Default 1.5.
+  chroma_k      : Colour-noise kernel (odd, 1–51). Higher=smoother colours, stars lose hue.
+  chroma_sig    : Colour-noise sigma 1–20. Higher=stronger. Default 10.
+
+COMMON PROBLEMS AND FIXES:
+  Core/nucleus pure white (blown out) → raise white_pct toward 99.99
+  Core/nucleus too dim               → lower white_pct toward 99.0–99.5
+  Q seems to have no effect on core  → white_pct is the real lever for core brightness
+  Color speckles / RGB noise         → raise chroma_k or chroma_sig
+  Background too bright / grey sky   → raise black_pct; lower stretch_q
+  Stars look blurry / soft           → lower luma_k and luma_sig; raise unsharp_gain
+  Halos or ringing around stars      → lower unsharp_gain or unsharp_sig
+  Green cast in background           → try a different bg_mesh_scale
+  Gradient / vignetting              → bg_mesh_scale 8 for large objects, 20–40 for small
+
+IMPORTANT RULES FOR SUGGESTIONS:
+  - Make conservative adjustments — change each parameter by no more than 20% of its current value
+  - Never move multiple parameters all in the same direction at once (e.g. do not simultaneously
+    lower Q, raise black_pct, AND raise white_pct — that compounds into a massively darker image)
+  - If the core is overexposed, raise white_pct slightly OR lower Q — not both
+  - Prefer null (no change) for parameters that are not clearly wrong
+
+Return ONLY a single valid JSON object — no markdown, no code fences, no commentary:
+{
+  "diagnosis": "2–3 sentences describing what you see",
+  "issues": ["concise issue 1", "concise issue 2"],
+  "suggestions": {
+    "bg_mesh_scale": <number or null>,
+    "stretch_q":     <number or null>,
+    "black_pct":     <number or null>,
+    "white_pct":     <number or null>,
+    "luma_k":        <number or null>,
+    "luma_sig":      <number or null>,
+    "unsharp_gain":  <number or null>,
+    "unsharp_sig":   <number or null>,
+    "chroma_k":      <number or null>,
+    "chroma_sig":    <number or null>
+  },
+  "reasoning": "one sentence per changed parameter explaining why"
+}
+Set any parameter to null if it looks good and needs no change.\
+"""
+
+
+@app.route("/api/stack/analyze/<path:session_name>", methods=["POST"])
+def api_stack_analyze(session_name: str):
+    """
+    Send the current stacked JPEG to a local Ollama vision model and return
+    parameter improvement suggestions as JSON.
+    """
+    import base64
+    import urllib.request
+    import urllib.error
+
+    job = db.get_stack_job(session_name)
+    if not job or not job.get("output_path"):
+        abort(404, "No completed stack for this session")
+
+    jpeg_path = job["output_path"]
+    if not os.path.isfile(jpeg_path):
+        abort(404, "JPEG not found — re-render first")
+
+    body = request.get_json(silent=True) or {}
+    ollama_model = body.get("ollama_model", "llama3.2-vision:latest")
+    ollama_url   = body.get("ollama_url",   "http://localhost:11434")
+
+    current_params = {k: body.get(k) for k in (
+        "bg_mesh_scale", "stretch_q", "black_pct", "white_pct",
+        "luma_k", "luma_sig", "unsharp_gain", "unsharp_sig",
+        "chroma_k", "chroma_sig",
+    ) if body.get(k) is not None}
+
+    with open(jpeg_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode()
+
+    feedback = body.get("feedback", "").strip()
+    user_msg = (
+        f"Current parameters:\n{json.dumps(current_params, indent=2)}\n\n"
+        + (f"User feedback on the current render: {feedback}\n\n" if feedback else "")
+        + "Analyze this astrophotography image and return your JSON suggestions."
+    )
+
+    payload = {
+        "model":    ollama_model,
+        "messages": [
+            {"role": "system",  "content": _OLLAMA_SYSTEM_PROMPT},
+            {"role": "user",    "content": user_msg, "images": [img_b64]},
+        ],
+        "stream":  True,
+        "format":  "json",
+        "options": {"temperature": 0.2},
+    }
+
+    def _generate():
+        content = ""
+        try:
+            req = urllib.request.Request(
+                f"{ollama_url}/api/chat",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                for raw_line in resp:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        chunk = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = chunk.get("message", {}).get("content", "")
+                    if delta:
+                        content += delta
+                        yield f"data: {json.dumps({'type': 'token', 'text': delta})}\n\n"
+                    if chunk.get("done"):
+                        break
+
+            # Stream finished — parse and emit structured result
+            try:
+                analysis = json.loads(content)
+                yield f"data: {json.dumps({'type': 'result', 'analysis': analysis})}\n\n"
+            except json.JSONDecodeError as exc:
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Invalid JSON from model: {exc}', 'raw': content[:500]})}\n\n"
+
+        except urllib.error.HTTPError as exc:
+            msg = (f"Model '{ollama_model}' not found — run: ollama pull {ollama_model}"
+                   if exc.code == 404 else f"Ollama HTTP {exc.code}: {exc.reason}")
+            yield f"data: {json.dumps({'type': 'error', 'message': msg})}\n\n"
+        except urllib.error.URLError as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Cannot reach Ollama at {ollama_url} ({exc.reason})'})}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+    return Response(
+        _generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/impacts")

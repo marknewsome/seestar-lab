@@ -1,0 +1,1242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stack Wizard — {{ session_name }} — Seestar Lab</title>
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <style>
+    /* ── Layout ─────────────────────────────────────────────── */
+    .sw-page {
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      grid-template-rows: auto 1fr;
+      height: calc(100vh - 52px);   /* below header */
+      overflow: hidden;
+    }
+    .sw-panel {
+      grid-row: 1 / 3;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 1.1rem 1rem 2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    .sw-preview-area {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: #050810;
+    }
+
+    /* ── Panel elements ─────────────────────────────────────── */
+    .sw-title {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      margin: 1rem 0 0.4rem;
+      padding-bottom: 0.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .sw-title:first-child { margin-top: 0; }
+
+    .sw-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+    .sw-label {
+      font-size: 0.78rem;
+      color: var(--text);
+      flex: 1;
+      line-height: 1.3;
+    }
+    .sw-sub {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      display: block;
+    }
+    .sw-input {
+      width: 72px;
+      text-align: right;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border-hi);
+      border-radius: 4px;
+      padding: 0.22rem 0.4rem;
+      font-size: 0.8rem;
+      font-family: inherit;
+      flex-shrink: 0;
+    }
+    .sw-input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    /* ── Action buttons ─────────────────────────────────────── */
+    .sw-btn {
+      width: 100%;
+      padding: 0.5rem 0;
+      border: none;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 0.5rem;
+      transition: opacity 0.15s;
+    }
+    .sw-btn:disabled { opacity: 0.45; cursor: default; }
+    .sw-btn-primary  { background: var(--accent); color: #fff; }
+    .sw-btn-primary:hover:not(:disabled)  { opacity: 0.85; }
+    .sw-btn-secondary { background: transparent; color: var(--accent);
+                        border: 1px solid var(--accent); margin-top: 0.35rem; }
+    .sw-btn-secondary:hover:not(:disabled) { background: var(--accent-dim); }
+    .sw-btn-stack { background: #223311; color: #7ecf5a;
+                    border: 1px solid #4a7a2a; margin-top: 0.35rem; }
+    .sw-btn-stack:hover:not(:disabled) { background: #2d4418; }
+    .sw-btn-analyze { background: #1a1a3a; color: #a78bfa;
+                      border: 1px solid #4c3a8a; margin-top: 0.35rem; }
+    .sw-btn-analyze:hover:not(:disabled) { background: #252550; }
+    .sw-btn-analyze.thinking { animation: analyzing-pulse 1.4s ease-in-out infinite; }
+    @keyframes analyzing-pulse {
+      0%,100% { opacity:1; } 50% { opacity:0.5; }
+    }
+    /* suggestion chips */
+    .sw-suggestion-chip {
+      display: inline-flex; align-items: center; gap: 0.3rem;
+      background: var(--accent-dim); border: 1px solid var(--border-hi);
+      border-radius: 4px; padding: 0.15rem 0.45rem;
+      font-size: 0.71rem; margin: 0.15rem 0.2rem 0.15rem 0;
+      white-space: nowrap;
+    }
+    .sw-chip-label { color: var(--text-muted); }
+    .sw-chip-arrow { color: var(--text-muted); }
+    .sw-chip-val   { color: var(--accent); font-weight: 600; }
+
+    .sw-reset {
+      font-size: 0.69rem;
+      color: var(--text-muted);
+      cursor: pointer;
+      text-decoration: underline;
+      text-align: center;
+      display: block;
+      margin-top: 0.5rem;
+      background: none;
+      border: none;
+    }
+    .sw-reset:hover { color: var(--accent); }
+
+    /* ── Status / progress ──────────────────────────────────── */
+    .sw-status-bar {
+      padding: 0.45rem 1rem;
+      font-size: 0.76rem;
+      color: var(--text-muted);
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      min-height: 34px;
+    }
+    .sw-stage { color: var(--accent); font-weight: 500; }
+    .sw-progress-wrap {
+      flex: 1;
+      height: 3px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .sw-progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width 0.4s ease;
+    }
+    .sw-frames { margin-left: auto; white-space: nowrap; }
+
+    /* ── Preview image ──────────────────────────────────────── */
+    .sw-img-wrap {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
+    }
+    .sw-img-wrap img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+    .sw-no-image {
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      text-align: center;
+      padding: 2rem;
+    }
+    .sw-spinner {
+      position: absolute;
+      inset: 0;
+      background: rgba(5,8,16,0.65);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.82rem;
+      color: var(--accent);
+    }
+    .sw-spinner.hidden { display: none; }
+
+    /* ── Comparison slider — all styled inline on elements ─── */
+    .sw-compare-divider {
+      position: absolute; top: 0; bottom: 0; width: 3px;
+      background: rgba(255,255,255,0.85); transform: translateX(-50%);
+      pointer-events: none;
+    }
+    .sw-compare-handle {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 36px; height: 36px; border-radius: 50%;
+      background: rgba(255,255,255,0.9); color: #222;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.9rem; font-weight: 700; box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+      pointer-events: none;
+    }
+    .sw-compare-label {
+      position: absolute; bottom: 0.5rem;
+      font-size: 0.65rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.06em; padding: 0.15rem 0.4rem; border-radius: 3px;
+      background: rgba(0,0,0,0.55); pointer-events: none;
+    }
+    .sw-label-before { left: 0.5rem; color: #f59e0b; }
+    .sw-label-after  { right: 0.5rem; color: var(--accent); }
+    /* ── Delta summary ──────────────────────────────────────── */
+    .sw-delta {
+      font-size: 0.68rem; color: var(--text-muted); margin: 0.2rem 0 0.4rem;
+      line-height: 1.5;
+    }
+    .sw-delta-val { color: var(--accent); }
+    /* ── Info strip below image ─────────────────────────────── */
+    .sw-info-strip {
+      padding: 0.35rem 1rem;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      gap: 1.2rem;
+      flex-wrap: wrap;
+    }
+    .sw-info-strip span { white-space: nowrap; }
+
+    /* ── Format selector + preset ──────────────────────────── */
+    .sw-select {
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border-hi); border-radius: 4px;
+      padding: 0.22rem 0.4rem; font-size: 0.78rem; font-family: inherit;
+      flex-shrink: 0; cursor: pointer;
+    }
+    .sw-select:focus { outline: none; border-color: var(--accent); }
+    .sw-preset-row { display: flex; gap: 0.35rem; align-items: center; margin-bottom: 0.4rem; }
+    .sw-preset-name {
+      flex: 1; background: var(--bg); color: var(--text);
+      border: 1px solid var(--border-hi); border-radius: 4px;
+      padding: 0.22rem 0.4rem; font-size: 0.75rem; font-family: inherit;
+    }
+    .sw-preset-name:focus { outline: none; border-color: var(--accent); }
+    .sw-preset-btn {
+      font-size: 0.72rem; padding: 0.22rem 0.5rem;
+      border-radius: 4px; border: 1px solid var(--border-hi);
+      background: transparent; color: var(--text-muted); cursor: pointer;
+      white-space: nowrap; transition: color var(--transition), border-color var(--transition);
+    }
+    .sw-preset-btn:hover { color: var(--accent); border-color: var(--accent); }
+    .sw-preset-chip {
+      display: inline-block; margin: 0.1rem 0.2rem 0.1rem 0;
+      padding: 0.1rem 0.4rem; border-radius: 4px;
+      background: var(--surface); border: 1px solid var(--border-hi);
+      cursor: pointer; white-space: nowrap; font-size: 0.72rem;
+    }
+    .sw-preset-chip:hover { border-color: var(--accent); color: var(--accent); }
+    .sw-preset-del { margin-left: 0.25rem; color: #cf6679; cursor: pointer; }
+    /* ── Hint box ───────────────────────────────────────────── */
+    .sw-hint {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+      margin-top: 0.3rem;
+      margin-bottom: 0.1rem;
+    }
+
+    /* ── Responsive: stack on narrow screens ────────────────── */
+    @media (max-width: 720px) {
+      .sw-page { grid-template-columns: 1fr; height: auto; overflow: visible; }
+      .sw-panel { border-right: none; border-bottom: 1px solid var(--border); }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div class="brand">
+      <span class="brand-icon">✦</span>
+      <span class="brand-name">Seestar Lab</span>
+    </div>
+    <nav class="site-nav">
+      <a class="nav-link" href="/">Sessions</a>
+      <a class="nav-link" href="/catalog/messier">Messier</a>
+      <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+      <a class="nav-link" href="/activity">Activity</a>
+      <a class="nav-link" href="/comet">Comet</a>
+      <a class="nav-link" href="/solar">Solar</a>
+      <a class="nav-link" href="/lunar">Lunar</a>
+      <a class="nav-link" href="/planner">Planner</a>
+      <a class="nav-link" href="/capture">Capture</a>
+      <a class="nav-link active" href="/stack/jobs">Queue</a>
+    </nav>
+  </div>
+</header>
+
+<main class="sw-page">
+
+  <!-- ── Left panel: controls ──────────────────────────────────────────────── -->
+  <aside class="sw-panel">
+
+    <div class="sw-title">Session</div>
+    <div style="font-size:0.8rem;word-break:break-all;margin-bottom:0.5rem">{{ session_name }}</div>
+    {% if job %}
+    <div style="font-size:0.72rem;color:var(--text-muted);margin-bottom:0.2rem">
+      Last run:
+      <span style="color:var(--text)">{{ job.frames_accepted or 0 }} / {{ job.frames_total or '?' }} frames</span>
+    </div>
+    {% endif %}
+
+    <!-- ── Presets ─────────────────────────────────────────────────────────── -->
+    <div class="sw-title">Presets</div>
+    <div class="sw-preset-row">
+      <input id="inp-preset-name" class="sw-preset-name" type="text" placeholder="Preset name…" />
+      <button class="sw-preset-btn" onclick="savePreset()">Save</button>
+    </div>
+    <div id="sw-preset-list" style="font-size:0.72rem;color:var(--text-muted);margin-bottom:0.3rem"></div>
+    <p class="sw-hint">Click a preset to load its settings and re-render.</p>
+
+    <!-- ── Frame selection ─────────────────────────────────────────────────── -->
+    <div class="sw-title">Frame selection</div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Max frames
+        <span class="sw-sub">Cap on accepted subs (best-first)</span>
+      </label>
+      <input id="inp-max-frames" class="sw-input" type="number" min="1" step="100"
+             value="{{ job.max_frames if job and job.max_frames else 500 }}" />
+    </div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Min quality
+        <span class="sw-sub">Fraction of best score (0 = off)</span>
+      </label>
+      <input id="inp-min-quality" class="sw-input" type="number" min="0" max="1" step="0.05"
+             value="{{ job.min_quality if job and job.min_quality else 0.0 }}" />
+    </div>
+
+    <!-- ── Background subtraction ─────────────────────────────────────────── -->
+    <div class="sw-title">Background subtraction</div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Mesh scale
+        <span class="sw-sub">Width ÷ scale = cell size. 0 = skip</span>
+      </label>
+      <input id="inp-bg-mesh" class="sw-input" type="number" min="0" step="1"
+             value="{{ defaults.bg_mesh_scale }}" />
+    </div>
+    <p class="sw-hint">
+      Coarse (8): large galaxies. Fine (40): compact nebulae. 0: skip (fills frame).
+    </p>
+
+    <!-- ── Stretch ────────────────────────────────────────────────────────── -->
+    <div class="sw-title">Asinh stretch</div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Q
+        <span class="sw-sub">Compression strength (4–12)</span>
+      </label>
+      <input id="inp-stretch-q" class="sw-input" type="number" min="1" max="30" step="0.5"
+             value="{{ defaults.stretch_q }}" />
+    </div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Black point %
+        <span class="sw-sub">Percentile subtracted before stretch</span>
+      </label>
+      <input id="inp-black-pct" class="sw-input" type="number" min="0" max="90" step="1"
+             value="{{ defaults.black_pct }}" />
+    </div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        White point %
+        <span class="sw-sub">Lower = brighter core (more star clipping)</span>
+      </label>
+      <input id="inp-white-pct" class="sw-input" type="number" min="90" max="100" step="0.1"
+             value="{{ defaults.white_pct }}" />
+    </div>
+    <p class="sw-hint">99.9 = default. 99.5 = brighter core. 99.99 = protect highlights.</p>
+
+    <!-- ── Luma sharpening ────────────────────────────────────────────────── -->
+    <div class="sw-title">Luma processing</div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Denoise kernel
+        <span class="sw-sub">Gaussian blur size (odd px, 0 = skip)</span>
+      </label>
+      <input id="inp-luma-k" class="sw-input" type="number" min="0" step="2"
+             value="{{ defaults.luma_k }}" />
+    </div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Denoise sigma
+      </label>
+      <input id="inp-luma-sig" class="sw-input" type="number" min="0.1" step="0.5"
+             value="{{ defaults.luma_sig }}" />
+    </div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Unsharp gain
+        <span class="sw-sub">0 = no sharpening</span>
+      </label>
+      <input id="inp-unsharp-gain" class="sw-input" type="number" min="0" step="0.05"
+             value="{{ defaults.unsharp_gain }}" />
+    </div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Unsharp sigma
+      </label>
+      <input id="inp-unsharp-sig" class="sw-input" type="number" min="0.1" step="0.25"
+             value="{{ defaults.unsharp_sig }}" />
+    </div>
+
+    <!-- ── Chroma denoising ───────────────────────────────────────────────── -->
+    <div class="sw-title">Chroma denoising</div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Kernel size
+        <span class="sw-sub">Larger = stronger color smoothing</span>
+      </label>
+      <input id="inp-chroma-k" class="sw-input" type="number" min="0" step="2"
+             value="{{ defaults.chroma_k }}" />
+    </div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Sigma
+      </label>
+      <input id="inp-chroma-sig" class="sw-input" type="number" min="0.1" step="1"
+             value="{{ defaults.chroma_sig }}" />
+    </div>
+    <p class="sw-hint">Higher = smoother colors but stars lose hue. 31/10 is a safe default.</p>
+
+    <!-- ── Actions ────────────────────────────────────────────────────────── -->
+    <div class="sw-title">Actions</div>
+
+    {% if has_fits %}
+    <button id="btn-rerender" class="sw-btn sw-btn-primary" onclick="doRerender()">
+      Re-render preview
+    </button>
+    <p class="sw-hint" style="text-align:center">
+      Uses saved linear FITS — seconds, not minutes.
+    </p>
+    {% else %}
+    <div style="font-size:0.75rem;color:#cf6679;margin-bottom:0.3rem;text-align:center">
+      No stacked FITS found — run a full stack first.
+    </div>
+    {% endif %}
+
+    <button id="btn-stack" class="sw-btn sw-btn-stack" onclick="doStack()">
+      Full re-stack
+    </button>
+    <p class="sw-hint" style="text-align:center">
+      Reprocesses sub-frames from scratch.
+    </p>
+
+    <button id="btn-revert" class="sw-btn sw-btn-secondary"
+            style="display:none" onclick="doRevert()">
+      ↩ Revert to previous settings
+    </button>
+    <div id="sw-delta" class="sw-delta" style="display:none"></div>
+
+    <!-- ── AI Analysis ─────────────────────────────────────────────────── -->
+    <div class="sw-title" style="margin-top:1rem">AI Analysis</div>
+
+    <div class="sw-row" style="margin-bottom:0.3rem">
+      <label class="sw-label">
+        Model
+        <span class="sw-sub">Ollama vision model name</span>
+      </label>
+      <input id="inp-ollama-model" class="sw-input" type="text"
+             style="width:130px;text-align:left;font-size:0.72rem"
+             value="llama3.2-vision:latest" />
+    </div>
+
+    <div class="sw-row" style="align-items:flex-start;margin-bottom:0.3rem">
+      <label class="sw-label">
+        Feedback
+        <span class="sw-sub">Optional — describe what's wrong</span>
+      </label>
+    </div>
+    <textarea id="inp-feedback"
+              placeholder="e.g. core too dark, stars blurry, too much color noise…"
+              style="width:100%;box-sizing:border-box;background:var(--bg);color:var(--text);
+                     border:1px solid var(--border-hi);border-radius:4px;padding:0.3rem 0.4rem;
+                     font-size:0.75rem;font-family:inherit;resize:vertical;min-height:48px;
+                     margin-bottom:0.4rem"></textarea>
+
+    <button id="btn-analyze" class="sw-btn sw-btn-analyze" onclick="doAnalyze()">
+      ✦ Analyze Image
+    </button>
+    <p class="sw-hint" style="text-align:center">
+      Sends current preview to local Ollama — suggests parameter changes.
+    </p>
+
+    <button class="sw-reset" onclick="resetDefaults()">Reset to defaults</button>
+
+    <!-- ── Download ────────────────────────────────────────────────────────── -->
+    <div class="sw-title" style="margin-top:1rem">Download</div>
+    <div class="sw-row" style="margin-bottom:0.5rem">
+      <label class="sw-label">Format</label>
+      <select id="inp-dl-format" class="sw-select">
+        <option value="jpeg">JPEG  (with EXIF)</option>
+        <option value="tiff">16-bit TIFF</option>
+      </select>
+    </div>
+    <button class="sw-btn sw-btn-secondary" onclick="doDownload()">
+      ↓ Download image
+    </button>
+    <p class="sw-hint" style="text-align:center">
+      Metadata (object, frames, integration, params) baked in.
+    </p>
+
+    <div style="flex:1"></div>
+    <div style="margin-top:1rem">
+      <a href="/stack/jobs" style="font-size:0.72rem;color:var(--text-muted)">← Queue &amp; History</a>
+    </div>
+  </aside>
+
+  <!-- ── Right: preview ────────────────────────────────────────────────────── -->
+  <div class="sw-preview-area">
+
+    <!-- Status bar -->
+    <div class="sw-status-bar" id="sw-status">
+      <span id="sw-stage" class="sw-stage">—</span>
+      <div class="sw-progress-wrap">
+        <div class="sw-progress-fill" id="sw-prog-fill" style="width:0%"></div>
+      </div>
+      <span class="sw-frames" id="sw-frames"></span>
+    </div>
+
+    <!-- AI Analysis result panel -->
+    <div id="sw-analysis-panel" style="display:none;
+         background:var(--surface);border-bottom:1px solid var(--border);
+         padding:0.75rem 1rem;font-size:0.78rem;line-height:1.5">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:0.4rem">
+        <span style="font-weight:600;color:var(--accent)">✦ AI Analysis</span>
+        <button onclick="dismissAnalysis()"
+                style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:0.75rem">
+          ✕ dismiss
+        </button>
+      </div>
+      <div id="sw-analysis-diag" style="color:var(--text);margin-bottom:0.5rem"></div>
+      <div id="sw-analysis-issues" style="margin-bottom:0.5rem"></div>
+      <div id="sw-analysis-suggestions" style="margin-bottom:0.5rem"></div>
+      <div id="sw-analysis-reasoning"
+           style="font-size:0.71rem;color:var(--text-muted);font-style:italic"></div>
+      <button id="btn-apply-analysis" class="sw-btn sw-btn-primary"
+              style="margin-top:0.6rem;padding:0.35rem 0"
+              onclick="applyAnalysis()">
+        Apply suggestions &amp; Re-render
+      </button>
+    </div>
+
+    <!-- Image -->
+    <div class="sw-img-wrap" id="sw-img-wrap">
+      <div class="sw-no-image" id="sw-no-img">
+        {% if has_fits %}
+          Press <strong>Re-render preview</strong> to generate an image.
+        {% else %}
+          No stacked output yet. Run a <strong>Full re-stack</strong> to begin.
+        {% endif %}
+      </div>
+
+      <!-- Normal single-image view -->
+      <img id="sw-img" src="" alt="Stack preview" style="display:none;max-width:100%;max-height:100%;object-fit:contain" />
+
+      <!-- Before overlay: sits above sw-img, clipped from the right to reveal before on left side -->
+      <img id="sw-img-before" src="" alt="Before"
+           style="display:none;position:absolute;top:0;left:0;right:0;bottom:0;
+                  width:100%;height:100%;object-fit:contain;
+                  clip-path:inset(0 50% 0 0);pointer-events:none;z-index:2;" />
+
+      <!-- Compare chrome: divider bar + Before/After labels (pointer-events:none so drag passes through) -->
+      <div id="sw-compare-chrome"
+           style="display:none;position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:4;">
+        <div id="sw-divider"
+             style="position:absolute;top:0;bottom:0;left:50%;width:3px;
+                    background:rgba(255,255,255,0.85);transform:translateX(-50%);">
+          <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+                      width:34px;height:34px;border-radius:50%;
+                      background:rgba(255,255,255,0.9);color:#111;
+                      display:flex;align-items:center;justify-content:center;
+                      font-size:0.85rem;font-weight:700;box-shadow:0 2px 8px rgba(0,0,0,0.5);">⟺</div>
+        </div>
+        <span style="position:absolute;bottom:0.6rem;left:0.6rem;font-size:0.65rem;font-weight:600;
+                     color:#f59e0b;background:rgba(0,0,0,0.6);padding:0.15rem 0.45rem;border-radius:3px;">Before</span>
+        <span style="position:absolute;bottom:0.6rem;right:0.6rem;font-size:0.65rem;font-weight:600;
+                     color:var(--accent);background:rgba(0,0,0,0.6);padding:0.15rem 0.45rem;border-radius:3px;">After</span>
+      </div>
+
+      <!-- Drag capture div — sits above before overlay, receives all mouse/touch events -->
+      <div id="sw-compare-drag"
+           style="display:none;position:absolute;top:0;left:0;right:0;bottom:0;cursor:col-resize;z-index:3;"></div>
+
+      <div class="sw-spinner hidden" id="sw-spinner">Rendering…</div>
+
+      <!-- Compare toggle — floats top-right of the image area -->
+      <button id="btn-compare" onclick="toggleCompare()"
+              style="display:none;position:absolute;top:0.6rem;right:0.6rem;z-index:10;
+                     font-size:0.72rem;font-weight:600;padding:0.3rem 0.7rem;
+                     border-radius:5px;border:1px solid var(--accent);
+                     background:var(--accent-dim);color:var(--accent);
+                     cursor:pointer;white-space:nowrap;
+                     box-shadow:0 2px 6px rgba(0,0,0,0.5)">
+        ⟺ Compare
+      </button>
+    </div>
+
+    <!-- Info strip -->
+    <div class="sw-info-strip" id="sw-info" style="display:none">
+      <span id="info-frames"></span>
+      <span id="info-params"></span>
+    </div>
+
+  </div>
+</main>
+
+<script>
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+const SESSION = {{ session_name | tojson }};
+
+// ── Defaults (from server) ────────────────────────────────────────────────────
+const DEFAULTS = {
+  maxFrames:   {{ (job.max_frames if job and job.max_frames else 500) | int }},
+  minQuality:  {{ (job.min_quality if job and job.min_quality else 0.0) | float }},
+  bgMesh:      {{ defaults.bg_mesh_scale | int }},
+  stretchQ:    {{ defaults.stretch_q | float }},
+  blackPct:    {{ defaults.black_pct | float }},
+  whitePct:    {{ defaults.white_pct | float }},
+  lumaK:       {{ defaults.luma_k | int }},
+  lumaSig:     {{ defaults.luma_sig | float }},
+  unsharpGain: {{ defaults.unsharp_gain | float }},
+  unsharpSig:  {{ defaults.unsharp_sig | float }},
+  chromaK:     {{ defaults.chroma_k | int }},
+  chromaSig:   {{ defaults.chroma_sig | float }},
+};
+
+function getParams() {
+  return {
+    max_frames:   parseInt(document.getElementById('inp-max-frames').value)  || DEFAULTS.maxFrames,
+    min_quality:  parseFloat(document.getElementById('inp-min-quality').value) || 0,
+    bg_mesh_scale: parseInt(document.getElementById('inp-bg-mesh').value),
+    stretch_q:    parseFloat(document.getElementById('inp-stretch-q').value),
+    black_pct:    parseFloat(document.getElementById('inp-black-pct').value),
+    white_pct:    parseFloat(document.getElementById('inp-white-pct').value),
+    luma_k:       parseInt(document.getElementById('inp-luma-k').value),
+    luma_sig:     parseFloat(document.getElementById('inp-luma-sig').value),
+    unsharp_gain: parseFloat(document.getElementById('inp-unsharp-gain').value),
+    unsharp_sig:  parseFloat(document.getElementById('inp-unsharp-sig').value),
+    chroma_k:     parseInt(document.getElementById('inp-chroma-k').value),
+    chroma_sig:   parseFloat(document.getElementById('inp-chroma-sig').value),
+  };
+}
+
+function resetDefaults() {
+  document.getElementById('inp-max-frames').value  = DEFAULTS.maxFrames;
+  document.getElementById('inp-min-quality').value = DEFAULTS.minQuality;
+  document.getElementById('inp-bg-mesh').value     = DEFAULTS.bgMesh;
+  document.getElementById('inp-stretch-q').value   = DEFAULTS.stretchQ;
+  document.getElementById('inp-black-pct').value   = DEFAULTS.blackPct;
+  document.getElementById('inp-white-pct').value   = DEFAULTS.whitePct;
+  document.getElementById('inp-luma-k').value      = DEFAULTS.lumaK;
+  document.getElementById('inp-luma-sig').value    = DEFAULTS.lumaSig;
+  document.getElementById('inp-unsharp-gain').value = DEFAULTS.unsharpGain;
+  document.getElementById('inp-unsharp-sig').value  = DEFAULTS.unsharpSig;
+  document.getElementById('inp-chroma-k').value    = DEFAULTS.chromaK;
+  document.getElementById('inp-chroma-sig').value  = DEFAULTS.chromaSig;
+}
+
+// ── Running state ─────────────────────────────────────────────────────────────
+let isRunning = false;
+let lastParams = null;
+
+function setRunning(v) {
+  isRunning = v;
+  const rr = document.getElementById('btn-rerender');
+  const st = document.getElementById('btn-stack');
+  if (rr) rr.disabled = v;
+  if (st) st.disabled = v;
+  document.getElementById('sw-spinner').classList.toggle('hidden', !v);
+}
+
+function setStage(stage, pct) {
+  document.getElementById('sw-stage').textContent = stage || '—';
+  document.getElementById('sw-prog-fill').style.width = Math.max(0, pct || 0) + '%';
+}
+
+function setFrames(accepted, total) {
+  const el = document.getElementById('sw-frames');
+  if (accepted != null && total != null && total > 0) {
+    el.textContent = `${accepted} / ${total} frames`;
+  } else {
+    el.textContent = '';
+  }
+}
+
+// ── Re-render ─────────────────────────────────────────────────────────────────
+async function doRerender(skipSnapshot = false) {
+  if (isRunning) return;
+  if (!skipSnapshot) snapshotParams();
+  const p = getParams();
+  lastParams = p;
+  updateDelta();
+  setRunning(true);
+  setStage('Starting re-render…', 0);
+  try {
+    const r = await fetch(`/api/stack/rerender/${encodeURIComponent(SESSION)}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(p),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      setStage(`Error: ${t}`, 0);
+      setRunning(false);
+    }
+    // progress via SSE
+  } catch(e) {
+    setStage(`Error: ${e}`, 0);
+    setRunning(false);
+  }
+}
+
+// ── Full stack ────────────────────────────────────────────────────────────────
+async function doStack() {
+  if (isRunning) return;
+  const p = getParams();
+  lastParams = p;
+  setRunning(true);
+  setStage('Queuing full stack…', 0);
+  try {
+    const r = await fetch('/api/stack/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        session_name:  SESSION,
+        max_frames:    p.max_frames,
+        min_quality:   p.min_quality,
+        bg_mesh_scale: p.bg_mesh_scale,
+      }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      setStage(`Error: ${t}`, 0);
+      setRunning(false);
+    }
+    // progress via SSE
+  } catch(e) {
+    setStage(`Error: ${e}`, 0);
+    setRunning(false);
+  }
+}
+
+// ── SSE ───────────────────────────────────────────────────────────────────────
+const evtSrc = new EventSource('/api/events');
+evtSrc.onmessage = e => {
+  let ev;
+  try { ev = JSON.parse(e.data); } catch { return; }
+  if (ev.session_name !== SESSION) return;
+
+  switch (ev.type) {
+    case 'stack_progress': {
+      const pct = ev.pct ?? 0;
+      if (pct < 0) {
+        // error
+        setStage(ev.stage || 'Error', 0);
+        setRunning(false);
+      } else {
+        setStage(ev.stage || 'Working…', pct);
+        setFrames(ev.frames_accepted, ev.frames_total);
+        if (!isRunning) setRunning(true);
+      }
+      break;
+    }
+    case 'stack_queued':
+      setStage('Queued — waiting for worker…', 0);
+      break;
+    case 'stack_done': {
+      setStage('Done', 100);
+      setFrames(ev.frames_accepted, ev.frames_total);
+      // Reload image with cache-bust
+      const img = document.getElementById('sw-img');
+      const noImg = document.getElementById('sw-no-img');
+      const ts = Date.now();
+      img.src = `/api/stack/image/${encodeURIComponent(SESSION)}?t=${ts}`;
+      img.style.display = '';
+      noImg.style.display = 'none';
+      img.onload = () => {
+        setRunning(false);
+        showInfoStrip(ev.frames_accepted, ev.frames_total);
+        // Check whether a previous render exists to enable Compare
+        fetch(`/api/stack/image/previous/${encodeURIComponent(SESSION)}`, {method:'HEAD'})
+          .then(r => {
+            document.getElementById('btn-compare').style.display = r.ok ? '' : 'none';
+            // In compare mode, refresh the before image to the newly saved previous render
+            if (compareMode && r.ok) {
+              const before = document.getElementById('sw-img-before');
+              before.src = `/api/stack/image/previous/${encodeURIComponent(SESSION)}?t=${Date.now()}`;
+            }
+          }).catch(() => {});
+      };
+      img.onerror = () => setRunning(false);
+      break;
+    }
+  }
+};
+
+function showInfoStrip(accepted, total) {
+  const p = lastParams;
+  if (!p) return;
+  const framesEl = document.getElementById('info-frames');
+  const paramsEl = document.getElementById('info-params');
+  if (accepted != null && total != null) {
+    framesEl.textContent = `${accepted} / ${total} frames`;
+  }
+  paramsEl.textContent =
+    `bg=${p.bg_mesh_scale} · Q=${p.stretch_q} · blk=${p.black_pct}% · wht=${p.white_pct}% · ` +
+    `luma ${p.luma_k}×${p.luma_k}/σ${p.luma_sig} · unsharp ${p.unsharp_gain}/σ${p.unsharp_sig} · ` +
+    `chroma ${p.chroma_k}×${p.chroma_k}/σ${p.chroma_sig}`;
+  document.getElementById('sw-info').style.display = '';
+}
+
+// ── Previous params + revert ──────────────────────────────────────────────────
+let previousParams = null;
+
+const PARAM_LABELS = {
+  bg_mesh_scale:'bg scale', stretch_q:'Q', black_pct:'black%', white_pct:'white%',
+  luma_k:'luma k', luma_sig:'luma σ', unsharp_gain:'unsharp gain',
+  unsharp_sig:'unsharp σ', chroma_k:'chroma k', chroma_sig:'chroma σ',
+};
+
+function snapshotParams() {
+  previousParams = getParams();
+}
+
+function doRevert() {
+  if (!previousParams) return;
+  const MAP = {
+    bg_mesh_scale:'inp-bg-mesh', stretch_q:'inp-stretch-q',
+    black_pct:'inp-black-pct', white_pct:'inp-white-pct',
+    luma_k:'inp-luma-k', luma_sig:'inp-luma-sig',
+    unsharp_gain:'inp-unsharp-gain', unsharp_sig:'inp-unsharp-sig',
+    chroma_k:'inp-chroma-k', chroma_sig:'inp-chroma-sig',
+  };
+  for (const [k, id] of Object.entries(MAP)) {
+    if (previousParams[k] != null) {
+      const el = document.getElementById(id);
+      if (el) el.value = previousParams[k];
+    }
+  }
+  updateDelta();      // delta will now show zeros — hide it
+  doRerender();
+}
+
+function updateDelta() {
+  const deltaEl = document.getElementById('sw-delta');
+  const revertBtn = document.getElementById('btn-revert');
+  if (!previousParams) { deltaEl.style.display = 'none'; revertBtn.style.display = 'none'; return; }
+  const cur = getParams();
+  const changes = [];
+  for (const k of Object.keys(PARAM_LABELS)) {
+    const pv = previousParams[k], cv = cur[k];
+    if (pv != null && cv != null && Math.abs(pv - cv) > 0.001) {
+      changes.push(`${PARAM_LABELS[k]} <span class="sw-delta-val">${pv}→${cv}</span>`);
+    }
+  }
+  if (!changes.length) {
+    deltaEl.style.display = 'none';
+  } else {
+    deltaEl.innerHTML = 'Δ ' + changes.join(' · ');
+    deltaEl.style.display = '';
+  }
+  revertBtn.style.display = previousParams ? '' : 'none';
+}
+
+// Update delta summary whenever any input changes
+document.addEventListener('input', e => {
+  if (e.target.closest('.sw-panel')) updateDelta();
+});
+
+// ── Comparison slider ─────────────────────────────────────────────────────────
+let compareMode = false;
+let comparePct  = 50;   // divider position as % of container width
+
+function toggleCompare() {
+  compareMode = !compareMode;
+  const btn    = document.getElementById('btn-compare');
+  const before  = document.getElementById('sw-img-before');
+  const chrome  = document.getElementById('sw-compare-chrome');
+  const drag    = document.getElementById('sw-compare-drag');
+  if (compareMode) {
+    // sw-img stays visible as "after"; overlay before image on left side
+    const ts = Date.now();
+    before.src           = `/api/stack/image/previous/${encodeURIComponent(SESSION)}?t=${ts}`;
+    before.style.display = '';
+    chrome.style.display = '';
+    drag.style.display   = '';
+    btn.textContent      = '✕ Exit compare';
+    btn.style.background = 'var(--accent)';
+    btn.style.color      = '#fff';
+    setDivider(50);
+  } else {
+    before.style.display = 'none';
+    chrome.style.display = 'none';
+    drag.style.display   = 'none';
+    before.src           = '';
+    btn.textContent      = '⟺ Compare';
+    btn.style.background = '';
+    btn.style.color      = '';
+  }
+}
+
+function setDivider(pct) {
+  comparePct = Math.max(2, Math.min(98, pct));
+  document.getElementById('sw-divider').style.left = comparePct + '%';
+  // clip before image from the right so left portion (0..pct%) remains visible
+  document.getElementById('sw-img-before').style.clipPath = `inset(0 ${100 - comparePct}% 0 0)`;
+}
+
+function initCompareSlider() {
+  const drag = document.getElementById('sw-compare-drag');
+  let dragging = false;
+
+  function getPct(clientX) {
+    const rect = document.getElementById('sw-img-wrap').getBoundingClientRect();
+    return ((clientX - rect.left) / rect.width) * 100;
+  }
+
+  drag.addEventListener('mousedown',   e => { dragging = true; setDivider(getPct(e.clientX)); });
+  window.addEventListener('mousemove', e => { if (dragging) setDivider(getPct(e.clientX)); });
+  window.addEventListener('mouseup',   () => { dragging = false; });
+
+  drag.addEventListener('touchstart',  e => { dragging = true; setDivider(getPct(e.touches[0].clientX)); }, {passive:true});
+  window.addEventListener('touchmove', e => { if (dragging) setDivider(getPct(e.touches[0].clientX)); }, {passive:true});
+  window.addEventListener('touchend',  () => { dragging = false; });
+}
+initCompareSlider();
+
+// ── Presets (localStorage) ────────────────────────────────────────────────────
+const PRESET_KEY = 'seestar-lab-stack-presets';  // global — shared across all sessions
+
+function loadPresets() {
+  try { return JSON.parse(localStorage.getItem(PRESET_KEY) || '{}'); }
+  catch { return {}; }
+}
+
+function savePreset() {
+  const name = document.getElementById('inp-preset-name').value.trim();
+  if (!name) { alert('Enter a preset name first.'); return; }
+  const presets = loadPresets();
+  presets[name] = getParams();
+  localStorage.setItem(PRESET_KEY, JSON.stringify(presets));
+  document.getElementById('inp-preset-name').value = '';
+  renderPresetList();
+}
+
+function applyPreset(name) {
+  const presets = loadPresets();
+  const p = presets[name];
+  if (!p) { setStage(`Preset "${name}" not found`, 0); return; }
+  snapshotParams();   // capture current values BEFORE overwriting so Revert works
+  const MAP = {
+    max_frames:    'inp-max-frames',   min_quality:   'inp-min-quality',
+    bg_mesh_scale: 'inp-bg-mesh',      stretch_q:     'inp-stretch-q',
+    black_pct:     'inp-black-pct',    white_pct:     'inp-white-pct',
+    luma_k:        'inp-luma-k',       luma_sig:      'inp-luma-sig',
+    unsharp_gain:  'inp-unsharp-gain', unsharp_sig:   'inp-unsharp-sig',
+    chroma_k:      'inp-chroma-k',     chroma_sig:    'inp-chroma-sig',
+  };
+  for (const [k, id] of Object.entries(MAP)) {
+    if (p[k] != null) {
+      const el = document.getElementById(id);
+      if (el) el.value = p[k];
+    }
+  }
+  setStage(`Preset "${name}" loaded`, 0);
+  updateDelta();
+  if (document.getElementById('btn-rerender')) doRerender(true);
+}
+
+function deletePreset(name) {
+  const presets = loadPresets();
+  delete presets[name];
+  localStorage.setItem(PRESET_KEY, JSON.stringify(presets));
+  renderPresetList();
+}
+
+function renderPresetList() {
+  const presets = loadPresets();
+  const el = document.getElementById('sw-preset-list');
+  const names = Object.keys(presets);
+  if (!names.length) {
+    el.innerHTML = '<span style="color:var(--text-muted)">No saved presets.</span>';
+    return;
+  }
+  el.innerHTML = '';
+  names.forEach(n => {
+    const chip = document.createElement('span');
+    chip.className = 'sw-preset-chip';
+    chip.textContent = n;
+    chip.addEventListener('click', () => applyPreset(n));
+
+    const del = document.createElement('span');
+    del.className = 'sw-preset-del';
+    del.textContent = ' ✕';
+    del.addEventListener('click', e => { e.stopPropagation(); deletePreset(n); });
+
+    chip.appendChild(del);
+    el.appendChild(chip);
+  });
+}
+
+// ── Download ──────────────────────────────────────────────────────────────────
+function doDownload() {
+  const fmt = document.getElementById('inp-dl-format').value;
+  const url = `/api/stack/download/${encodeURIComponent(SESSION)}?format=${fmt}`;
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+// ── AI Analysis ───────────────────────────────────────────────────────────────
+let _pendingSuggestions = null;
+
+async function doAnalyze() {
+  const imgEl = document.getElementById('sw-img');
+  if (!imgEl || imgEl.style.display === 'none') {
+    alert('Re-render the image first so there is something to analyze.');
+    return;
+  }
+  const btn = document.getElementById('btn-analyze');
+  btn.disabled = true;
+  btn.classList.add('thinking');
+  btn.textContent = '✦ Analyzing…';
+
+  // Show panel with live token stream while waiting
+  const panel = document.getElementById('sw-analysis-panel');
+  const tokenView = document.getElementById('sw-analysis-diag');
+  document.getElementById('sw-analysis-issues').innerHTML = '';
+  document.getElementById('sw-analysis-suggestions').innerHTML = '';
+  document.getElementById('sw-analysis-reasoning').textContent = '';
+  document.getElementById('btn-apply-analysis').style.display = 'none';
+  Object.assign(tokenView.style, {
+    fontFamily:'monospace', fontSize:'0.68rem', color:'var(--text-muted)',
+    whiteSpace:'pre-wrap', maxHeight:'120px', overflowY:'auto'
+  });
+  tokenView.textContent = '';
+  panel.style.display = '';
+
+  const p = getParams();
+  const model    = document.getElementById('inp-ollama-model').value.trim()
+                || 'llama3.2-vision:latest';
+  const feedback = document.getElementById('inp-feedback').value.trim();
+
+  try {
+    const r = await fetch(`/api/stack/analyze/${encodeURIComponent(SESSION)}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({...p, ollama_model: model, feedback}),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      alert('Analysis failed: ' + t);
+      panel.style.display = 'none';
+      return;
+    }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+        if (ev.type === 'token') {
+          tokenView.textContent += ev.text;
+          tokenView.scrollTop = tokenView.scrollHeight;
+        } else if (ev.type === 'result') {
+          Object.assign(tokenView.style, {
+            fontFamily:'', fontSize:'', color:'', whiteSpace:'', maxHeight:'', overflowY:''
+          });
+          tokenView.textContent = '';
+          showAnalysis(ev.analysis, p);
+        } else if (ev.type === 'error') {
+          alert('Analysis failed: ' + ev.message);
+          panel.style.display = 'none';
+        }
+      }
+    }
+  } catch(e) {
+    alert('Analysis error: ' + e);
+    panel.style.display = 'none';
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('thinking');
+    btn.textContent = '✦ Analyze Image';
+  }
+}
+
+function showAnalysis(a, currentParams) {
+  _pendingSuggestions = a.suggestions || {};
+
+  // Diagnosis
+  document.getElementById('sw-analysis-diag').textContent = a.diagnosis || '';
+
+  // Issues
+  const issuesEl = document.getElementById('sw-analysis-issues');
+  if (a.issues && a.issues.length) {
+    issuesEl.innerHTML = a.issues.map(i =>
+      `<span style="display:inline-block;margin-right:0.5rem;color:#f59e0b">⚠ ${esc(i)}</span>`
+    ).join('');
+  } else {
+    issuesEl.innerHTML = '';
+  }
+
+  // Suggestions chips
+  const sugEl = document.getElementById('sw-analysis-suggestions');
+  const LABELS = {
+    bg_mesh_scale: 'bg scale', stretch_q: 'Q', black_pct: 'black %',
+    white_pct: 'white %', luma_k: 'luma k', luma_sig: 'luma σ',
+    unsharp_gain: 'unsharp gain', unsharp_sig: 'unsharp σ',
+    chroma_k: 'chroma k', chroma_sig: 'chroma σ',
+  };
+  const chips = Object.entries(_pendingSuggestions)
+    .filter(([, v]) => v != null)
+    .map(([k, v]) => {
+      const cur = currentParams[k] ?? '?';
+      return `<span class="sw-suggestion-chip">
+        <span class="sw-chip-label">${LABELS[k] || k}</span>
+        <span class="sw-chip-arrow">${esc(String(cur))} →</span>
+        <span class="sw-chip-val">${v}</span>
+      </span>`;
+    });
+  sugEl.innerHTML = chips.length
+    ? '<div style="margin-bottom:0.2rem;font-size:0.7rem;color:var(--text-muted)">Suggested changes:</div>' + chips.join('')
+    : '<span style="color:var(--text-muted);font-size:0.72rem">No parameter changes suggested — image looks good.</span>';
+
+  // Reasoning
+  document.getElementById('sw-analysis-reasoning').textContent = a.reasoning || '';
+
+  // Show/hide apply button
+  document.getElementById('btn-apply-analysis').style.display =
+    chips.length ? '' : 'none';
+
+  document.getElementById('sw-analysis-panel').style.display = '';
+}
+
+function dismissAnalysis() {
+  document.getElementById('sw-analysis-panel').style.display = 'none';
+  _pendingSuggestions = null;
+}
+
+function applyAnalysis() {
+  if (!_pendingSuggestions) return;
+  const MAP = {
+    bg_mesh_scale: 'inp-bg-mesh',
+    stretch_q:     'inp-stretch-q',
+    black_pct:     'inp-black-pct',
+    white_pct:     'inp-white-pct',
+    luma_k:        'inp-luma-k',
+    luma_sig:      'inp-luma-sig',
+    unsharp_gain:  'inp-unsharp-gain',
+    unsharp_sig:   'inp-unsharp-sig',
+    chroma_k:      'inp-chroma-k',
+    chroma_sig:    'inp-chroma-sig',
+  };
+  for (const [k, v] of Object.entries(_pendingSuggestions)) {
+    if (v != null && MAP[k]) {
+      const el = document.getElementById(MAP[k]);
+      if (el) el.value = v;
+    }
+  }
+  dismissAnalysis();
+  doRerender();   // kick off re-render immediately with new values
+}
+
+// Show any saved presets immediately
+renderPresetList();
+
+// ── Check if a job is already running for this session on load ────────────────
+(async () => {
+  try {
+    const r = await fetch('/api/stack/status');
+    if (!r.ok) return;
+    const all = await r.json();
+    const j = all[SESSION];
+    if (!j) return;
+    if (j.status === 'running' || j.status === 'pending') {
+      setRunning(true);
+      setStage(j.stage || 'Working…', j.pct || 0);
+      setFrames(j.frames_accepted, j.frames_total);
+    }
+    // Show existing image if present
+    if (j.status === 'done' && j.output_path) {
+      const img = document.getElementById('sw-img');
+      const noImg = document.getElementById('sw-no-img');
+      img.src = `/api/stack/image/${encodeURIComponent(SESSION)}?t=${Date.now()}`;
+      img.style.display = '';
+      noImg.style.display = 'none';
+      setStage('Ready', 100);
+      setFrames(j.frames_accepted, j.frames_total);
+    }
+  } catch {}
+})();
+</script>
+</body>
+</html>

@@ -1242,6 +1242,19 @@ main {
 }
 .btn-stack-cancel:hover { background: #7f2020; color: #fff; }
 
+.btn-stack-wizard {
+  font-size: 0.72rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 5px;
+  border: 1px solid var(--accent-dim);
+  background: transparent;
+  color: var(--accent);
+  text-decoration: none;
+  transition: background var(--transition), border-color var(--transition);
+  white-space: nowrap;
+}
+.btn-stack-wizard:hover { background: var(--accent-dim); border-color: var(--accent); }
+
 .stack-progress-wrap {
   height: 3px;
   background: var(--border);

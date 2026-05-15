@@ -541,31 +541,42 @@ def _auto_crop(img: np.ndarray, valid_mask: np.ndarray, margin: int = 12) -> np.
     return img[r0:r1, c0:c1]
 
 
-# ── Stretch ───────────────────────────────────────────────────────────────────
+# ── Stretch / denoise tuning constants ───────────────────────────────────────
+# Change here; values flow automatically into both the pipeline and the run log.
+
+_STRETCH_Q          = 8.0   # asinh stretch aggressiveness (5=gentle, 8=aggressive)
+_STRETCH_BLACK_PCT  = 40    # percentile used as black point (50=median; lower reveals fainter structure)
+_STRETCH_WHITE_PCT  = 99.9  # percentile used as white reference (lower = brighter core, more star clipping)
+_LUMA_BLUR_K    = 9     # luma Gaussian kernel size (must be odd)
+_LUMA_BLUR_SIG  = 2     # luma Gaussian sigma
+_CHROMA_BLUR_K  = 31    # chroma Gaussian kernel size (must be odd)
+_CHROMA_BLUR_SIG = 10   # chroma Gaussian sigma
+_UNSHARP_SIG    = 1.5   # unsharp mask blur sigma
+_UNSHARP_GAIN   = 1.35  # unsharp mask blend weight (1 + gain blends in sharpened detail)
 
 _STF_MIDTONE_TARGET = 0.12
 
 
-def _auto_stretch(img: np.ndarray, Q: float = 6.0) -> np.ndarray:
+def _auto_stretch(img: np.ndarray,
+                  Q: float          = _STRETCH_Q,
+                  black_pct: float  = _STRETCH_BLACK_PCT,
+                  white_pct: float  = _STRETCH_WHITE_PCT) -> np.ndarray:
     """
     Per-channel asinh stretch for preview JPEGs.
 
-    Black point = per-channel median (sky background for sky-dominated images).
-    arcsinh(x·Q) / arcsinh(Q) is linear near zero so noise excursions just
-    above the sky median stay dark, while bright galaxy/star signal is
-    compressed logarithmically.  Power-law (gamma) stretches tiny noise
-    spikes above sky into visible gray; asinh does not.
-    Q controls aggressiveness: 5 = gentle, 8 = moderate, 15 = aggressive.
+    black_pct percentile → black point; white_pct percentile → white reference.
+    Q controls shadow aggressiveness: 5 = gentle, 8 = moderate, 15 = aggressive.
+    Lower white_pct brightens the core (at the cost of more star clipping).
     """
     result = np.zeros_like(img, dtype=np.float32)
     denom  = float(np.arcsinh(Q))
     for c in range(3):
         ch   = img[:, :, c]
-        lo   = float(np.median(ch))            # sky background → black
-        hi   = float(np.percentile(ch, 99.9))  # bright stars → white
+        lo   = float(np.percentile(ch, black_pct))
+        hi   = float(np.percentile(ch, white_pct))
         span = max(hi - lo, 1e-10)
-        linear = np.clip((ch - lo) / span, 0.0, 1.0)
-        result[:, :, c] = np.arcsinh(linear * Q) / denom
+        linear = np.clip((ch - lo) / span, 0.0, None)
+        result[:, :, c] = np.clip(np.arcsinh(linear * Q) / denom, 0.0, 1.0)
 
     return result
 
@@ -836,9 +847,10 @@ def _siril_full_stack(
                     bot_crop = i
                     break
 
-            # Apply column crop with the same zero-based mask
+            # Apply column crop: a column is invalid only if >5% of its rows
+            # are zero (Siril registration border), not just a single zero pixel.
             lum_cols = bgr.sum(axis=2)
-            valid_cols = np.where(lum_cols.min(axis=0) > 0)[0]
+            valid_cols = np.where((lum_cols > 0).mean(axis=0) > 0.95)[0]
             c0 = int(valid_cols[0])  if valid_cols.size else 0
             c1 = int(valid_cols[-1]) + 1 if valid_cols.size else bgr.shape[1]
 
@@ -955,31 +967,24 @@ def _graxpert_denoise(
 
 # ── Enhancement ───────────────────────────────────────────────────────────────
 
-def _denoise_sharpen(img: np.ndarray) -> np.ndarray:
-    """
-    Chroma Gaussian + unsharp-mask sharpening.  img: uint8 BGR.
-
-    Runs on the stretch uint8 image to kill residual speckles that GraXpert
-    leaves in the linear domain.  Applies moderate luma smoothing + heavy
-    chroma smoothing, then a gentle unsharp mask for apparent sharpness.
-    """
+def _denoise_sharpen(img: np.ndarray,
+                     luma_k:      int   = _LUMA_BLUR_K,
+                     luma_sig:    float = _LUMA_BLUR_SIG,
+                     chroma_k:    int   = _CHROMA_BLUR_K,
+                     chroma_sig:  float = _CHROMA_BLUR_SIG,
+                     unsharp_gain: float = _UNSHARP_GAIN,
+                     unsharp_sig:  float = _UNSHARP_SIG) -> np.ndarray:
+    """Chroma Gaussian + unsharp-mask sharpening on a stretched uint8 BGR image."""
     ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
     y, cr, cb = cv2.split(ycrcb)
 
-    # Luma: moderate smoothing suppresses bright luma speckles in dark sky areas
-    y_dn  = cv2.GaussianBlur(y,  (15, 15), 4)
+    y_dn  = cv2.GaussianBlur(y,  (luma_k,   luma_k),   luma_sig)
+    cr_dn = cv2.GaussianBlur(cr, (chroma_k, chroma_k), chroma_sig)
+    cb_dn = cv2.GaussianBlur(cb, (chroma_k, chroma_k), chroma_sig)
 
-    # Chroma: aggressive blur kills all residual coloured Bayer speckles
-    cr_dn = cv2.GaussianBlur(cr, (31, 31), 10)
-    cb_dn = cv2.GaussianBlur(cb, (31, 31), 10)
-
-    denoised = cv2.cvtColor(cv2.merge([y_dn, cr_dn, cb_dn]), cv2.COLOR_YCrCb2BGR)
-
-    # Gentle unsharp mask — just enough to restore star and core sharpness
-    # without amplifying residual noise.
-    blurred   = cv2.GaussianBlur(denoised, (0, 0), 1.5)
-    sharpened = cv2.addWeighted(denoised, 1.4, blurred, -0.4, 0)
-    return sharpened
+    denoised  = cv2.cvtColor(cv2.merge([y_dn, cr_dn, cb_dn]), cv2.COLOR_YCrCb2BGR)
+    blurred   = cv2.GaussianBlur(denoised, (0, 0), unsharp_sig)
+    return cv2.addWeighted(denoised, unsharp_gain, blurred, -(unsharp_gain - 1), 0)
 
 
 # ── FITS writer ───────────────────────────────────────────────────────────────
@@ -1043,6 +1048,10 @@ def _write_stack_log(log_path: str, stats: dict, output_path: str) -> None:
         f"  bg_mesh_scale    : {stats.get('bg_mesh_scale', 20)}  (0 = skip background subtraction)",
         f"  min_quality      : {stats.get('min_quality', 0.0):.2f}  (0 = off; 0.5 = keep top half by score)",
         f"  GraXpert denoise : {stats.get('graxpert_status', 'not run')}",
+        f"  stretch_Q        : {_STRETCH_Q}  (black point={_STRETCH_BLACK_PCT}th pct)",
+        f"  luma_blur        : {_LUMA_BLUR_K}×{_LUMA_BLUR_K}  sigma={_LUMA_BLUR_SIG}",
+        f"  chroma_blur      : {_CHROMA_BLUR_K}×{_CHROMA_BLUR_K}  sigma={_CHROMA_BLUR_SIG}",
+        f"  unsharp          : gain={_UNSHARP_GAIN}  sigma={_UNSHARP_SIG}",
     ]
     try:
         with open(log_path, 'w', encoding='utf-8') as f:
@@ -1598,17 +1607,20 @@ class StackProcessor:
 
 
 def rerender_preview(fits_path: str, jpeg_path: str,
-                     progress_cb: Optional[Callable] = None,
-                     bg_mesh_scale: int = 20) -> str:
+                     progress_cb:   Optional[Callable] = None,
+                     bg_mesh_scale: int   = 20,
+                     stretch_q:     float = _STRETCH_Q,
+                     black_pct:     float = _STRETCH_BLACK_PCT,
+                     white_pct:     float = _STRETCH_WHITE_PCT,
+                     luma_k:        int   = _LUMA_BLUR_K,
+                     luma_sig:      float = _LUMA_BLUR_SIG,
+                     chroma_k:      int   = _CHROMA_BLUR_K,
+                     chroma_sig:    float = _CHROMA_BLUR_SIG,
+                     unsharp_gain:  float = _UNSHARP_GAIN,
+                     unsharp_sig:   float = _UNSHARP_SIG) -> str:
     """
-    Regenerate the preview JPEG from an already-stacked FITS file.
-
-    Applies the full current preview pipeline (background subtraction,
-    GraXpert, SCNR, asinh stretch, chroma denoising, unsharp mask) without
-    re-running frame alignment.  bg_mesh_scale controls the SEP mesh coarseness
-    (higher = coarser, better for large galaxies; lower = finer, better for
-    compact nebulae).
-
+    Regenerate the preview JPEG from an already-stacked FITS file without
+    re-running frame alignment.  All post-processing parameters are tunable.
     Returns the path of the written JPEG.
     """
     if progress_cb is None:
@@ -1639,6 +1651,14 @@ def rerender_preview(fits_path: str, jpeg_path: str,
 
     os.makedirs(os.path.dirname(os.path.abspath(jpeg_path)), exist_ok=True)
 
+    # Keep a copy of the previous render so the wizard can offer before/after comparison
+    prev_path = str(Path(jpeg_path).with_name(Path(jpeg_path).stem + '_prev.jpg'))
+    if os.path.isfile(jpeg_path):
+        try:
+            shutil.copy2(jpeg_path, prev_path)
+        except OSError:
+            pass
+
     if has_linear:
         # Full Python pipeline on the pre-bg-subtraction linear data
         progress_cb(10, "Background subtraction", 0, 0)
@@ -1652,11 +1672,14 @@ def rerender_preview(fits_path: str, jpeg_path: str,
         bgr = _scnr_green(bgr)
 
         progress_cb(75, "Auto-stretch", 0, 0)
-        preview = _auto_stretch(bgr)
+        preview = _auto_stretch(bgr, Q=stretch_q, black_pct=black_pct, white_pct=white_pct)
 
         progress_cb(88, "Noise reduction and sharpening", 0, 0)
         preview_u8 = (preview * 255).astype(np.uint8)
-        preview_u8 = _denoise_sharpen(preview_u8)
+        preview_u8 = _denoise_sharpen(preview_u8,
+                                      luma_k=luma_k, luma_sig=luma_sig,
+                                      chroma_k=chroma_k, chroma_sig=chroma_sig,
+                                      unsharp_gain=unsharp_gain, unsharp_sig=unsharp_sig)
 
         progress_cb(97, "Saving JPEG", 0, 0)
         ok = cv2.imwrite(jpeg_path, preview_u8[::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -1685,11 +1708,14 @@ def rerender_preview(fits_path: str, jpeg_path: str,
     bgr = _scnr_green(bgr)
 
     progress_cb(80, "Auto-stretch", 0, 0)
-    preview = _auto_stretch(bgr)
+    preview = _auto_stretch(bgr, Q=stretch_q, black_pct=black_pct)
 
     progress_cb(90, "Noise reduction and sharpening", 0, 0)
     preview_u8 = (preview * 255).astype(np.uint8)
-    preview_u8 = _denoise_sharpen(preview_u8)
+    preview_u8 = _denoise_sharpen(preview_u8,
+                                  luma_k=luma_k, luma_sig=luma_sig,
+                                  chroma_k=chroma_k, chroma_sig=chroma_sig,
+                                  unsharp_gain=unsharp_gain, unsharp_sig=unsharp_sig)
 
     progress_cb(97, "Saving JPEG", 0, 0)
     ok = cv2.imwrite(jpeg_path, preview_u8[::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])

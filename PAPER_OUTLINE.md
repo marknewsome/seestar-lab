@@ -232,7 +232,6 @@ or JOSS (Journal of Open Source Software)
   - Checkpoint/resume for stacking (resume after crash mid-session)
   - Plate-solving integration for precise catalog matching
   - Mobile-friendly UI for session browsing
-  - Expose stretch Q and luma blur as UI controls (currently tuned constants)
 
 ---
 
