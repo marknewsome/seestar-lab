@@ -832,30 +832,42 @@ def api_stack_rerender(session_name: str):
     body = request.get_json(silent=True) or {}
     bg_mesh_scale = int(body.get("bg_mesh_scale", 20))
 
+    frames_total    = job.get("frames_total", 0) or 0
+    frames_accepted = job.get("frames_accepted", 0) or 0
+
     def _rerender_worker():
         from stack_processor import rerender_preview
         db.start_stack_job(session_name)
 
         def progress_cb(pct, stage, *_):
-            db.update_stack_job_progress(session_name, pct, stage, 0, 0)
+            db.update_stack_job_progress(session_name, pct, stage,
+                                         frames_accepted, frames_total)
             _broadcast({
-                "type":         "stack_progress",
-                "session_name": session_name,
-                "pct":          pct,
-                "stage":        stage,
-                "status":       "running",
+                "type":            "stack_progress",
+                "session_name":    session_name,
+                "pct":             pct,
+                "stage":           stage,
+                "status":          "running",
+                "frames_total":    frames_total,
+                "frames_accepted": frames_accepted,
             })
 
         try:
             rerender_preview(fits_path, output_path, progress_cb,
                              bg_mesh_scale=bg_mesh_scale)
-            db.finish_stack_job(session_name, output_path, 0, 0)
+            db.finish_stack_job(session_name, output_path,
+                                frames_accepted, frames_total)
             _broadcast({"type": "stack_done", "session_name": session_name,
-                        "pct": 100, "stage": "Re-render complete"})
+                        "pct": 100, "stage": "Re-render complete",
+                        "frames_total": frames_total,
+                        "frames_accepted": frames_accepted,
+                        "output_path": output_path})
         except Exception as exc:
             db.fail_stack_job(session_name, str(exc))
             _broadcast({"type": "stack_progress", "session_name": session_name,
-                        "pct": -1, "stage": f"Error: {exc}", "status": "error"})
+                        "pct": -1, "stage": f"Error: {exc}", "status": "error",
+                        "frames_total": frames_total,
+                        "frames_accepted": frames_accepted})
 
     t = threading.Thread(target=_rerender_worker, daemon=True)
     t.start()
