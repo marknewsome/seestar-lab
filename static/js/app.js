@@ -551,18 +551,25 @@ function buildCard(s) {
 // ── Stack footer ──────────────────────────────────────────────────────────────
 
 async function queueStack(sessionName, force = false) {
-  const sfx       = cardId(sessionName).slice(5);
-  const btn       = document.getElementById(`stack-btn-${sfx}`);
-  const mfEl      = document.getElementById(`stack-mf-${sfx}`);
-  const cacheEl   = document.getElementById(`stack-cache-${sfx}`);
-  const maxFrames = mfEl ? (parseInt(mfEl.value, 10) || 500) : 500;
-  const useCache  = cacheEl ? cacheEl.checked : false;
+  const sfx         = cardId(sessionName).slice(5);
+  const btn         = document.getElementById(`stack-btn-${sfx}`);
+  const mfEl        = document.getElementById(`stack-mf-${sfx}`);
+  const cacheEl     = document.getElementById(`stack-cache-${sfx}`);
+  const bgEl        = document.getElementById(`stack-bg-${sfx}`);
+  const mqEl        = document.getElementById(`stack-mq-${sfx}`);
+  const maxFrames   = mfEl   ? (parseInt(mfEl.value,   10) || 500) : 500;
+  const useCache    = cacheEl ? cacheEl.checked : false;
+  const bgMeshScale = bgEl   ? (parseInt(bgEl.value,   10))        : 20;
+  const minQuality  = mqEl   ? (parseFloat(mqEl.value) || 0.0)     : 0.0;
   if (btn) { btn.disabled = true; btn.textContent = 'Queuing…'; }
   try {
     const res  = await fetch('/api/stack/start', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ session_name: sessionName, force, max_frames: maxFrames, use_cache: useCache }),
+      body:    JSON.stringify({ session_name: sessionName, force,
+                                max_frames: maxFrames, use_cache: useCache,
+                                bg_mesh_scale: bgMeshScale,
+                                min_quality: minQuality }),
     });
     const body = await res.json();
     if (!res.ok) {
@@ -572,13 +579,15 @@ async function queueStack(sessionName, force = false) {
     }
     // Optimistically set state so the footer re-renders immediately
     stackData[sessionName] = Object.assign(stackData[sessionName] || {}, {
-      session_name: sessionName,
-      status: 'pending',
-      pct: 0,
-      stage: 'Queued…',
-      frames_total: body.fits_count || 0,
+      session_name:  sessionName,
+      status:        'pending',
+      pct:           0,
+      stage:         'Queued…',
+      frames_total:  body.fits_count || 0,
       frames_accepted: 0,
-      max_frames: body.max_frames || maxFrames,
+      max_frames:    body.max_frames || maxFrames,
+      bg_mesh_scale: bgMeshScale,
+      min_quality:   minQuality,
     });
     _refreshStackFooter(sessionName);
   } catch {
@@ -596,25 +605,117 @@ async function cancelStack(sessionName) {
   } catch { /* ignore — server will broadcast cancelled state via SSE */ }
 }
 
-function buildStackFooter(sessionName) {
-  const job     = stackData[sessionName];
-  const sn_js   = sessionName.replace(/'/g, "\\'");
+async function rerenderStack(sessionName) {
   const idSuffix = sessionName.replace(/[^a-z0-9]/gi, '_');
-  const status    = job?.status;
+  const bgInput  = document.getElementById('stack-bg-' + idSuffix);
+  const bgMeshScale = bgInput ? parseInt(bgInput.value, 10) : 20;
+  try {
+    await fetch('/api/stack/rerender/' + encodeURIComponent(sessionName), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ bg_mesh_scale: bgMeshScale }),
+    });
+  } catch { /* SSE will report progress */ }
+}
+
+// Track which cards have the options panel open (survives footer rebuilds)
+const stackOptionsOpen = new Set();
+
+function toggleStackOptions(sessionName) {
+  if (stackOptionsOpen.has(sessionName)) stackOptionsOpen.delete(sessionName);
+  else stackOptionsOpen.add(sessionName);
+  _refreshStackFooter(sessionName);
+}
+
+function buildStackFooter(sessionName) {
+  const job      = stackData[sessionName];
+  const sn_js    = sessionName.replace(/'/g, "\\'");
+  const sfx      = sessionName.replace(/[^a-z0-9]/gi, '_');
+  const status   = job?.status;
   const isQueued  = status === 'pending';
   const isRunning = status === 'running';
   const isActive  = isQueued || isRunning;
   const isDone    = status === 'done';
   const isError   = status === 'error';
+  const optOpen   = stackOptionsOpen.has(sessionName);
 
-  // Progress bar row (running) or queued chip (pending)
+  // ── Saved values ──────────────────────────────────────────────────────────
+  const mfVal = job?.max_frames    ?? 500;
+  const bgVal = job?.bg_mesh_scale ?? 20;
+  const mqVal = job?.min_quality   ?? 0.0;
+
+  // ── Primary row controls ──────────────────────────────────────────────────
+  const frameInfo = isDone
+    ? `<span class="stack-frame-info">${job.frames_accepted}/${job.frames_total} frames</span>`
+    : '';
+
+  const mfInput = (!isActive)
+    ? `<label class="stack-mf-label" title="Best N frames to use (quality-ranked)">
+         <input id="stack-mf-${sfx}" class="stack-mf-input" type="number"
+                value="${mfVal}" min="10" max="9999" step="50" />
+         frames
+       </label>`
+    : `<span class="stack-mf-label">${job?.frames_accepted || mfVal}/${job?.frames_total || '?'} frames</span>`;
+
+  const gearBtn = (!isActive)
+    ? `<button class="btn-stack-gear ${optOpen ? 'active' : ''}"
+               onclick="toggleStackOptions('${sn_js}')"
+               title="Stacking options">⚙</button>`
+    : '';
+
+  const stackBtn = isRunning
+    ? `<button id="stack-btn-${sfx}" class="btn-stack" disabled>Stacking…</button>`
+    : isQueued
+    ? `<button id="stack-btn-${sfx}" class="btn-stack" disabled>Queued…</button>`
+    : (!isDone && !isError)
+    ? `<button id="stack-btn-${sfx}" class="btn-stack"
+               onclick="queueStack('${sn_js}')">Stack</button>`
+    : '';
+
+  const rerenderBtn = isDone
+    ? `<button class="btn-stack-rerun"
+               onclick="rerenderStack('${sn_js}')"
+               title="Re-apply background subtraction + AI denoising + stretch">↻ Re-render</button>`
+    : '';
+
+  const restackBtn = (isDone || isError)
+    ? `<button class="btn-stack-rerun"
+               onclick="queueStack('${sn_js}', true)"
+               title="Re-stack with current settings">↻ Re-stack</button>`
+    : '';
+
+  const cancelBtn = isRunning
+    ? `<button class="btn-stack-cancel"
+               onclick="cancelStack('${sn_js}')"
+               title="Stop stacking after current frame">Cancel</button>`
+    : '';
+
+  // ── Options panel (gear toggle) ───────────────────────────────────────────
+  const optionsPanel = (!isActive && optOpen) ? `
+    <div class="stack-options-panel">
+      <label class="stack-mf-label" title="Quality floor: frames scoring below this fraction of the best frame are rejected even if max_frames would include them. 0 = off, 0.5 = top half only.">
+        <input id="stack-mq-${sfx}" class="stack-mf-input" type="number"
+               value="${mqVal}" min="0" max="0.95" step="0.05" />
+        min qual
+      </label>
+      <label class="stack-mf-label" title="Background mesh scale: higher = coarser (large galaxies like M101); lower = finer (compact nebulae). 0 = skip subtraction.">
+        <input id="stack-bg-${sfx}" class="stack-mf-input" type="number"
+               value="${bgVal}" min="0" max="60" step="2" />
+        bg scale
+      </label>
+      ${(isDone || isError) ? `<label class="stack-cache-label" title="Reuse aligned frames from the last run — much faster re-stack">
+        <input type="checkbox" id="stack-cache-${sfx}" class="stack-cache-input" checked />
+        skip copy
+      </label>` : ''}
+    </div>` : '';
+
+  // ── Progress / queued indicator ───────────────────────────────────────────
   let progressRow = '';
   if (isRunning) {
-    const pct   = job.pct || 0;
-    const stage = esc(job.stage || 'Working…');
-    const counts = (job.frames_total > 0)
-      ? ` · ${job.frames_accepted || 0}/${job.frames_total} frames`
-      : '';
+    const pct    = job.pct || 0;
+    const stage  = esc(job.stage || 'Working…');
+    const counts = job.frames_total > 0
+      ? ` · ${job.frames_accepted || 0}/${job.frames_total}` : '';
     progressRow = `
       <div class="stack-progress-wrap">
         <div class="stack-progress-fill" style="width:${pct}%"></div>
@@ -624,12 +725,9 @@ function buildStackFooter(sessionName) {
     progressRow = `<div class="stack-queued-row">⏳ Queued — waiting for active stack to finish</div>`;
   }
 
-  // Result thumbnail + view link + log link
+  // ── Result thumbnail ──────────────────────────────────────────────────────
   let resultRow = '';
   if (isDone && job.output_path) {
-    const logLink = `<a class="stack-log-link"
-           href="/api/stack/log/${encodeURIComponent(sessionName)}"
-           target="_blank">View run log</a>`;
     resultRow = `
       <div class="stack-result">
         <img class="stack-result-thumb"
@@ -640,55 +738,14 @@ function buildStackFooter(sessionName) {
         <a class="stack-view-link"
            href="/api/stack/image/${encodeURIComponent(sessionName)}"
            target="_blank">View full size</a>
-        ${logLink}
+        <a class="stack-log-link"
+           href="/api/stack/log/${encodeURIComponent(sessionName)}"
+           target="_blank">View run log</a>
       </div>`;
   }
 
-  // Error message
   const errorRow = isError
     ? `<div class="stack-error">Error: ${esc(job.error_msg || 'unknown')}</div>`
-    : '';
-
-  // Buttons
-  const mfVal = job?.max_frames ?? 500;
-  const mfInput = (!isActive)
-    ? `<label class="stack-mf-label" title="Best N frames to use (quality-ranked)">
-         <input id="stack-mf-${idSuffix}" class="stack-mf-input" type="number"
-                value="${mfVal}" min="10" max="9999" step="50" />
-         frames
-       </label>`
-    : `<span class="stack-mf-label">top ${job.frames_accepted || mfVal} frames</span>`;
-
-  const stackBtn = isRunning
-    ? `<button id="stack-btn-${idSuffix}" class="btn-stack" disabled>Stacking…</button>`
-    : isQueued
-    ? `<button id="stack-btn-${idSuffix}" class="btn-stack" disabled>Queued…</button>`
-    : (!isDone && !isError)
-    ? `<button id="stack-btn-${idSuffix}" class="btn-stack"
-         onclick="queueStack('${sn_js}')">Stack</button>`
-    : '';
-
-  const cancelBtn = isRunning
-    ? `<button class="btn-stack-cancel"
-         onclick="cancelStack('${sn_js}')"
-         title="Stop stacking after current frame">Cancel</button>`
-    : '';
-
-  const cacheCheck = (isDone || isError)
-    ? `<label class="stack-cache-label" title="Skip copy — reuse frames from the last run">
-         <input type="checkbox" id="stack-cache-${idSuffix}" class="stack-cache-input" checked />
-         Skip copy
-       </label>`
-    : '';
-
-  const restackBtn = (isDone || isError)
-    ? `<button class="btn-stack-rerun"
-         onclick="queueStack('${sn_js}', true)"
-         title="Re-stack with current settings">↻ Re-stack</button>`
-    : '';
-
-  const frameInfo = isDone
-    ? `<span class="stack-frame-info">${job.frames_accepted}/${job.frames_total} frames used</span>`
     : '';
 
   return `<div class="stack-footer">
@@ -697,12 +754,14 @@ function buildStackFooter(sessionName) {
       ${frameInfo}
       <div class="stack-btn-group">
         ${mfInput}
-        ${cacheCheck}
+        ${gearBtn}
+        ${rerenderBtn}
         ${restackBtn}
         ${cancelBtn}
         ${stackBtn}
       </div>
     </div>
+    ${optionsPanel}
     ${progressRow}
     ${resultRow}
     ${errorRow}

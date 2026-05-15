@@ -259,11 +259,13 @@ _stack_cancel_lock = threading.Lock()
 def _run_stack_job(job: dict) -> None:
     from stack_processor import StackProcessor, StackCancelled
 
-    session_name = job["session_name"]
-    fits_files   = job["fits_files"]
-    output_path  = job["output_path"]
-    max_frames   = job.get("max_frames", 500)
-    use_cache    = bool(job.get("use_cache", False))
+    session_name  = job["session_name"]
+    fits_files    = job["fits_files"]
+    output_path   = job["output_path"]
+    max_frames    = job.get("max_frames", 500)
+    use_cache     = bool(job.get("use_cache", False))
+    bg_mesh_scale = int(job.get("bg_mesh_scale", 20))
+    min_quality   = float(job.get("min_quality", 0.0))
 
     cancel_flag = threading.Event()
     with _stack_cancel_lock:
@@ -287,7 +289,9 @@ def _run_stack_job(job: dict) -> None:
         result = StackProcessor().run(fits_files, output_path, progress_cb,
                                       cancel_cb=cancel_flag.is_set,
                                       max_frames=max_frames,
-                                      use_cache=use_cache)
+                                      use_cache=use_cache,
+                                      bg_mesh_scale=bg_mesh_scale,
+                                      min_quality=min_quality)
         db.finish_stack_job(
             session_name, output_path,
             result["frames_accepted"], result["frames_total"],
@@ -696,11 +700,13 @@ def api_stack_start():
     max_frames caps how many best-quality frames are used; default 500.
     """
     from pathlib import Path as _Path
-    body         = request.get_json(silent=True) or {}
-    session_name = body.get("session_name", "").strip()
-    force        = bool(body.get("force", False))
-    max_frames   = int(body.get("max_frames", 500))
-    use_cache    = bool(body.get("use_cache", False))
+    body          = request.get_json(silent=True) or {}
+    session_name  = body.get("session_name", "").strip()
+    force         = bool(body.get("force", False))
+    max_frames    = int(body.get("max_frames", 500))
+    use_cache     = bool(body.get("use_cache", False))
+    bg_mesh_scale = int(body.get("bg_mesh_scale", 20))
+    min_quality   = float(body.get("min_quality", 0.0))
 
     if not session_name:
         return jsonify({"error": "session_name required"}), 400
@@ -735,11 +741,13 @@ def api_stack_start():
         return jsonify({"error": "job already queued or running", "status": "already_queued"}), 409
 
     _stack_queue.put({
-        "session_name": session_name,
-        "fits_files":   fits_files,
-        "output_path":  output_path,
-        "max_frames":   max_frames,
-        "use_cache":    use_cache,
+        "session_name":  session_name,
+        "fits_files":    fits_files,
+        "output_path":   output_path,
+        "max_frames":    max_frames,
+        "use_cache":     use_cache,
+        "bg_mesh_scale": bg_mesh_scale,
+        "min_quality":   min_quality,
     })
     _broadcast({
         "type":         "stack_queued",
@@ -821,28 +829,33 @@ def api_stack_rerender(session_name: str):
     if not os.path.isfile(fits_path):
         abort(404, "FITS file not found — run a full stack first")
 
+    body = request.get_json(silent=True) or {}
+    bg_mesh_scale = int(body.get("bg_mesh_scale", 20))
+
     def _rerender_worker():
         from stack_processor import rerender_preview
         db.start_stack_job(session_name)
 
         def progress_cb(pct, stage, *_):
             db.update_stack_job_progress(session_name, pct, stage, 0, 0)
-            _stack_broadcast({
-                "type": "stack_progress",
-                "session": session_name,
-                "pct": pct,
-                "stage": stage,
+            _broadcast({
+                "type":         "stack_progress",
+                "session_name": session_name,
+                "pct":          pct,
+                "stage":        stage,
+                "status":       "running",
             })
 
         try:
-            rerender_preview(fits_path, output_path, progress_cb)
+            rerender_preview(fits_path, output_path, progress_cb,
+                             bg_mesh_scale=bg_mesh_scale)
             db.finish_stack_job(session_name, output_path, 0, 0)
-            _stack_broadcast({"type": "stack_done", "session": session_name,
-                               "pct": 100, "stage": "Re-render complete"})
+            _broadcast({"type": "stack_done", "session_name": session_name,
+                        "pct": 100, "stage": "Re-render complete"})
         except Exception as exc:
             db.fail_stack_job(session_name, str(exc))
-            _stack_broadcast({"type": "stack_progress", "session": session_name,
-                               "pct": -1, "stage": f"Error: {exc}"})
+            _broadcast({"type": "stack_progress", "session_name": session_name,
+                        "pct": -1, "stage": f"Error: {exc}", "status": "error"})
 
     t = threading.Thread(target=_rerender_worker, daemon=True)
     t.start()

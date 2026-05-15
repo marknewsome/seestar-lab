@@ -70,7 +70,11 @@ or JOSS (Journal of Open Source Software)
 
 - Laplacian-variance sharpness score on raw Bayer centre-quarter (Stage A)
 - SEP (Source Extractor Python) per-frame FWHM, eccentricity, SNR (Stage B)
-- Reject below 40 % of median sharpness; rank survivors by combined score; cap at max_frames
+- Combined score = `(star_count × SNR) / FWHM`; rewards dense, sharp, high-contrast frames
+- Stage A: reject below 40 % of median sharpness
+- Stage B quality floor: reject frames below `best_score × min_quality` before applying `max_frames` cap
+  — discards cloud-degraded or poor-seeing subs that would otherwise dilute the stack
+- Survivors sorted by score (best first) and capped at `max_frames`; floor-rejected count logged separately
 
 ### 3.3 Pre-Debayering for Color Registration
 
@@ -105,7 +109,12 @@ or JOSS (Journal of Open Source Software)
 ### 3.6 Per-Channel Background Subtraction
 
 - Goal: equalise R/G/B sky levels and remove smooth vignetting gradients
-- Tool: SEP (Source Extractor Python) sigma-clipped background mesh, ~20 × 20 cells per channel
+- Tool: SEP (Source Extractor Python) sigma-clipped background mesh per channel
+- `bg_mesh_scale` controls mesh cell size: `bw = image_width // bg_mesh_scale`
+  - High values (coarse mesh, e.g. 8): better for large galaxies like M 101 — fine cells
+    would sample interarm regions as sky and over-subtract galaxy signal
+  - Low values (fine mesh, e.g. 40): better for compact nebulae with strong gradients
+  - 0: skip background subtraction entirely (useful for targets that fill the frame)
 - Sigma-clipping iteratively rejects bright pixels within each cell — nebulosity and galaxy
   signal are excluded from the sky estimate (unlike percentile-of-cell, which is biased by
   any extended emission filling a large fraction of the frame)
@@ -113,6 +122,9 @@ or JOSS (Journal of Open Source Software)
   colour balance simultaneously
 - Motivation: the original single-scalar 5th-percentile subtract was channel-unaware,
   producing residual blue/green cast (visible in M 20 Trifid comparison)
+- Note: GRBG Bayer sensors have 2× green photosites; fine meshes differentially
+  over-subtract R and B vs. G, producing green-tinted output after clipping — this is the
+  primary motivation for the tunable `bg_mesh_scale` parameter
 
 ### 3.7 AI Denoising on Linear Data
 
@@ -121,18 +133,20 @@ or JOSS (Journal of Open Source Software)
   - Linear data: read noise is Gaussian, background is flat → optimal conditions for the model
   - Stretched data: nonlinear amplification of shadows transforms Gaussian noise into
     asymmetric, spatially varying noise — model performance degrades
-- GPU-accelerated via CUDA (onnxruntime-gpu); ~74 s on a consumer NVIDIA card
-- Falls back silently to undenoised FITS if GraXpert unavailable
+- GPU-accelerated via CUDA (onnxruntime-gpu); strength=1.0 (maximum)
+- Falls back silently to undenoised FITS if GraXpert unavailable; outcome (ran / fell back)
+  recorded in the plain-text run log alongside frame counts and timing
 
 ### 3.8 Results
 
-- M 101 (Pinwheel Galaxy): 500 sub-frames in ~19 min; 1500 frames in ~1h 6m
+- M 101 (Pinwheel Galaxy): 3000 sub-frames in ~87 min; 1500 frames in ~1h 6m; 500 frames in ~19 min
 - M 20 (Trifid Nebula): 60 frames in ~2 min — both red emission and blue reflection lobes
   visible after per-channel background correction
 - Full object set processed in a single session: M 1, 20, 27, 31, 36, 42, 97, 101, 108 — all
   queued sequentially; no interference between jobs
-- SNR discussion: 500 vs. 1000 vs. 1500 frames; diminishing returns curve; quality-filter
-  effect (adding frames includes lower-quality subs)
+- SNR discussion: 500 vs. 1000 vs. 3000 frames; diminishing returns curve; quality-floor
+  effect (min_quality=0.4 rejected 1111/4111 frames in one M 101 run, keeping score range 7442–9569)
+- JPEG output vertically flipped to match Seestar app display orientation (FITS row 0 = image bottom)
 
 ---
 
@@ -187,6 +201,14 @@ or JOSS (Journal of Open Source Software)
 - Queued-but-not-running cards show a pulsing amber indicator in the session browser;
   Cancel only exposed for the running job (cancelling a pending job is a no-op)
 
+### 6.2 Unit Testing
+
+- pytest suite covering pure pipeline functions: quality scoring, quality floor selection,
+  background subtraction, stretch, SCNR, crop, frame weighting
+- Synthetic numpy array fixtures — no FITS files or external tools required; 41 tests in <0.1 s
+- Key regressions caught by tests: divide-by-zero in fwhm clamp, quality floor math,
+  mesh_scale=0 skip-subtraction path
+
 ### 6.3 Observing Planner
 
 - Rise/set times and altitude curves using astropy for configured observer lat/lon
@@ -208,9 +230,9 @@ or JOSS (Journal of Open Source Software)
   (CLI API stability, version-specific sequence naming)
 - Future work:
   - Checkpoint/resume for stacking (resume after crash mid-session)
-  - GraXpert AI denoising as the default JPEG step (already implemented as fallback)
   - Plate-solving integration for precise catalog matching
   - Mobile-friendly UI for session browsing
+  - Expose stretch Q and luma blur as UI controls (currently tuned constants)
 
 ---
 

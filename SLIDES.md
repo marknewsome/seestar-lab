@@ -31,16 +31,16 @@
 - One-click pipeline for `_sub` session folders containing raw `.fit` sub-frames
 - Hybrid pipeline: Python for quality selection, **Siril CLI** for registration + stacking:
   1. Laplacian sharpness + SEP (FWHM / eccentricity / SNR) quality scoring
-  2. Frame selection — top N by combined score (default 500)
+  2. Frame selection — Stage A sharpness floor; Stage B score-relative quality floor (`min_quality`); cap at `max_frames`
   3. Pre-debayer each frame to 3-channel RGB FITS (prevents Bayer-grid registration artefacts)
   4. Siril: star-pattern registration → additive-scale sigma-clip stack (3σ)
   5. IQR-based border crop (detects partial-coverage rows by pixel-to-pixel variance)
-  6. SEP per-channel 2D mesh background subtraction (sigma-clipped; handles gradients)
-  7. **GraXpert AI denoising on the linear stack** (before stretching — optimal noise model)
-  8. Siril autostretch → JPEG preview
-- GPU-accelerated via CUDA when available; 500 frames ~19 min, 1500 frames ~1h 6m
-- Stack queue visible at `/stack/jobs` — history, durations, log and image links
-- Live progress via Server-Sent Events; queued jobs show pulsing amber indicator
+  6. SEP per-channel 2D mesh background subtraction — `bg_mesh_scale` tunes cell size (coarse for large galaxies, fine for compact nebulae; 0 = skip)
+  7. **GraXpert AI denoising on the linear stack** (before stretching — optimal noise model; outcome logged)
+  8. Asinh stretch (Q=6) + YCrCb denoise + unsharp mask → JPEG, vertically flipped to match Seestar orientation
+- GPU-accelerated via CUDA; 3000 frames ~87 min on consumer hardware
+- **Re-render** reprocesses saved linear FITS without a full restack — try different `bg_mesh_scale` in seconds
+- Stack queue at `/stack/jobs` — history, durations, log and image links; live SSE progress
 
 ---
 

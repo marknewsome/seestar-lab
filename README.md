@@ -160,28 +160,33 @@ Windows and reachable at `C:\Program Files\Siril\bin\siril-cli.exe` from WSL2.
 | # | Stage | Who | Details |
 |---|---|---|---|
 | 1 | **Sharpness scan** | Python | Each FITS file is read as raw Bayer uint16. Laplacian-variance sharpness is scored on the centre quarter. |
-| 2 | **SEP quality metrics** | Python | Source Extractor Python (SEP) measures FWHM, eccentricity, and SNR per frame. Combined with sharpness to rank frames. |
-| 3 | **Frame selection** | Python | Frames below 40 % of median sharpness are rejected. Survivors are sorted by combined score and capped at `max_frames` (default 500). |
-| 4 | **Pre-debayer** | Python | Each selected frame is debayered to BGR, converted to float32/65535, transposed to 3-channel (R,G,B) FITS, and written to `C:\Temp\seestar_siril_{ts}\light_NNNNN.fit`. Siril receives proper colour images — no Bayer-grid registration artifacts. |
+| 2 | **SEP quality metrics** | Python | Source Extractor Python (SEP) measures FWHM, eccentricity, and SNR per frame. Combined score = `(stars × SNR) / FWHM`. |
+| 3 | **Frame selection** | Python | Frames below 40 % of median sharpness are rejected (Stage A). Survivors ranked by combined score; those below `best_score × min_quality` are rejected (Stage B quality floor); remainder capped at `max_frames`. |
+| 4 | **Pre-debayer** | Python | Each selected frame is debayered to BGR, converted to float32, transposed to 3-channel (R,G,B) FITS, and written to `C:\Temp\seestar_siril_{ts}\light_NNNNN.fit`. Siril receives proper colour images — no Bayer-grid registration artifacts. |
 | 5 | **Convert + Register** | Siril | `convert light -out=pp_light` collects all `light*.fit` files into a Siril sequence. `register light_` computes inter-frame transforms using star-pattern matching. |
 | 6 | **Sigma-clip stack** | Siril | `stack r_light_ rej 3 3 -norm=addscale -out=stacked` integrates frames with additive-scale normalisation and 3σ rejection, suppressing hot pixels, cosmic rays, and satellite trails. |
 | 7 | **IQR border crop** | Python | Per-row inter-quartile range of the green channel identifies partial-coverage border rows left by registration. Rows with IQR > 1.5 × median IQR of the image centre are trimmed from top and bottom; leftmost/rightmost fully-covered columns are found by luminance mask. |
-| 8 | **Background subtraction** | Python | SEP sigma-clipped 2D mesh fit (~20 × 20 cells) applied per channel independently. Equalises R/G/B sky levels and removes vignetting gradients. Sigma-clipping prevents nebula or galaxy signal from biasing the sky estimate. |
-| 9 | **AI denoising** | GraXpert | GraXpert ONNX model denoises the linear float32 stack before any stretch is applied. Linear data has Gaussian noise characteristics; denoising here gives the model cleaner signal than nonlinearly stretched output would. GPU-accelerated via CUDA when available (~74 s on an NVIDIA card). |
-| 10 | **Save FITS** | Python | Denoised linear float32 colour FITS written alongside the output directory. |
-| 11 | **JPEG preview** | Siril | `_siril_postprocess` applies Siril autostretch and saves JPEG quality 95. Falls back to asinh stretch if Siril is unavailable. |
+| 8 | **Background subtraction** | Python | SEP sigma-clipped 2D mesh background subtraction applied per channel. `bg_mesh_scale` controls mesh coarseness: higher = fewer, larger cells (better for large galaxies like M101 where fine cells over-subtract galaxy signal); 0 = skip entirely. |
+| 9 | **AI denoising** | GraXpert | GraXpert ONNX model denoises the linear float32 stack before any stretch is applied. Linear data has Gaussian noise characteristics; denoising here gives the model cleaner signal than nonlinearly stretched output would. GPU-accelerated via CUDA when available. Whether GraXpert ran (or fell back) is recorded in the run log. |
+| 10 | **Save FITS** | Python | Denoised linear float32 colour FITS written alongside the output directory for later re-rendering without a full restack. |
+| 11 | **JPEG preview** | Python | Per-channel asinh stretch (Q=6), YCrCb chroma + luma Gaussian denoise, gentle unsharp mask; JPEG quality 95. Output is vertically flipped to match Seestar app orientation. |
 
 Output is registered as the session thumbnail immediately — visible without a rescan.
 
 Work files (~24 MB × 500 frames ≈ 12 GB) are written to `C:\Temp` and cleaned up on
 completion, error, or cancel.
 
-### max_frames
+### max_frames and min_quality
 
-The `max_frames` input (default 500) caps how many frames pass stage 3.  SNR scales as
-√N, so returns diminish quickly: 500 → 1000 frames is only +41 % gain.  The quality filter
-selects the best frames first, so adding more frames means including lower-quality subs.  A
-practical sweet spot is **1 500 frames** for a rich session like M 101.
+`max_frames` (default 500) caps how many frames pass stage 3.  SNR scales as √N, so
+returns diminish quickly: 500 → 1000 frames is only +41 % gain.  A practical sweet spot is
+**1 500 – 3 000 frames** for a rich session like M 101.
+
+`min_quality` (default 0.0 = off) applies a score-relative floor before the cap: frames
+scoring below `best_score × min_quality` are rejected regardless of how many remain.
+For example, `min_quality=0.4` keeps only frames that score at least 40 % of the best
+frame's score, discarding cloud-degraded or poor-seeing subs even if `max_frames` has not
+been reached.  The number of floor-rejected frames appears in the run log.
 
 ### Memory usage
 
@@ -202,10 +207,14 @@ A **Cancel** button appears while stacking is active.  It signals the pipeline t
 cleanly after the current frame finishes.  The DB is marked as cancelled and the stack footer
 reverts to idle state; no partial output is written.
 
-### Re-stack
+### Re-stack and Re-render
 
 A **Re-stack** button replaces the Stack button once a job has completed or failed, allowing
-re-stacking (e.g. after adjusting `max_frames` or changing source frames).
+re-stacking (e.g. after adjusting `max_frames`, `min_quality`, or `bg_mesh_scale`).
+
+**Re-render** reprocesses the saved linear FITS through background subtraction, GraXpert
+denoising, stretch, and sharpening — without rerunning the full alignment stack.  Useful
+for tuning `bg_mesh_scale` or comparing stretch settings in seconds rather than hours.
 
 ---
 
@@ -533,10 +542,12 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/stack/start` | Queue stacking — body: `{"session_name": str, "force": bool, "max_frames": int}` |
+| `POST` | `/api/stack/start` | Queue stacking — body: `{"session_name": str, "force": bool, "max_frames": int, "bg_mesh_scale": int, "min_quality": float, "skip_copy": bool}` |
 | `POST` | `/api/stack/cancel` | Cancel active job — body: `{"session_name": str}` |
+| `POST` | `/api/stack/rerender` | Re-render from saved linear FITS — body: `{"session_name": str, "bg_mesh_scale": int}` |
 | `GET` | `/api/stack/status` | JSON: all stack job statuses keyed by session name |
 | `GET` | `/api/stack/image/<session_name>` | Serve full-size stacked JPEG |
+| `GET` | `/api/stack/log/<session_name>` | Serve plain-text run log |
 
 ### Comet wizard
 
@@ -599,6 +610,20 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 | `complete` | `changed`, `total` | Scan finished |
 | `stack_progress` | `session_name`, `status`, `pct`, `stage`, `frames_total`, `frames_accepted` | Stacking pipeline progress |
 | `stack_done` | `session_name`, `status`, `frames_total`, `frames_accepted`, `output_path` | Stacking complete (or failed) |
+
+---
+
+## Testing
+
+Unit tests cover the pure functions in `stack_processor.py` (quality scoring, frame
+selection, background subtraction, stretch, SCNR, crop, etc.) using synthetic numpy arrays —
+no FITS files or external tools required.
+
+```bash
+./run_tests.sh          # activates venv and runs pytest -v
+```
+
+41 tests run in under 0.1 s.  See `tests/test_stack_processor.py`.
 
 ---
 

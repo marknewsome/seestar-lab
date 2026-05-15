@@ -1314,6 +1314,32 @@ main {
 }
 .stack-cache-input { cursor: pointer; }
 
+.btn-stack-gear {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 5px;
+  border: 1px solid var(--border-hi);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  line-height: 1;
+  transition: background var(--transition), color var(--transition),
+              border-color var(--transition);
+}
+.btn-stack-gear:hover       { color: var(--text); border-color: var(--text-muted); }
+.btn-stack-gear.active      { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+
+.stack-options-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding: 0.45rem 0.5rem;
+  border-radius: 5px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
 .stack-error {
   font-size: 0.74rem;
   color: #f87171;

@@ -35,6 +35,7 @@ Only the top-max_frames selected files are loaded in pass 2, so the unselected
 temp copies are never read again (they are cleaned up in the finally block).
 """
 
+import logging
 import os
 import re
 import shutil
@@ -385,9 +386,15 @@ def _weighted_sigma_clip(
 
 # ── Background subtraction ────────────────────────────────────────────────────
 
-def _subtract_background(img: np.ndarray, grid: int = 16) -> np.ndarray:
+def _subtract_background(img: np.ndarray, mesh_scale: int = 20) -> np.ndarray:
     """
     SEP sigma-clipped mesh background subtraction.
+
+    mesh_scale controls the box size: bw = w // mesh_scale.  Higher values
+    give a coarser mesh (fewer, larger cells) — better for large galaxies like
+    M101 where fine cells would sample interarm regions as sky.  Lower values
+    give a finer mesh — better for compact objects with strong gradients.
+    Recommended range: 8 (very coarse, large galaxy) to 40 (fine, small nebula).
 
     SEP iteratively rejects bright pixels within each cell (sigma-clipping),
     making it robust against extended nebulosity or galaxies that fill a large
@@ -401,10 +408,10 @@ def _subtract_background(img: np.ndarray, grid: int = 16) -> np.ndarray:
 
     try:
         import sep
-        # Box size: ~1/20 of the frame so the mesh has ~400 cells but each
-        # cell is large enough to contain sky even in galaxy-dominated fields.
-        bw = max(w // 20, 32)
-        bh = max(h // 20, 32)
+        if mesh_scale <= 0:
+            return result   # caller requested no background subtraction
+        bw = max(w // mesh_scale, 32)
+        bh = max(h // mesh_scale, 32)
         for c in range(3):
             data = np.ascontiguousarray(img[:, :, c].astype(np.float64))
             bkg  = sep.Background(data, bw=bw, bh=bh, fw=3, fh=3)
@@ -481,6 +488,30 @@ def _color_calibrate(img: np.ndarray) -> np.ndarray:
     return np.clip(result, 0.0, None)
 
 
+def _chroma_smooth(img: np.ndarray, sigma: float = 2.0) -> np.ndarray:
+    """
+    Lab-space chroma smoothing on a linear float32 BGR image in [0, 1].
+
+    Smooths only the a and b (colour) channels, leaving luminance untouched.
+    Applied on linear data before stretching so the noise model is Gaussian
+    and uniform — the stretch would otherwise nonlinearly amplify residual
+    chroma speckle into the visible mottled colour pattern.
+    """
+    # Normalise to [0,1] for Lab conversion regardless of input ADU range,
+    # then restore original scale afterward so only a/b (colour) are changed.
+    img_f   = np.clip(img, 0.0, None).astype(np.float32)
+    scale   = float(np.percentile(img_f, 99.99)) if img_f.max() > 0 else 1.0
+    scale   = max(scale, 1e-6)
+    img_n   = np.clip(img_f / scale, 0.0, 1.0)
+    lab     = cv2.cvtColor(img_n, cv2.COLOR_BGR2Lab)
+    l, a, b = cv2.split(lab)
+    k    = max(int(sigma * 6) | 1, 3)
+    a_sm = cv2.GaussianBlur(a, (k, k), sigma)
+    b_sm = cv2.GaussianBlur(b, (k, k), sigma)
+    result_n = cv2.cvtColor(cv2.merge([l, a_sm, b_sm]), cv2.COLOR_Lab2BGR)
+    return (result_n * scale).astype(np.float32)
+
+
 def _scnr_green(img: np.ndarray) -> np.ndarray:
     """
     Maximum-neutral Subtractive Chromatic Noise Reduction for the green channel.
@@ -515,7 +546,7 @@ def _auto_crop(img: np.ndarray, valid_mask: np.ndarray, margin: int = 12) -> np.
 _STF_MIDTONE_TARGET = 0.12
 
 
-def _auto_stretch(img: np.ndarray, Q: float = 8.0) -> np.ndarray:
+def _auto_stretch(img: np.ndarray, Q: float = 6.0) -> np.ndarray:
     """
     Per-channel asinh stretch for preview JPEGs.
 
@@ -628,6 +659,8 @@ def _siril_full_stack(
     bayer_pattern: str,
     output_fits: str,
     progress_cb: Optional[Callable] = None,
+    bg_mesh_scale: int = 20,
+    _extra_stats: Optional[dict] = None,
 ) -> bool:
     """
     Use Siril CLI for CFA registration + sigma-clip stacking, then debayer the
@@ -784,7 +817,7 @@ def _siril_full_stack(
             # fully-stacked sky rows; galaxy rows also spike but they're in the
             # middle third so we only scan the outer third from each edge.
             # FITS row 0 = bottom of the actual image, so "top border" = high rows.
-            g_fits = data[1]   # green plane in FITS orientation (row 0 = image bottom)
+            g_fits = data[1]   # green plane; astropy returns NumPy order (row 0 = top)
             H_f    = g_fits.shape[0]
             row_iqr = (np.percentile(g_fits, 75, axis=1)
                      - np.percentile(g_fits, 25, axis=1))
@@ -811,10 +844,17 @@ def _siril_full_stack(
 
             bgr = bgr[bot_crop:top_crop, c0:c1]
 
+            # Save pre-background-subtraction linear FITS so re-render can
+            # re-apply background subtraction with a different mesh scale
+            # without re-running the full alignment stack.
+            linear_fits = str(Path(output_fits).with_name(
+                Path(output_fits).stem + '_linear.fits'))
+            _write_fits(linear_fits, bgr, Path(output_fits).stem + '_linear')
+
             # Per-channel SEP background subtraction: fits a sigma-clipped 2D mesh
             # to each channel independently, equalising sky levels across R/G/B and
             # removing vignetting gradients without treating nebula/galaxy as sky.
-            bgr = _subtract_background(bgr)
+            bgr = _subtract_background(bgr, mesh_scale=bg_mesh_scale)
             bgr = np.clip(bgr, 0.0, None)
 
             # GraXpert AI denoising on the linear image (before any stretch).
@@ -822,7 +862,10 @@ def _siril_full_stack(
             # the model clean signal to work with rather than nonlinearly amplified
             # shadow noise.  Falls back silently if GraXpert is unavailable.
             progress_cb(97, "AI denoising (GraXpert)")
-            bgr = _graxpert_denoise(bgr, strength=0.8)
+            _gx_status: list = []
+            bgr = _graxpert_denoise(bgr, strength=1.0, _status_out=_gx_status)
+            if _extra_stats is not None:
+                _extra_stats['graxpert_status'] = _gx_status[0] if _gx_status else 'not run'
 
             _write_fits(output_fits, bgr, Path(output_fits).stem)
         except Exception as exc:
@@ -844,11 +887,18 @@ def _siril_full_stack(
 
 # ── AI denoising (GraXpert) ───────────────────────────────────────────────────
 
-def _graxpert_denoise(img_bgr: np.ndarray, strength: float = 0.8) -> np.ndarray:
+def _graxpert_denoise(
+    img_bgr: np.ndarray,
+    strength: float = 1.0,
+    _status_out: Optional[list] = None,
+) -> np.ndarray:
     """
     GraXpert AI denoising on a linear float32 BGR image in [0, 1].
     Downloads the ONNX model on first call; uses CUDA if available.
     Falls back silently to the original image on any error.
+
+    If _status_out is a list, a single human-readable status string is
+    appended to it so callers can include the outcome in a run log.
 
     Monkey-patches graxpert.ai_model_handling.run_in_process to a no-op so
     that inference runs in-process rather than in a forked child.  GraXpert
@@ -856,6 +906,10 @@ def _graxpert_denoise(img_bgr: np.ndarray, strength: float = 0.8) -> np.ndarray:
     context on WSL2 (CUDA is not fork-safe), causing GPU=-1 failures.
     Running in-process is safe for CUDA/TensorRT providers.
     """
+    def _record(s):
+        if _status_out is not None:
+            _status_out.append(s)
+
     try:
         import graxpert.ai_model_handling as _gxh
         from graxpert.denoising import denoise as _gx_denoise
@@ -887,9 +941,15 @@ def _graxpert_denoise(img_bgr: np.ndarray, strength: float = 0.8) -> np.ndarray:
             _gxh.run_in_process = _orig_run_in_process
 
         if result is None:
+            logging.warning("GraXpert denoise returned None — using original image")
+            _record(f"failed (returned None)")
             return img_bgr
+        logging.info(f"GraXpert denoise: OK (strength={strength}, model={ai_version})")
+        _record(f"OK  (strength={strength}, model={ai_version})")
         return result[:, :, ::-1].astype(np.float32)   # RGB → BGR
-    except Exception:
+    except Exception as exc:
+        logging.warning(f"GraXpert denoise failed — using original image: {exc}")
+        _record(f"failed ({exc})")
         return img_bgr
 
 
@@ -906,8 +966,8 @@ def _denoise_sharpen(img: np.ndarray) -> np.ndarray:
     ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
     y, cr, cb = cv2.split(ycrcb)
 
-    # Luma: gentle smoothing suppresses bright luma speckles in dark sky areas
-    y_dn  = cv2.GaussianBlur(y,  (7,  7),  2)
+    # Luma: moderate smoothing suppresses bright luma speckles in dark sky areas
+    y_dn  = cv2.GaussianBlur(y,  (15, 15), 4)
 
     # Chroma: aggressive blur kills all residual coloured Bayer speckles
     cr_dn = cv2.GaussianBlur(cr, (31, 31), 10)
@@ -970,12 +1030,19 @@ def _write_stack_log(log_path: str, stats: dict, output_path: str) -> None:
         f"  Stage B pass (SEP metrics) : {stage_b}  ({100*stage_b/total:.1f}%)"
             if total else f"  Stage B pass (SEP metrics) : {stage_b}",
         f"  Selected after cap  : {selected}  (max_frames={stats.get('max_frames', '?')})",
+        f"  Quality floor cut   : {stats.get('floor_rejected', 0)}  (min_quality={stats.get('min_quality', 0.0):.2f}, floor score={stats.get('floor_score', 0.0):.2f})",
+        f"  Score range         : {stats.get('worst_score', '?')} – {stats.get('best_score', '?')}",
         f"  Alignment accepted  : {aligned}  ({align_rate} of selected)",
         f"  Alignment rejected  : {rejected_align}",
         f"",
         f"Registration",
         f"  Reference frame  : {stats.get('ref_frame', 'unknown')}",
         f"  Bayer pattern    : {stats.get('bayer_pattern', 'unknown')}",
+        f"",
+        f"Post-processing",
+        f"  bg_mesh_scale    : {stats.get('bg_mesh_scale', 20)}  (0 = skip background subtraction)",
+        f"  min_quality      : {stats.get('min_quality', 0.0):.2f}  (0 = off; 0.5 = keep top half by score)",
+        f"  GraXpert denoise : {stats.get('graxpert_status', 'not run')}",
     ]
     try:
         with open(log_path, 'w', encoding='utf-8') as f:
@@ -1005,12 +1072,14 @@ class StackProcessor:
 
     def run(
         self,
-        fits_files:  list[str],
-        output_path: str,
-        progress_cb: Callable[[int, str, int, int], None],
-        cancel_cb:   Optional[Callable[[], bool]] = None,
-        max_frames:  int = DEFAULT_MAX_FRAMES,
-        use_cache:   bool = False,
+        fits_files:    list[str],
+        output_path:   str,
+        progress_cb:   Callable[[int, str, int, int], None],
+        cancel_cb:     Optional[Callable[[], bool]] = None,
+        max_frames:    int = DEFAULT_MAX_FRAMES,
+        use_cache:     bool = False,
+        bg_mesh_scale: int = 20,
+        min_quality:   float = 0.0,
     ) -> dict:
 
         def _chk():
@@ -1029,6 +1098,8 @@ class StackProcessor:
             'ref_frame':      '',
             'bayer_pattern':  '',
             'max_frames':     max_frames,
+            'bg_mesh_scale':  bg_mesh_scale,
+            'min_quality':    min_quality,
             'elapsed_s':      0.0,
             'used_cache':     False,
         }
@@ -1145,11 +1216,19 @@ class StackProcessor:
                 progress_cb(22 + int(14 * (bi + 1) / n_stage_a),
                             f"Stage B: {bi + 1}/{n_stage_a}", n_stage_a, total)
 
-            # Rank by combined quality score; cap to max_frames
-            scored = sorted(range(n_stage_a),
-                            key=lambda k: _quality_score(stage_b_metrics[k]),
-                            reverse=True)
-            scored = scored[:max_frames]
+            # Rank by combined quality score (best first)
+            all_scores = [_quality_score(stage_b_metrics[k]) for k in range(n_stage_a)]
+            scored = sorted(range(n_stage_a), key=lambda k: all_scores[k], reverse=True)
+
+            # Score-relative quality floor: drop frames below min_quality × best score.
+            # This cuts poor-condition frames even when max_frames would include them.
+            best_score  = all_scores[scored[0]] if scored else 0.0
+            floor_score = best_score * max(min_quality, 0.0)
+            scored_floor = [k for k in scored if all_scores[k] >= floor_score]
+            n_floor_rejected = len(scored) - len(scored_floor)
+
+            # Hard cap at max_frames
+            scored = scored_floor[:max_frames]
 
             # Re-sort to original on-disk order for sequential pass 2 reads
             scored.sort()
@@ -1163,8 +1242,12 @@ class StackProcessor:
                     f"Only {n_selected} frames passed Stage B quality selection (need {MIN_FRAMES})"
                 )
 
-            run_stats['stage_b_pass'] = len(stage_a_idx)
-            run_stats['selected']     = n_selected
+            run_stats['stage_b_pass']      = len(stage_a_idx)
+            run_stats['selected']          = n_selected
+            run_stats['floor_rejected']    = n_floor_rejected
+            run_stats['best_score']        = round(best_score, 2)
+            run_stats['worst_score']       = round(all_scores[scored[-1]] if scored else 0.0, 2)
+            run_stats['floor_score']       = round(floor_score, 2)
 
             # Reference frame: highest Stage B quality score (best FWHM + stars + SNR)
             ref_rank_idx = max(range(n_selected),
@@ -1200,12 +1283,16 @@ class StackProcessor:
                         f"Siril: register + stack ({n_selected} frames)…",
                         n_selected, total)
             siril_installed = os.path.isfile(SIRIL_CLI)
+            _siril_extra: dict = {}
             siril_stack_ok  = _siril_full_stack(
                 selected_files, bayer_pattern, fits_path,
                 progress_cb=lambda p, msg, *_a: progress_cb(
                     37 + int(p * 0.50), msg, n_selected, total
                 ),
+                bg_mesh_scale=bg_mesh_scale,
+                _extra_stats=_siril_extra,
             )
+            run_stats.update(_siril_extra)
             if siril_installed and not siril_stack_ok:
                 # Siril is present but the run failed (disk space, script error,
                 # etc.).  The error was already surfaced via progress_cb — raise
@@ -1239,7 +1326,7 @@ class StackProcessor:
                         preview  = _auto_stretch(bgr_prev)
                         preview_u8 = (preview * 255).astype(np.uint8)
                         preview_u8 = _denoise_sharpen(preview_u8)
-                        cv2.imwrite(str(output_path), preview_u8,
+                        cv2.imwrite(str(output_path), preview_u8[::-1],
                                     [cv2.IMWRITE_JPEG_QUALITY, 95])
                     except Exception:
                         pass
@@ -1478,7 +1565,7 @@ class StackProcessor:
 
                 progress_cb(97, "Saving preview JPEG", n_accepted, total)
                 ok = cv2.imwrite(
-                    str(output_path), preview_u8,
+                    str(output_path), preview_u8[::-1],
                     [cv2.IMWRITE_JPEG_QUALITY, 95],
                 )
                 if not ok:
@@ -1511,29 +1598,39 @@ class StackProcessor:
 
 
 def rerender_preview(fits_path: str, jpeg_path: str,
-                     progress_cb: Optional[Callable] = None) -> str:
+                     progress_cb: Optional[Callable] = None,
+                     bg_mesh_scale: int = 20) -> str:
     """
     Regenerate the preview JPEG from an already-stacked FITS file.
 
-    Applies the full current preview pipeline (GraXpert, SCNR, asinh stretch,
-    chroma denoising, unsharp mask) without re-running frame alignment.
-    Useful for tuning the preview without an 80-minute re-stack.
+    Applies the full current preview pipeline (background subtraction,
+    GraXpert, SCNR, asinh stretch, chroma denoising, unsharp mask) without
+    re-running frame alignment.  bg_mesh_scale controls the SEP mesh coarseness
+    (higher = coarser, better for large galaxies; lower = finer, better for
+    compact nebulae).
 
     Returns the path of the written JPEG.
     """
     if progress_cb is None:
         progress_cb = lambda p, msg, *a: None
 
+    # If a pre-background-subtraction linear FITS exists (saved during the
+    # original stack), use it so we can re-apply bg subtraction with the new
+    # mesh scale.  Falls back to the processed FITS for older stacks.
+    linear_fits = str(Path(fits_path).with_name(
+        Path(fits_path).stem + '_linear.fits'))
+    source_fits = linear_fits if os.path.isfile(linear_fits) else fits_path
+    has_linear  = os.path.isfile(linear_fits)
+
     progress_cb(5, "Loading FITS", 0, 0)
     try:
         from astropy.io import fits as _fits
-        with _fits.open(fits_path) as hdul:
+        with _fits.open(source_fits) as hdul:
             data = hdul[0].data.astype(np.float32)
     except Exception as e:
         raise RuntimeError(f"Cannot read FITS: {e}")
 
     if data.ndim == 3 and data.shape[0] == 3:
-        # FITS plane order is RGB → convert to BGR float32
         bgr = data[::-1].transpose(1, 2, 0).copy()
     elif data.ndim == 3 and data.shape[2] == 3:
         bgr = data[:, :, ::-1].copy()
@@ -1542,6 +1639,33 @@ def rerender_preview(fits_path: str, jpeg_path: str,
 
     os.makedirs(os.path.dirname(os.path.abspath(jpeg_path)), exist_ok=True)
 
+    if has_linear:
+        # Full Python pipeline on the pre-bg-subtraction linear data
+        progress_cb(10, "Background subtraction", 0, 0)
+        bgr = _subtract_background(bgr, mesh_scale=bg_mesh_scale)
+        bgr = np.clip(bgr, 0.0, None)
+
+        progress_cb(30, "AI denoising (GraXpert)", 0, 0)
+        bgr = _graxpert_denoise(bgr, strength=1.0)
+
+        progress_cb(60, "SCNR green suppression", 0, 0)
+        bgr = _scnr_green(bgr)
+
+        progress_cb(75, "Auto-stretch", 0, 0)
+        preview = _auto_stretch(bgr)
+
+        progress_cb(88, "Noise reduction and sharpening", 0, 0)
+        preview_u8 = (preview * 255).astype(np.uint8)
+        preview_u8 = _denoise_sharpen(preview_u8)
+
+        progress_cb(97, "Saving JPEG", 0, 0)
+        ok = cv2.imwrite(jpeg_path, preview_u8[::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not ok:
+            raise RuntimeError(f"Failed to write JPEG to {jpeg_path}")
+        progress_cb(100, "Done", 0, 0)
+        return jpeg_path
+
+    # No linear FITS — older stack.  Try Siril postprocess on the processed FITS.
     progress_cb(10, "Post-processing (Siril)", 0, 0)
     siril_ok = _siril_postprocess(fits_path, jpeg_path,
                                    progress_cb=lambda p, msg, *a: progress_cb(
@@ -1550,7 +1674,7 @@ def rerender_preview(fits_path: str, jpeg_path: str,
         progress_cb(100, "Done", 0, 0)
         return jpeg_path
 
-    # Fallback: our own pipeline
+    # Fallback: our own pipeline on the processed FITS
     progress_cb(20, "Colour calibration", 0, 0)
     bgr = _color_calibrate(bgr)
 
@@ -1568,7 +1692,7 @@ def rerender_preview(fits_path: str, jpeg_path: str,
     preview_u8 = _denoise_sharpen(preview_u8)
 
     progress_cb(97, "Saving JPEG", 0, 0)
-    ok = cv2.imwrite(jpeg_path, preview_u8, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    ok = cv2.imwrite(jpeg_path, preview_u8[::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not ok:
         raise RuntimeError(f"Failed to write JPEG to {jpeg_path}")
 
