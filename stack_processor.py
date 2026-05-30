@@ -35,6 +35,7 @@ Only the top-max_frames selected files are loaded in pass 2, so the unselected
 temp copies are never read again (they are cleaned up in the finally block).
 """
 
+import gc
 import logging
 import os
 import re
@@ -760,6 +761,9 @@ def _siril_full_stack(
             hdu = _fits.PrimaryHDU(rgb.astype(np.uint16))
             hdu.header['COLORMD'] = 'RGB'
             hdu.writeto(os.path.join(work_dir, f"light_{i:05d}.fit"), overwrite=True)
+            del raw, bgr, rgb, hdu   # return numpy pool memory to OS each frame
+            if (i + 1) % 100 == 0:
+                gc.collect()
             if (i + 1) % 50 == 0 or i + 1 == n:
                 progress_cb(
                     int(20 * (i + 1) / n),

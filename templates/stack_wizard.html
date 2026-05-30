@@ -476,6 +476,12 @@
       Reprocesses sub-frames from scratch.
     </p>
 
+    <button id="btn-cancel" class="sw-btn"
+            style="display:none;background:#3a1a1a;color:#cf6679;border:1px solid #cf6679"
+            onclick="doCancel()">
+      ✕ Cancel
+    </button>
+
     <button id="btn-revert" class="sw-btn sw-btn-secondary"
             style="display:none" onclick="doRevert()">
       ↩ Revert to previous settings
@@ -703,7 +709,23 @@ function setRunning(v) {
   const st = document.getElementById('btn-stack');
   if (rr) rr.disabled = v;
   if (st) st.disabled = v;
+  document.getElementById('btn-cancel').style.display = v ? '' : 'none';
   document.getElementById('sw-spinner').classList.toggle('hidden', !v);
+}
+
+async function doCancel() {
+  const btn = document.getElementById('btn-cancel');
+  btn.disabled = true;
+  btn.textContent = 'Cancelling…';
+  try {
+    await fetch('/api/stack/cancel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_name: SESSION}),
+    });
+  } catch(e) {
+    console.error('Cancel failed:', e);
+  }
 }
 
 function setStage(stage, pct) {
@@ -760,6 +782,7 @@ async function doStack() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         session_name:  SESSION,
+        force:         true,
         max_frames:    p.max_frames,
         min_quality:   p.min_quality,
         bg_mesh_scale: p.bg_mesh_scale,
@@ -787,8 +810,7 @@ evtSrc.onmessage = e => {
   switch (ev.type) {
     case 'stack_progress': {
       const pct = ev.pct ?? 0;
-      if (pct < 0) {
-        // error
+      if (pct < 0 || ev.status === 'error') {
         setStage(ev.stage || 'Error', 0);
         setRunning(false);
       } else {
