@@ -28,6 +28,7 @@ track-path composite.
 | **Lunar Timelapse wizard** | Step-by-step pipeline for lunar sessions: select videos, choose render mode (Standard / Enhanced / Surface detail), configure stretch and quality parameters, produce an MP4 timelapse with title card. Supports cancel, back-to-parameters, and result persistence. |
 | **Live Capture** | RTSP stream viewer and recorder. Add one or more Seestar RTSP URLs; view the live MJPEG feed in the browser; optionally record to `SEESTAR_DATA_DIR/captures/` with auto-named MP4 files. Stream configs are persisted in browser localStorage. |
 | **Observing Planner** | Visibility planner for DSO and solar-system objects: shows rise/set times, altitude curves, and optimal observing windows for the configured observer location. |
+| **Transit Planner** | Predicts when tracked satellites (ISS, Hubble, Tiangong, and ~169 other bright objects) will transit the solar or lunar disk. 3-pass algorithm: coarse 1-min grid → 1 s medium scan → 0.05 s ultra-fine contact times. Reports duration, chord % of disk, centerline offset in km, and body altitude/az. Solar transits flagged with filter reminder. TLEs fetched from Celestrak, cached 12 h. |
 | **Result persistence** | Completed solar and lunar timelapse results are saved in browser localStorage (keyed by directory, 30-day TTL). Returning to a previously-rendered directory shows the results without re-rendering. A "Forget" button clears the saved state; "Re-render" re-runs Pass 2+3 using the cached disk-detection data. |
 | **Stack queue** | `/stack/jobs` shows all stacking jobs: active (running job with live progress bar + queued jobs with pulsing indicator) and history (completed/failed jobs with frame counts, wall-clock duration, and links to the result image and run log). Live-updated via SSE. |
 
@@ -86,6 +87,7 @@ static/js/app.js     Sessions-page UI; SSE client; thumbnail picker; stack contr
 static/js/comet_wizard.js  Comet wizard multi-step UI; frame grid; preview; job polling; frame browser
 static/js/catalog.js       Messier / Caldwell bingo-card pages
 solar_processor.py         Solar disk-normalised timelapse pipeline
+satellite_transit_planner.py  Satellite solar/lunar transit prediction (TLE fetch/cache, 3-pass scan, de421 ephemeris)
 static/js/solar_wizard.js  Solar timelapse wizard UI — 3-step flow, per-directory localStorage persistence
 static/js/lunar_wizard.js  Lunar timelapse wizard UI — mode selection, cancel/back support, result persistence
 static/js/capture.js       Live capture page — RTSP stream cards, MJPEG viewer, recording start/stop
@@ -217,6 +219,7 @@ current preview image with a before/after comparison slider.
 |---|---|
 | **Re-render preview** | Applies current params to the saved linear FITS — seconds, not minutes |
 | **Full re-stack** | Reprocesses sub-frames from scratch with the new `max_frames` / `min_quality` |
+| **Cancel** | Abort a running stack or re-render mid-job; button appears during any active operation |
 | **Revert** | Restores the params that were active before the last re-render or preset load |
 | **Compare slider** | Side-by-side overlay of the current render and the immediately preceding one |
 | **Presets** | Save/load named parameter sets to browser localStorage (shared across all sessions) |
@@ -537,7 +540,11 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 | `GET` | `/impacts` | Lunar impact events page |
 | `GET` | `/solar` | Solar timelapse wizard |
 | `GET` | `/lunar` | Lunar timelapse wizard |
-| `GET` | `/planner` | Observing planner |
+| `GET` | `/planner` | Observing planner (DSO visibility tonight) |
+| `GET` | `/planner/transits` | Transit planner (satellite solar/lunar transit predictions) |
+| `POST` | `/api/planner/transits` | Start transit prediction task — body: `{"days_ahead": int, "target": "sun"|"moon"|"both", "notable_only": bool}` |
+| `GET` | `/api/planner/transits/status?task_id=` | Poll prediction task status / result |
+| `DELETE` | `/api/planner/transits/tle-cache` | Invalidate TLE cache, force fresh fetch on next run |
 | `GET` | `/capture` | Live RTSP capture page |
 | `GET` | `/stack/jobs` | Stack queue and job history |
 | `GET` | `/stack/wizard/<session_name>` | Stack Wizard — full post-processing tuning UI |

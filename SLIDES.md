@@ -106,10 +106,22 @@
 
 ## Observing Planner
 
-- Visibility planner for DSO and solar-system objects
-- Shows rise/set times and altitude curves for your configured observer location
-- Highlights optimal observing windows for the current night
-- Uses observer coordinates from the `.env` configuration (`OBSERVER_LAT` / `OBSERVER_LON`)
+- Visibility planner for Messier and Caldwell objects tonight
+- Shows rise/set times, altitude curves, and optimal observing windows
+- Cross-references your session history — highlights objects never yet imaged
+- Re-image filter surfaces sessions rated "Want more" or "Priority"
+- Moon phase, illumination, and astronomical dark window
+
+---
+
+## Transit Planner
+
+- Predicts when satellites will transit the **solar or lunar disk**
+- Covers ISS, Hubble, Tiangong, and ~169 other bright tracked objects
+- 3-pass algorithm: coarse 1-min grid → 1-second scan → **0.05-second ultra-fine** contact times
+- Outputs: duration, chord % of disk, centerline offset in km, body altitude/az
+- ☀ **Solar filter warning** on every Sun transit event
+- TLEs fetched from Celestrak, cached 12 h; de421 ephemeris auto-downloaded on first run
 
 ---
 
@@ -121,6 +133,7 @@
 - **OpenCV** — transit detection, ECC registration, disk detection, blob tracking
 - **astropy / scipy** — coordinate calculations, sigma clipping, polynomial fitting
 - **astroalign** — star-pattern alignment for comet wizard
+- **skyfield + sgp4** — satellite orbital mechanics, TLE propagation, transit prediction
 - Entirely local — no cloud dependency, no external API required (OpenSky and ADS-B are optional)
 
 ---
