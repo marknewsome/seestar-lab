@@ -2502,6 +2502,113 @@ def api_planner_status():
     return jsonify({"status": "running"})
 
 
+# ── Satellite Transit Planner ──────────────────────────────────────────────────
+
+_transit_tasks: dict = {}
+_transit_lock         = threading.Lock()
+
+
+def _run_transit_task(task_id: str, lat: float, lon: float, elevation: float,
+                      days_ahead: int, target: str, notable_only: bool) -> None:
+    def _prog(msg: str, pct: int) -> None:
+        with _transit_lock:
+            if task_id in _transit_tasks:
+                _transit_tasks[task_id]["progress"] = {"msg": msg, "pct": pct}
+
+    try:
+        from satellite_transit_planner import find_transits
+        result = find_transits(lat, lon, elevation, days_ahead, target,
+                               notable_only, progress_cb=_prog)
+        with _transit_lock:
+            _transit_tasks[task_id] = {"status": "done", "result": result}
+    except Exception as exc:
+        log.exception("Transit task %s failed", task_id)
+        with _transit_lock:
+            _transit_tasks[task_id] = {"status": "error", "error": str(exc)}
+
+
+@app.route("/planner/transits")
+def transit_planner_page():
+    loc = _get_obs_location()
+    from satellite_transit_planner import tle_cache_info
+    return render_template("transit_planner.html", data_dir=DATA_DIR,
+                           obs_location=json.dumps(loc),
+                           tle_info=json.dumps(tle_cache_info()))
+
+
+@app.route("/api/planner/transits", methods=["POST"])
+def api_planner_transits():
+    """Start a transit-prediction task; return task_id immediately."""
+    body        = request.get_json(silent=True) or {}
+    lat         = body.get("lat")
+    lon         = body.get("lon")
+    elevation   = float(body.get("elevation", 50))
+    days_ahead  = int(body.get("days_ahead", 7))
+    target      = body.get("target", "both")
+    notable_only = bool(body.get("notable_only", False))
+
+    if lat is None or lon is None:
+        loc = _get_obs_location()
+        if not loc:
+            return jsonify({"error": "Location not set"}), 400
+        lat, lon, elevation = loc["lat"], loc["lon"], loc.get("elevation", 50)
+
+    if body.get("lat") is not None:
+        db.set_meta("obs_lat",       str(lat))
+        db.set_meta("obs_lon",       str(lon))
+        db.set_meta("obs_elevation", str(elevation))
+        if body.get("name"):
+            db.set_meta("obs_name", str(body["name"]))
+
+    task_id = hashlib.md5(
+        f"transit:{lat:.4f}:{lon:.4f}:{days_ahead}:{target}:{notable_only}".encode()
+    ).hexdigest()[:12]
+
+    with _transit_lock:
+        existing = _transit_tasks.get(task_id)
+
+    if existing and existing.get("status") == "done":
+        return jsonify({"task_id": task_id, "cached": True})
+
+    with _transit_lock:
+        _transit_tasks[task_id] = {"status": "running", "progress": {"msg": "Starting…", "pct": 0}}
+
+    threading.Thread(
+        target=_run_transit_task,
+        args=(task_id, float(lat), float(lon), float(elevation),
+              days_ahead, target, notable_only),
+        daemon=True, name=f"transit-{task_id}",
+    ).start()
+
+    return jsonify({"task_id": task_id, "cached": False})
+
+
+@app.route("/api/planner/transits/status")
+def api_planner_transits_status():
+    task_id = request.args.get("task_id", "")
+    with _transit_lock:
+        task = _transit_tasks.get(task_id)
+    if not task:
+        return jsonify({"error": "not found"}), 404
+    if task["status"] == "done":
+        return jsonify({"status": "done", "result": task["result"]})
+    if task["status"] == "error":
+        return jsonify({"status": "error", "error": task.get("error", "")})
+    return jsonify({"status": "running", "progress": task.get("progress", {})})
+
+
+@app.route("/api/planner/transits/tle-cache", methods=["DELETE"])
+def api_transit_tle_cache_delete():
+    """Force a fresh TLE fetch on the next prediction run."""
+    from satellite_transit_planner import _TLE_CACHE_PATH
+    try:
+        if _TLE_CACHE_PATH.exists():
+            _TLE_CACHE_PATH.unlink()
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"ok": True})
+
+
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
     body  = request.get_json(silent=True) or {}

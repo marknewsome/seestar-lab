@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transit Planner — Seestar Lab</title>
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <style>
+    /* ── Page layout ─────────────────────────────────────────────────────── */
+    .tp-page {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 1.5rem 1rem 4rem;
+    }
+
+    /* ── Hero ────────────────────────────────────────────────────────────── */
+    .tp-hero {
+      text-align: center;
+      padding: 2.5rem 1rem 2rem;
+      position: relative;
+    }
+    .tp-hero-title {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: var(--text);
+      margin: 0 0 0.4rem;
+    }
+    .tp-hero-sub {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+      margin: 0;
+    }
+
+    /* ── Controls ────────────────────────────────────────────────────────── */
+    .tp-controls {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.2rem 1.4rem;
+      margin-bottom: 1.4rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.2rem;
+      align-items: flex-end;
+    }
+    .tp-ctrl-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .tp-ctrl-label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--text-muted);
+    }
+    .tp-toggle-row {
+      display: flex;
+      gap: 0.3rem;
+    }
+    .tp-toggle {
+      padding: 0.3rem 0.75rem;
+      font-size: 0.82rem;
+      font-family: inherit;
+      border-radius: 5px;
+      border: 1px solid var(--border-hi);
+      background: var(--bg);
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s, border-color 0.12s;
+    }
+    .tp-toggle:hover { background: var(--card-hover); color: var(--text); }
+    .tp-toggle.active {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .tp-run-btn {
+      padding: 0.45rem 1.4rem;
+      font-size: 0.88rem;
+      font-weight: 700;
+      font-family: inherit;
+      border: none;
+      border-radius: 7px;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      align-self: flex-end;
+      white-space: nowrap;
+    }
+    .tp-run-btn:disabled { opacity: 0.45; cursor: default; }
+    .tp-run-btn:hover:not(:disabled) { opacity: 0.85; }
+
+    /* ── Location bar ────────────────────────────────────────────────────── */
+    .tp-loc-bar {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.8rem;
+      flex-wrap: wrap;
+    }
+    .tp-loc-bar a { color: var(--accent); text-decoration: none; }
+    .tp-loc-bar a:hover { text-decoration: underline; }
+
+    /* ── Progress / status ───────────────────────────────────────────────── */
+    .tp-status {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.2rem;
+      margin-bottom: 1.2rem;
+      display: none;
+    }
+    .tp-status.visible { display: block; }
+    .tp-status-msg {
+      font-size: 0.85rem;
+      color: var(--accent);
+      margin-bottom: 0.5rem;
+    }
+    .tp-prog-track {
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .tp-prog-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      width: 0%;
+      transition: width 0.4s ease;
+    }
+    .tp-error-msg {
+      color: #fca5a5;
+      font-size: 0.85rem;
+      background: rgba(252,165,165,0.08);
+      border: 1px solid rgba(252,165,165,0.2);
+      border-radius: 8px;
+      padding: 0.8rem 1rem;
+      margin-bottom: 1.2rem;
+      display: none;
+    }
+    .tp-error-msg.visible { display: block; }
+
+    /* ── TLE info strip ──────────────────────────────────────────────────── */
+    .tp-tle-strip {
+      font-size: 0.73rem;
+      color: var(--text-muted);
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+    }
+    .tp-tle-stale { color: #fbbf24; }
+    .tp-tle-fresh { color: #4ade80; }
+    .tp-tle-btn {
+      font-size: 0.7rem;
+      color: var(--accent);
+      background: none;
+      border: 1px solid var(--accent-dim);
+      border-radius: 4px;
+      padding: 0.1rem 0.45rem;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .tp-tle-btn:hover { background: var(--accent-dim); }
+
+    /* ── Solar filter warning ────────────────────────────────────────────── */
+    .tp-solar-warn {
+      background: rgba(251,191,36,0.10);
+      border: 1px solid rgba(251,191,36,0.35);
+      border-radius: 8px;
+      padding: 0.65rem 1rem;
+      font-size: 0.82rem;
+      color: #fbbf24;
+      margin-bottom: 1.4rem;
+      display: none;
+    }
+    .tp-solar-warn.visible { display: flex; gap: 0.6rem; align-items: flex-start; }
+
+    /* ── Summary bar ─────────────────────────────────────────────────────── */
+    .tp-summary {
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      margin-bottom: 1rem;
+    }
+    .tp-summary strong { color: var(--text); }
+
+    /* ── Date group header ───────────────────────────────────────────────── */
+    .tp-date-hdr {
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--text-muted);
+      padding: 0.4rem 0;
+      border-bottom: 1px solid var(--border);
+      margin: 1.2rem 0 0.6rem;
+    }
+    .tp-date-hdr:first-of-type { margin-top: 0; }
+
+    /* ── Event card ──────────────────────────────────────────────────────── */
+    .tp-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      margin-bottom: 0.7rem;
+      display: grid;
+      grid-template-columns: 4px 1fr;
+      overflow: hidden;
+    }
+    .tp-card-stripe { }
+    .tp-card-stripe.sun  { background: #f59e0b; }
+    .tp-card-stripe.moon { background: #94a3b8; }
+    .tp-card-body {
+      padding: 0.85rem 1rem;
+    }
+    .tp-card-top {
+      display: flex;
+      align-items: baseline;
+      gap: 0.7rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.4rem;
+    }
+    .tp-card-icon { font-size: 1.1rem; line-height: 1; }
+    .tp-card-sat {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .tp-notable-badge {
+      font-size: 0.64rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      background: var(--accent-dim);
+      color: var(--accent);
+      border: 1px solid var(--border-hi);
+      border-radius: 3px;
+      padding: 0.05rem 0.35rem;
+    }
+    .tp-card-time {
+      margin-left: auto;
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+    }
+    .tp-card-utc {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    .tp-card-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem 1.2rem;
+      font-size: 0.78rem;
+      color: var(--text-muted);
+    }
+    .tp-metric-val { color: var(--text); font-weight: 600; }
+    .tp-card-filter {
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: #fbbf24;
+      background: rgba(251,191,36,0.10);
+      border: 1px solid rgba(251,191,36,0.25);
+      border-radius: 4px;
+      padding: 0.15rem 0.5rem;
+      margin-left: auto;
+    }
+
+    /* ── Empty state ─────────────────────────────────────────────────────── */
+    .tp-empty {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: var(--text-muted);
+      font-size: 0.88rem;
+      display: none;
+    }
+    .tp-empty.visible { display: block; }
+    .tp-empty-icon { font-size: 2.5rem; margin-bottom: 0.8rem; opacity: 0.4; }
+  </style>
+</head>
+<body>
+
+  <header id="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">✦</span>
+        <span class="brand-name">Seestar Lab</span>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Sessions</a>
+        <a class="nav-link" href="/catalog/messier">Messier</a>
+        <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+        <a class="nav-link" href="/activity">Activity</a>
+        <a class="nav-link" href="/comet">Comet</a>
+        <a class="nav-link" href="/solar">Solar</a>
+        <a class="nav-link" href="/lunar">Lunar</a>
+        <a class="nav-link" href="/planner">Planner</a>
+        <a class="nav-link active" href="/planner/transits">Transits</a>
+        <a class="nav-link" href="/capture">Capture</a>
+        <a class="nav-link" href="/stack/jobs">Queue</a>
+      </nav>
+      <div class="header-meta">
+        <span class="data-dir" title="SEESTAR_DATA_DIR">{{ data_dir }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="tp-page">
+
+    <div class="tp-hero">
+      <h1 class="tp-hero-title">Transit Planner</h1>
+      <p class="tp-hero-sub">Predict when satellites cross the solar or lunar disk</p>
+    </div>
+
+    <!-- ── Location & TLE status ──────────────────────────────────────────── -->
+    <div class="tp-loc-bar" id="tp-loc-bar">
+      <span id="tp-loc-text">—</span>
+      <a href="/planner">Change location</a>
+    </div>
+
+    <div class="tp-tle-strip" id="tp-tle-strip"></div>
+
+    <!-- ── Solar filter notice (shown when solar events exist in results) ──── -->
+    <div class="tp-solar-warn" id="tp-solar-warn">
+      <span>☀</span>
+      <span>Solar transits require a proper solar filter. Never observe the Sun
+      without one. Start recording <em>before</em> the predicted time — transit
+      duration is typically under 2 seconds.</span>
+    </div>
+
+    <!-- ── Controls ───────────────────────────────────────────────────────── -->
+    <div class="tp-controls">
+
+      <div class="tp-ctrl-group">
+        <span class="tp-ctrl-label">Look ahead</span>
+        <div class="tp-toggle-row" id="ctrl-days">
+          <button class="tp-toggle" data-val="3">3 days</button>
+          <button class="tp-toggle active" data-val="7">7 days</button>
+          <button class="tp-toggle" data-val="14">14 days</button>
+        </div>
+      </div>
+
+      <div class="tp-ctrl-group">
+        <span class="tp-ctrl-label">Target body</span>
+        <div class="tp-toggle-row" id="ctrl-target">
+          <button class="tp-toggle" data-val="sun">☀ Sun</button>
+          <button class="tp-toggle" data-val="moon">🌙 Moon</button>
+          <button class="tp-toggle active" data-val="both">Both</button>
+        </div>
+      </div>
+
+      <div class="tp-ctrl-group">
+        <span class="tp-ctrl-label">Satellites</span>
+        <div class="tp-toggle-row" id="ctrl-filter">
+          <button class="tp-toggle" data-val="true">Notable only</button>
+          <button class="tp-toggle active" data-val="false">All bright</button>
+        </div>
+      </div>
+
+      <button class="tp-run-btn" id="tp-run-btn" onclick="runPrediction()">
+        Predict Transits
+      </button>
+
+    </div>
+
+    <!-- ── Progress ───────────────────────────────────────────────────────── -->
+    <div class="tp-status" id="tp-status">
+      <div class="tp-status-msg" id="tp-status-msg">Starting…</div>
+      <div class="tp-prog-track">
+        <div class="tp-prog-fill" id="tp-prog-fill"></div>
+      </div>
+    </div>
+    <div class="tp-error-msg" id="tp-error-msg"></div>
+
+    <!-- ── Results ────────────────────────────────────────────────────────── -->
+    <div id="tp-results" style="display:none">
+      <div class="tp-summary" id="tp-summary"></div>
+      <div id="tp-events"></div>
+    </div>
+
+    <div class="tp-empty" id="tp-empty">
+      <div class="tp-empty-icon">🛰</div>
+      No transits found in the selected window.<br>
+      Try extending the look-ahead or including all bright objects.
+    </div>
+
+  </main>
+
+<script>
+// ── Seed data from server ──────────────────────────────────────────────────
+const OBS_LOC  = {{ obs_location|safe }};
+const TLE_INFO = {{ tle_info|safe }};
+
+// ── Active toggle group helper ─────────────────────────────────────────────
+function initToggles(groupId) {
+  const row = document.getElementById(groupId);
+  row.querySelectorAll('.tp-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      row.querySelectorAll('.tp-toggle').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+    });
+  });
+}
+initToggles('ctrl-days');
+initToggles('ctrl-target');
+initToggles('ctrl-filter');
+
+function getToggleVal(groupId) {
+  const active = document.querySelector(`#${groupId} .tp-toggle.active`);
+  return active ? active.dataset.val : null;
+}
+
+// ── Location display ───────────────────────────────────────────────────────
+(function() {
+  const el = document.getElementById('tp-loc-bar');
+  if (OBS_LOC && OBS_LOC.lat !== undefined) {
+    const name = OBS_LOC.name ? `${OBS_LOC.name} · ` : '';
+    document.getElementById('tp-loc-text').textContent =
+      `${name}${OBS_LOC.lat.toFixed(4)}°, ${OBS_LOC.lon.toFixed(4)}° · ${OBS_LOC.elevation || 50} m`;
+  } else {
+    document.getElementById('tp-loc-text').textContent = 'No location set';
+  }
+})();
+
+// ── TLE cache strip ────────────────────────────────────────────────────────
+(function() {
+  const strip = document.getElementById('tp-tle-strip');
+  if (!TLE_INFO.exists) {
+    strip.innerHTML = '<span>TLE catalogue: will be downloaded on first run (~1 MB)</span>';
+    return;
+  }
+  if (TLE_INFO.corrupt) {
+    strip.innerHTML = '<span class="tp-tle-stale">TLE cache corrupt</span> <button class="tp-tle-btn" onclick="refreshTle()">Refresh</button>';
+    return;
+  }
+  const cls   = TLE_INFO.stale ? 'tp-tle-stale' : 'tp-tle-fresh';
+  const label = TLE_INFO.stale ? '⚠ stale' : '✓ fresh';
+  strip.innerHTML =
+    `TLE catalogue: <span class="${cls}">${label}</span> · ` +
+    `${TLE_INFO.n_sats} satellites · ` +
+    `fetched ${TLE_INFO.age_h}h ago ` +
+    `<button class="tp-tle-btn" onclick="refreshTle()">Refresh now</button>`;
+})();
+
+async function refreshTle() {
+  await fetch('/api/planner/transits/tle-cache', {method: 'DELETE'});
+  location.reload();
+}
+
+// ── Run prediction ─────────────────────────────────────────────────────────
+let _pollTimer = null;
+
+async function runPrediction() {
+  if (!OBS_LOC || OBS_LOC.lat === undefined) {
+    alert('Please set your observer location in the Planner page first.');
+    return;
+  }
+
+  clearTimeout(_pollTimer);
+  const btn = document.getElementById('tp-run-btn');
+  btn.disabled = true;
+
+  setStatus('Queuing…', 0, true);
+  setError(null);
+  setResults(null);
+
+  const days        = parseInt(getToggleVal('ctrl-days'),  10);
+  const target      = getToggleVal('ctrl-target');
+  const notableOnly = getToggleVal('ctrl-filter') === 'true';
+
+  let task_id;
+  try {
+    const r = await fetch('/api/planner/transits', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        lat:          OBS_LOC.lat,
+        lon:          OBS_LOC.lon,
+        elevation:    OBS_LOC.elevation || 50,
+        days_ahead:   days,
+        target:       target,
+        notable_only: notableOnly,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) { setError(j.error || 'Request failed'); btn.disabled = false; return; }
+    task_id = j.task_id;
+    if (j.cached) {
+      await fetchAndShowResult(task_id);
+      btn.disabled = false;
+      return;
+    }
+  } catch(e) {
+    setError(String(e));
+    btn.disabled = false;
+    return;
+  }
+
+  _pollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/planner/transits/status?task_id=${task_id}`);
+      const j = await r.json();
+      if (j.status === 'running') {
+        const p = j.progress || {};
+        setStatus(p.msg || 'Working…', p.pct || 0, true);
+      } else if (j.status === 'done') {
+        clearInterval(_pollTimer);
+        setStatus('Done', 100, false);
+        showResult(j.result);
+        btn.disabled = false;
+      } else if (j.status === 'error') {
+        clearInterval(_pollTimer);
+        setStatus('', 0, false);
+        setError(j.error || 'Unknown error');
+        btn.disabled = false;
+      }
+    } catch(e) {
+      // network blip — keep polling
+    }
+  }, 1000);
+}
+
+async function fetchAndShowResult(task_id) {
+  const r = await fetch(`/api/planner/transits/status?task_id=${task_id}`);
+  const j = await r.json();
+  if (j.status === 'done') showResult(j.result);
+  setStatus('', 0, false);
+}
+
+// ── UI state helpers ───────────────────────────────────────────────────────
+function setStatus(msg, pct, visible) {
+  const box = document.getElementById('tp-status');
+  box.classList.toggle('visible', visible);
+  document.getElementById('tp-status-msg').textContent = msg;
+  document.getElementById('tp-prog-fill').style.width  = pct + '%';
+}
+
+function setError(msg) {
+  const el = document.getElementById('tp-error-msg');
+  if (msg) { el.textContent = msg; el.classList.add('visible'); }
+  else      { el.classList.remove('visible'); }
+}
+
+function setResults(r) {
+  document.getElementById('tp-results').style.display = r ? '' : 'none';
+  document.getElementById('tp-empty').classList.remove('visible');
+  document.getElementById('tp-solar-warn').classList.remove('visible');
+}
+
+// ── Render results ─────────────────────────────────────────────────────────
+const AZ_DIR = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+function azDir(deg) { return AZ_DIR[Math.round(deg / 22.5) % 16]; }
+
+function fmtLocalTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+function fmtLocalDate(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString([], {weekday:'long', month:'long', day:'numeric'});
+}
+function fmtUTC(iso) {
+  return iso.replace('T', ' ').replace(/\.\d+Z$/, ' UTC').replace('Z', ' UTC');
+}
+
+function showResult(res) {
+  setResults(res);
+  const events = res.events || [];
+
+  // Summary
+  const scanned = res.satellites_scanned;
+  const notable = events.filter(e => e.is_notable).length;
+  document.getElementById('tp-summary').innerHTML =
+    `<strong>${events.length}</strong> transit${events.length !== 1 ? 's' : ''} found ` +
+    `in next <strong>${res.days_ahead}</strong> days · ` +
+    `${scanned} satellites scanned` +
+    (notable ? ` · <strong>${notable}</strong> involving notable satellites` : '');
+
+  // Solar warning
+  const hasSolar = events.some(e => e.solar_filter);
+  document.getElementById('tp-solar-warn').classList.toggle('visible', hasSolar);
+
+  if (!events.length) {
+    document.getElementById('tp-empty').classList.add('visible');
+    document.getElementById('tp-results').style.display = 'none';
+    return;
+  }
+
+  // Group by local date
+  const byDate = {};
+  for (const ev of events) {
+    const dateKey = fmtLocalDate(ev.mid_utc);
+    (byDate[dateKey] = byDate[dateKey] || []).push(ev);
+  }
+
+  const container = document.getElementById('tp-events');
+  container.innerHTML = '';
+
+  for (const [dateLabel, evs] of Object.entries(byDate)) {
+    const hdr = document.createElement('div');
+    hdr.className = 'tp-date-hdr';
+    hdr.textContent = dateLabel;
+    container.appendChild(hdr);
+
+    for (const ev of evs) {
+      container.appendChild(buildCard(ev));
+    }
+  }
+}
+
+function buildCard(ev) {
+  const isSun  = ev.body === 'sun';
+  const icon   = isSun ? '☀' : '🌙';
+  const cls    = isSun ? 'sun' : 'moon';
+
+  const card = document.createElement('div');
+  card.className = 'tp-card';
+  card.innerHTML = `
+    <div class="tp-card-stripe ${cls}"></div>
+    <div class="tp-card-body">
+      <div class="tp-card-top">
+        <span class="tp-card-icon">${icon}</span>
+        <span class="tp-card-sat">${ev.satellite}</span>
+        ${ev.is_notable ? '<span class="tp-notable-badge">Notable</span>' : ''}
+        <span style="flex:1"></span>
+        <div style="text-align:right">
+          <div class="tp-card-time">${fmtLocalTime(ev.mid_utc)}</div>
+          <div class="tp-card-utc">${fmtUTC(ev.mid_utc)}</div>
+        </div>
+        ${ev.solar_filter ? '<span class="tp-card-filter">☀ SOLAR FILTER</span>' : ''}
+      </div>
+      <div class="tp-card-metrics">
+        <span>Duration: <span class="tp-metric-val">${ev.duration_s.toFixed(1)} s</span></span>
+        <span>Chord: <span class="tp-metric-val">${ev.chord_pct}%</span> of disk</span>
+        <span>Centerline offset: <span class="tp-metric-val">${ev.centerline_km} km</span></span>
+        <span>${isSun ? 'Sun' : 'Moon'} altitude: <span class="tp-metric-val">${ev.body_alt_deg}° ${azDir(ev.body_az_deg)}</span></span>
+        <span>NORAD: <span class="tp-metric-val">${ev.norad}</span></span>
+        <span>Contact: <span class="tp-metric-val">${fmtLocalTime(ev.c1_utc)} → ${fmtLocalTime(ev.c2_utc)}</span></span>
+      </div>
+    </div>`;
+  return card;
+}
+</script>
+</body>
+</html>

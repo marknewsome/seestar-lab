@@ -17,3 +17,4 @@ graxpert>=3.0.0                # AI background extraction + denoising
 
 # Optional — YOLO second-stage transit validation (large download)
 # ultralytics>=8.0.0
+skyfield>=1.54

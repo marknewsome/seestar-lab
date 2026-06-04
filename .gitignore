@@ -41,3 +41,5 @@ instance/
 # Environment variables
 *.env
 
+de421.bsp
+tle_cache.json
