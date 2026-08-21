@@ -117,6 +117,23 @@ Pass 2 — Nucleus detection
     temporal smooth (σ=3 frames, reflected-pad at boundaries) removes this
     high-frequency noise while preserving the real multi-day comet drift.
 
+  Rolling-hint confidence gate:
+    When no user hint is active, each frame's search is seeded from the
+    PREVIOUS frame's detected position ("rolling hint").  Without a check,
+    a single bad detection — the diffuseness score occasionally peaks on a
+    star or noise instead of the coma — becomes the seed for the next
+    frame's search, and the tracker can drift off the comet entirely for a
+    run of frames before by chance recovering.  This showed up in practice
+    as a visible "jiggle" in nucleus-fixed animations: the comet snapping to
+    a wrong position for one frame, then back.  Each detection's diffuseness
+    score is now compared against a running median of recent confident
+    scores; only detections at least NUCLEUS_CONFIDENCE_MIN_RATIO of that
+    baseline are trusted to become the next rolling hint.  A rejected
+    detection still contributes its (uncertain) position to the output list
+    — Pass 2's downstream Gaussian smoothing and gap-interpolation handle
+    isolated bad points — but does not corrupt subsequent frames' search
+    origin.
+
 Pass 3 — Stars-fixed animation  (sub-passes 3a / 3b / 3c)
 
   3a — Union canvas
@@ -247,7 +264,8 @@ AA_SIGMA          = 5.0     # source-detection sigma for astroalign
 AA_MAX_PTS        = 60      # max control points for astroalign
 MIN_SUBS          = 1       # skip frames with fewer stacked subs than this
 MAX_FRAMES        = 300     # subsample to at most this many frames (0 = no limit)
-NOISE_LEVEL       = 0       # bilateral noise reduction strength 0=off, 1–5=increasing
+NOISE_LEVEL       = 0       # noise reduction strength 0=off, 1–5=increasing (see _apply_noise)
+NUCLEUS_CONFIDENCE_MIN_RATIO = 0.5   # rolling-hint gate: min score vs running median to trust a detection
 MAX_GAP_MULT      = 4.0     # VFR: cap large gaps at this multiple of the median (0=no cap)
 TITLE_SECS        = 2.5     # duration of the title card at the start of each animation
 
@@ -293,25 +311,33 @@ def _load_fits(path: str) -> tuple[np.ndarray, dict]:
     Handles both:
       • Individual Bayer subs  — (H, W) uint16 with BAYERPAT header → debayer
       • Pre-debayered stacks   — (3, H, W) uint16 → transpose to (H, W, 3)
+
+    astropy.io.fits already applies BZERO/BSCALE automatically when reading
+    the primary HDU's data (standard FITS: on-disk storage is signed int16,
+    BZERO=32768/BSCALE=1 maps it back to the true unsigned range) — the array
+    returned by fits.open() is already correctly scaled. A previous version
+    of this function re-applied `* bscale + bzero` on top of that, silently
+    double-offsetting every frame ever loaded (e.g. true range 751–65535
+    became 33519–98303, blowing past the 16-bit ceiling and compressing all
+    real dynamic range into a narrow high band). Do not re-apply BZERO/BSCALE
+    here — the values from fits.open() are final.
     """
     with fits.open(path) as hdul:
         hdr  = hdul[0].header
-        raw  = hdul[0].data          # uint16, shape varies
+        raw  = hdul[0].data          # uint16, shape varies — already BZERO/BSCALE-corrected
 
-    bzero  = float(hdr.get("BZERO",  0))
-    bscale = float(hdr.get("BSCALE", 1))
-    bayer  = hdr.get("BAYERPAT", "")
+    bayer = hdr.get("BAYERPAT", "")
 
     if raw.ndim == 2 and bayer:
         # Raw Bayer mono sub — debayer to (H, W, 3) RGB uint16
         code = _BAYER_CODES.get(bayer.upper(), cv2.COLOR_BayerGR2RGB)
         rgb16 = cv2.cvtColor(raw.astype(np.uint16), code)   # (H, W, 3) uint16
-        data  = rgb16.astype(np.float32) * bscale + bzero
+        data  = rgb16.astype(np.float32)
     elif raw.ndim == 3 and raw.shape[0] == 3:
         # Pre-debayered RGB stack: (3, H, W) → (H, W, 3)
-        data = np.transpose(raw, (1, 2, 0)).astype(np.float32) * bscale + bzero
+        data = np.transpose(raw, (1, 2, 0)).astype(np.float32)
     else:
-        data = raw.astype(np.float32) * bscale + bzero
+        data = raw.astype(np.float32)
 
     # Parse nsubs: "Stacked_N_..." → N; individual subs → 1
     stem  = Path(path).stem
@@ -344,9 +370,10 @@ def _stretch(rgb: np.ndarray,
     """
     Per-frame display stretch:
       1. Subtract per-channel sky background (low percentile).
-      2. Scale so the high percentile of luminance maps to 1.
-      3. Apply gamma to bring up faint coma / tail.
-      4. Clip to [0, 1].
+      2. Equalise channel means (neutral-gray white balance).
+      3. Scale so the high percentile of luminance maps to 1.
+      4. Apply gamma to bring up faint coma / tail.
+      5. Clip to [0, 1].
 
     sky_pct/high_pct/gamma override the module globals when provided.
     stat_mask — optional boolean (H,W) array; when given, sky and high
@@ -354,6 +381,15 @@ def _stretch(rgb: np.ndarray,
       the image contains composite-fill areas with different brightness
       (e.g. the stars-fixed canvas), so only the real frame pixels drive
       the calibration.
+
+    Step 2 (white balance) matters for multi-session animations/stacks:
+    sky background color cast drifts session to session (moonlight, airmass,
+    twilight at the edges of an observing run).  Sky-level SUBTRACTION alone
+    corrects the black point per channel but not the relative brightness
+    slope above it, so a frame with a green-heavy sky still reads greenish
+    after step 1.  Equalising channel MEANS after subtraction (scaling, not
+    just offsetting) removes that residual cast so consecutive animation
+    frames don't visibly shift color.
     """
     s_pct = sky_pct  if sky_pct  is not None else STRETCH_SKY_PCT
     h_pct = high_pct if high_pct is not None else STRETCH_HIGH_PCT
@@ -364,6 +400,17 @@ def _stretch(rgb: np.ndarray,
         vals = out[..., c][stat_mask] if stat_mask is not None else out[..., c].ravel()
         sky  = np.percentile(vals, s_pct)
         out[..., c] = out[..., c] - sky
+    out = np.clip(out, 0, None)
+
+    means = np.array([
+        float(out[..., c][stat_mask].mean()) if stat_mask is not None
+        else float(out[..., c].mean())
+        for c in range(3)
+    ])
+    target = float(np.median(means))
+    if target > 1e-6:
+        wb_scale = np.where(means > 1e-6, target / np.maximum(means, 1e-6), 1.0)
+        out = out * wb_scale[None, None, :]
 
     lum = _luminance(out)
     if stat_mask is not None:
@@ -379,11 +426,27 @@ def _stretch(rgb: np.ndarray,
 
 
 def _apply_noise(bgr: np.ndarray, noise: int = 0) -> np.ndarray:
-    """Bilateral noise reduction. noise=0 → no-op; 1–5 → increasing strength."""
+    """
+    Non-local-means noise reduction. noise=0 → no-op; 1–5 → increasing strength.
+
+    Previously used cv2.bilateralFilter, which turned out to have very little
+    effect at full animation-frame resolution: a bilateral filter's edge-
+    preserving radius is tuned relative to local pixel neighbourhoods, and on
+    a full-size busy star field the same sigma that visibly cleaned up a small
+    cropped test region did almost nothing once run on the whole frame (mean
+    absolute pixel change was ~20x weaker on the full frame vs. an isolated
+    crop with identical parameters — always verify denoise strength at actual
+    output resolution, not on a crop). fastNlMeansDenoisingColored's patch-
+    matching approach scales better to full frames and gives a real,
+    verifiable reduction at comparable settings without visibly softening the
+    coma/tail or blobbing stars, provided the strength (h) is not pushed past
+    roughly what NOISE_LEVEL 3 maps to here.
+    """
     if noise <= 0:
         return bgr
-    sigma = float(10 + noise * 10)   # 20 … 60 for levels 1–5
-    return cv2.bilateralFilter(bgr, 9, sigmaColor=sigma, sigmaSpace=sigma)
+    h = float(6 + noise * 4)   # 10 … 26 for levels 1–5
+    return cv2.fastNlMeansDenoisingColored(bgr, None, h=h, hColor=h,
+                                            templateWindowSize=7, searchWindowSize=21)
 
 
 def _to_bgr8(rgb_float: np.ndarray, width: int, sharpen: bool = False) -> np.ndarray:
@@ -513,13 +576,21 @@ def _align_stars(
 def _find_nucleus_in_frame(lum: np.ndarray,
                             hint_x: Optional[float] = None,
                             hint_y: Optional[float] = None,
-                            search_r: int = 400) -> Optional[tuple[float, float]]:
+                            search_r: int = 400) -> Optional[tuple[float, float, float]]:
     """
     Find the comet nucleus in a single luminance frame.
 
     The Seestar tracks the comet each session, so the nucleus is always near
     the frame centre.  We search within search_r pixels of the hint position
     (default: frame centre) for the brightest diffuse blob.
+
+    Returns (x, y, confidence) where confidence is the diffuseness-score peak
+    value, normalised by the ROI's own background level so it is comparable
+    across frames with different sky brightness.  Callers use this to decide
+    whether a rolling hint should be trusted (see _find_nucleus) — an
+    unconstrained "brightest diffuse blob" search will occasionally lock onto
+    a star or noise instead of the coma, and that single bad detection should
+    not be allowed to drag the next frame's search window along with it.
     """
     h, w = lum.shape
     cx = int(hint_x) if hint_x is not None else w // 2
@@ -542,7 +613,7 @@ def _find_nucleus_in_frame(lum: np.ndarray,
     large = cv2.GaussianBlur(residual, (0, 0), sigmaX=25)
     eps   = float(np.percentile(residual, 99)) * 0.05 + 1.0
     score = (large ** 2) / (small + eps)
-    _, _, _, max_loc = cv2.minMaxLoc(score)
+    _, max_val, _, max_loc = cv2.minMaxLoc(score)
 
     # Centroid within a window around the peak to reduce per-frame jitter.
     # A single argmax pixel is noisy; the weighted centroid of the score peak
@@ -560,7 +631,8 @@ def _find_nucleus_in_frame(lum: np.ndarray,
     else:
         cx_sub, cy_sub = float(px), float(py)
 
-    return (float(x1 + cx_sub), float(y1 + cy_sub))
+    confidence = float(max_val) / eps
+    return (float(x1 + cx_sub), float(y1 + cy_sub), confidence)
 
 
 def _find_nucleus(
@@ -601,6 +673,12 @@ def _find_nucleus(
 
     positions = []
     last_orig_pos: Optional[tuple[float, float]] = None
+    # Running history of CONFIDENT detection scores, used as the trust baseline
+    # for the rolling hint (see NUCLEUS_CONFIDENCE_MIN_RATIO doc above).  Only
+    # populated with scores from detections that themselves passed the gate,
+    # so a run of bad frames can't drag the baseline down and start accepting
+    # more bad frames.
+    confident_scores: list[float] = []
 
     for i, f in enumerate(files):
         src_data, _ = _load_fits(f)
@@ -621,15 +699,34 @@ def _find_nucleus(
             hx, hy = float(w // 2), float(h // 2)
             search_r = int(min(h, w) * 0.4)
 
-        pos_orig = _find_nucleus_in_frame(src_lum, hint_x=hx, hint_y=hy,
-                                          search_r=search_r)
-        if pos_orig is None:
+        result = _find_nucleus_in_frame(src_lum, hint_x=hx, hint_y=hy,
+                                        search_r=search_r)
+        if result is None:
             positions.append(None)
             last_orig_pos = None
             continue
+        ox, oy, confidence = result
+        pos_orig = (ox, oy)
 
-        last_orig_pos = pos_orig
-        ox, oy = pos_orig
+        # Only let a detection become the next frame's rolling hint if it is
+        # reasonably confident relative to recent confident detections.  A
+        # detection that fails the gate still contributes its position below
+        # (smoothing/interpolation in _smooth_nucleus_positions cleans up
+        # isolated bad points) but does not become the search seed for frame
+        # i+1 — that's what let a single glitch cascade before this gate.
+        if raw_hint_offset is None:
+            baseline = float(np.median(confident_scores)) if confident_scores else None
+            trusted = baseline is None or confidence >= baseline * NUCLEUS_CONFIDENCE_MIN_RATIO
+            if trusted:
+                last_orig_pos = pos_orig
+                confident_scores.append(confidence)
+                if len(confident_scores) > 20:
+                    confident_scores.pop(0)
+            # else: keep the previous last_orig_pos so the NEXT frame's search
+            # still starts from the last trusted location, not the glitch.
+        else:
+            last_orig_pos = pos_orig
+
         t = transforms[i]
         if t is not None:
             # Transform the original-frame nucleus position into aligned coords:
@@ -894,18 +991,21 @@ def _draw_nucleus_marker(img: np.ndarray, px: int, py: int,
 
 def _detect_trail_mask(
     rgb_float: np.ndarray,
-    sigma_thresh: float = 6.0,
     min_length:   int   = 60,
     fill_thresh:  float = 0.25,
-    dilation:     int   = 12,
+    dilation:     int   = 20,
+    nucleus_xy: "tuple[float, float] | None" = None,
+    nucleus_exclude_r: float = 220.0,
 ) -> np.ndarray:
     """
     Return a boolean mask of satellite/aircraft trail pixels (True = contaminated).
 
     Algorithm:
       1. Compute luminance; estimate background with a large Gaussian blur.
-      2. Compute residual = lum − background; threshold at sigma_thresh × MAD-σ
-         to find anomalously bright features.
+      2. Compute residual = lum − background; threshold at the
+         PCTILE_THRESH percentile of the residual to find anomalously bright
+         features — the top ~(100 - PCTILE_THRESH)% of pixels by residual
+         brightness, regardless of the residual distribution's shape.
       3. Find connected components.  A component is classified as a trail if:
            max(bbox_width, bbox_height) ≥ min_length   (it is long)
            AND  area / (bbox_w × bbox_h)  ≤ fill_thresh  (it is sparse/thin)
@@ -914,19 +1014,51 @@ def _detect_trail_mask(
          stars are therefore ignored even if they exceed the brightness threshold.
       4. Dilate the trail mask by `dilation` pixels to cover PSF wings.
 
-    Zero-fill border pixels (from warpAffine BORDER_CONSTANT) are naturally
-    excluded because their luminance is 0 and they never exceed the threshold.
+    Zero-fill border pixels themselves are naturally excluded because their
+    luminance is 0 and they never exceed the threshold — but the SEAM between
+    real content and a zero-fill region (from warpAffine BORDER_CONSTANT,
+    e.g. after the nucleus-centering translation) is not: the background
+    estimate is a large-sigma Gaussian blur, which bleeds real content into
+    the adjacent zero region and vice versa, producing a spurious sharp
+    residual edge running along the boundary. That edge is long and thin —
+    exactly the trail classifier's target shape — and got flagged as a
+    trail-like feature in practice. A margin of `bg_sigma`-ish pixels around
+    every uncovered-region boundary is excluded from the trail mask entirely
+    to prevent this.
+
+    A previous version thresholded at sigma_thresh × MAD-σ. MAD is not a
+    reliable sigma estimator for a sparse starfield residual: with roughly
+    half the frame at exact background (residual = 0) and the rest a long-
+    tailed distribution of star brightnesses, MAD can land anywhere from
+    exactly 0 up to a small fraction of the true bright-pixel population —
+    both cases push the effective threshold far too low, flagging a large
+    fraction of ordinary stars as "anomalously bright." Dense star clusters
+    then get merged by connected-component labelling into large low-fill-
+    ratio blobs that are misclassified as trails, corrupting any composite
+    that accumulates 2+ such frames. A fixed high percentile of the residual
+    itself sidesteps the estimator entirely: it always selects the correct
+    proportion of "unusually bright" pixels regardless of how much of the
+    frame is background or how the bright tail is shaped.
+
+    A bright, active coma can show real jet/streamer substructure — thin
+    radiating filaments of dust/gas from the nucleus — that satisfies the
+    same "long and thin" shape test as a satellite trail. Observed on a
+    deep, high-SNR multi-night 220P stack: one night's coma had visible jet
+    structure that got misclassified as trail contamination, locally
+    dropping stack coverage in that frame's coma region and leaving a
+    visible color-shifted patch in the accumulated deep stack. If the
+    caller knows where the nucleus is in this frame (Pass 4 always does,
+    since frames are nucleus-aligned to a common reference position), a
+    disc around it is excluded from trail detection entirely — the coma is
+    expected to look "trail-like" there and should never be masked out.
     """
     lum = _luminance(rgb_float)
     bg  = cv2.GaussianBlur(lum, (0, 0), sigmaX=25.0)
     residual = np.clip(lum.astype(np.float32) - bg, 0.0, None)
 
-    # Robust σ estimate via MAD (resistant to stars and bright sky)
-    med   = float(np.median(residual))
-    mad   = float(np.median(np.abs(residual - med)))
-    sigma = max(mad * 1.4826, 1e-9)
-
-    binary = (residual > sigma_thresh * sigma).astype(np.uint8)
+    PCTILE_THRESH = 99.5
+    thresh = float(np.percentile(residual, PCTILE_THRESH))
+    binary = (residual > max(thresh, 1e-9)).astype(np.uint8)
 
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         binary, connectivity=8)
@@ -945,6 +1077,22 @@ def _detect_trail_mask(
         k    = dilation * 2 + 1
         kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         trail_mask = cv2.dilate(trail_mask, kern)
+
+    # Exclude a margin around any zero-fill boundary: the background blur
+    # (sigma=25) bleeds real content across the seam for roughly that many
+    # pixels in each direction, so give it a matching margin to be safe.
+    covered = (lum > 0).astype(np.uint8)
+    uncovered = 1 - covered
+    edge_margin = 25 * 4 + 1
+    edge_kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (edge_margin, edge_margin))
+    near_boundary = cv2.dilate(uncovered, edge_kern).astype(bool) & covered.astype(bool)
+    trail_mask[near_boundary] = 0
+
+    if nucleus_xy is not None:
+        ncx, ncy = nucleus_xy
+        yy, xx = np.mgrid[0:trail_mask.shape[0], 0:trail_mask.shape[1]]
+        near_nucleus = (xx - ncx) ** 2 + (yy - ncy) ** 2 <= nucleus_exclude_r ** 2
+        trail_mask[near_nucleus] = 0
 
     return trail_mask.astype(bool)
 
@@ -1249,7 +1397,7 @@ def main() -> None:
     args = ap.parse_args()
 
     # Apply CLI overrides to module globals so helper functions pick them up
-    global FPS, STRETCH_GAMMA, NUCLEUS_CROP_PX, STRETCH_SKY_PCT, STRETCH_HIGH_PCT, NOISE_LEVEL, MAX_GAP_MULT
+    global FPS, STRETCH_GAMMA, NUCLEUS_CROP_PX, STRETCH_SKY_PCT, STRETCH_HIGH_PCT, NOISE_LEVEL, MAX_GAP_MULT, OUTPUT_WIDTH
     if args.fps          is not None: FPS              = args.fps
     if args.gamma        is not None: STRETCH_GAMMA    = args.gamma
     if args.crop         is not None: NUCLEUS_CROP_PX  = args.crop
@@ -1502,7 +1650,13 @@ def main() -> None:
                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         del src_data
         covered = warped.sum(axis=2) > 0
-        trail   = _detect_trail_mask(warped)
+        nuc_xy = None
+        if nucleus_pos[i] is not None:
+            M = _make_M(i)
+            nx, ny = nucleus_pos[i]
+            nuc_xy = (M[0, 0] * nx + M[0, 1] * ny + M[0, 2],
+                      M[1, 0] * nx + M[1, 1] * ny + M[1, 2])
+        trail   = _detect_trail_mask(warped, nucleus_xy=nuc_xy)
         good    = covered & ~trail
         comp_sum[good]   += warped[good].astype(np.float64)
         comp_count[good] += 1
@@ -1664,7 +1818,7 @@ def main() -> None:
 
             # Accumulate nucleus-aligned full frame for deep stack
             # Exclude satellite/aircraft trail pixels via per-pixel count array.
-            trail   = _detect_trail_mask(aligned_rgb)
+            trail   = _detect_trail_mask(aligned_rgb, nucleus_xy=(ref_nx, ref_ny))
             covered = aligned_rgb.sum(axis=2) > 0
             good    = covered & ~trail
             stack_sum[good]   += aligned_rgb[good].astype(np.float64)
