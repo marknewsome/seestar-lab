@@ -10,6 +10,10 @@ Pipeline:
   3. Frame selection   — reject below 40 % of median sharpness; keep top max_frames
                          by score.  Files re-sorted to original on-disk order so
                          pass 2 is as sequential as possible.
+  4. Siril stack       — preferred path when Siril CLI is installed: RCD demosaic
+                         (convert -debayer), 2-pass registration, FWHM-weighted
+                         winsorized sigma-clip stack with channel equalisation.
+                         Steps 4–5 below are the fallback when Siril is missing.
   4. Registration pass — heavy pass on accepted files only: read FITS, debayer,
                          normalise sky background to reference, align (astroalign →
                          ECC → phase-correlation), measure SEP frame metrics.
@@ -36,6 +40,7 @@ temp copies are never read again (they are cleaned up in the finally block).
 """
 
 import gc
+import json
 import logging
 import os
 import re
@@ -58,9 +63,75 @@ QUALITY_THRESHOLD = 0.40   # reject frames below this fraction of median sharpne
 DEFAULT_MAX_FRAMES = 500   # keep only this many best frames (quality-ranked)
 DRIZZLE_SCALE     = 2      # Lanczos upsample factor (matches Seestar's output size)
 
+# Siril's multi-file `convert` opens every frame at once and aborts with
+# "Max number of opened files (8192) is larger than required number of images"
+# past this count.  `-fitseq` would avoid it but its register step is broken
+# in Siril 1.4.3 (see the note in _siril_full_stack), so this is a hard
+# ceiling.  Clamp here rather than discovering it after the multi-hour copy
+# and scoring phases have already run.
+SIRIL_MAX_OPEN_FILES = 8192
+SIRIL_FRAME_LIMIT    = 8000   # headroom under the ceiling for Siril's own temps
+
 
 class StackCancelled(RuntimeError):
     """Raised when a cancel callback signals the job should stop."""
+
+
+def _kill_windows_siril() -> None:
+    """Kill any siril-cli.exe left running on the Windows side.
+
+    Siril is invoked through WSL interop, so Python's subprocess timeout only
+    terminates the local /init shim; the Windows process survives and keeps
+    writing into the work dir we are about to delete.
+    """
+    import subprocess, logging
+    try:
+        subprocess.run(
+            ["/mnt/c/Windows/System32/taskkill.exe", "/IM", "siril-cli.exe", "/F"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:
+        logging.warning(f"Could not kill orphaned siril-cli.exe: {exc}")
+
+
+def _siril_error_lines(stdout: str, context: int = 12) -> str:
+    """Pull the actual error lines out of Siril's very chatty stdout.
+
+    Siril logs a line per frame ("HDU 1234: type=0, ..."), so a plain tail of
+    the output buries the real failure under thousands of progress lines.
+    """
+    lines = stdout.splitlines()
+    hits  = [i for i, ln in enumerate(lines)
+             if any(k in ln for k in ('rror', 'ailed', 'Could not', 'Warning:',
+                                      'not found', 'Exiting'))]
+    if not hits:
+        return f"stdout (tail): {stdout[-800:]}\n"
+    keep, seen = [], set()
+    for i in hits[-context:]:
+        for j in range(max(0, i - 1), min(len(lines), i + 2)):
+            if j not in seen:
+                seen.add(j)
+                keep.append(lines[j])
+    return "stdout (error lines):\n" + "\n".join(keep) + "\n"
+
+
+def _copy_file_no_sendfile(src: str, dst: str, bufsize: int = 4 * 1024 * 1024) -> None:
+    """Chunked read/write copy, bypassing os.sendfile() and file metadata.
+
+    shutil.copy2/copyfile use sendfile() on Linux, which has been observed to
+    raise ENOMEM ("Cannot allocate memory") when either side of the copy is a
+    WSL2 9p/drvfs mount (e.g. a Windows drive under /mnt/<letter>) — a known
+    category of WSL2 9p driver issue, not an actual low-memory condition.
+    Deliberately skips shutil.copystat(): chmod/utime on a 9p-mounted
+    destination can raise PermissionError, and these are throwaway working
+    copies that don't need preserved permissions or timestamps.
+    """
+    with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
+        while True:
+            buf = fsrc.read(bufsize)
+            if not buf:
+                break
+            fdst.write(buf)
 
 
 # ── Minimal FITS reader ────────────────────────────────────────────────────────
@@ -342,6 +413,83 @@ def _compute_weight(metrics: dict) -> float:
     return (stars * snr) / (fwhm**2 * (1.0 + ecc))
 
 
+def score_session_frames(
+    fits_files:  list[str],
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    cancel_cb:   Optional[Callable[[], bool]] = None,
+) -> list[dict]:
+    """
+    Score every frame in a session with the same Stage A / Stage B metrics the
+    real stacking pipeline uses, without copying to local disk or stacking
+    anything.  Read-only pass over the source files — safe to run concurrently
+    with an actual stack job (though I/O will contend on spinning/network
+    drives).
+
+    Returns one dict per input file, in the same order as fits_files:
+      {file, sharpness, stage_a_pass, fwhm, eccentricity, star_count, snr,
+       score, error}
+    'error' is set (and other fields are None/0) if the file couldn't be read
+    or scored.  Frames are NOT capped by max_frames or min_quality here — this
+    is the full distribution so the caller can pick those cutoffs visually.
+    """
+
+    def _chk():
+        if cancel_cb and cancel_cb():
+            raise StackCancelled("Scoring cancelled")
+
+    total = len(fits_files)
+    results: list[dict] = []
+    sharpness: list[float] = []
+    bayer_pattern = 'GRBG'
+
+    for i, fpath in enumerate(fits_files):
+        _chk()
+        row = {
+            'file': os.path.basename(fpath), 'sharpness': 0.0,
+            'stage_a_pass': False, 'fwhm': None, 'eccentricity': None,
+            'star_count': 0, 'snr': None, 'score': 0.0, 'error': None,
+        }
+        try:
+            raw, hdr = _read_fits(fpath)
+            if i == 0:
+                bayer_pattern = hdr.get('BAYERPAT', 'GRBG').strip("'").strip()
+            row['sharpness'] = _sharpness(raw)
+        except Exception as exc:
+            row['error'] = str(exc) or type(exc).__name__
+        results.append(row)
+        sharpness.append(row['sharpness'] if row['error'] is None else 0.0)
+        if progress_cb:
+            progress_cb(int(60 * (i + 1) / total), f"Stage A: {i + 1}/{total}")
+
+    positive  = [s for s in sharpness if s > 0]
+    threshold = float(np.median(positive)) * QUALITY_THRESHOLD if positive else 0.0
+
+    for i, row in enumerate(results):
+        if row['error'] is None:
+            row['stage_a_pass'] = sharpness[i] >= threshold
+
+    stage_a_indices = [i for i, row in enumerate(results) if row['stage_a_pass']]
+    for bi, i in enumerate(stage_a_indices):
+        _chk()
+        row = results[i]
+        try:
+            raw, _ = _read_fits(fits_files[i])
+            bgr     = _debayer(raw, bayer_pattern).astype(np.float32) / 65535.0
+            metrics = _frame_metrics(bgr)
+            row['fwhm']         = metrics['fwhm']
+            row['eccentricity'] = metrics['eccentricity']
+            row['star_count']   = metrics['star_count']
+            row['snr']          = metrics['snr']
+            row['score']        = _quality_score(metrics)
+        except Exception as exc:
+            row['error'] = str(exc) or type(exc).__name__
+        if progress_cb:
+            progress_cb(60 + int(40 * (bi + 1) / max(len(stage_a_indices), 1)),
+                        f"Stage B: {bi + 1}/{len(stage_a_indices)}")
+
+    return results
+
+
 # ── Weighted sigma-clipped integration ────────────────────────────────────────
 
 def _weighted_sigma_clip(
@@ -554,6 +702,23 @@ _CHROMA_BLUR_K  = 31    # chroma Gaussian kernel size (must be odd)
 _CHROMA_BLUR_SIG = 10   # chroma Gaussian sigma
 _UNSHARP_SIG    = 1.5   # unsharp mask blur sigma
 _UNSHARP_GAIN   = 1.35  # unsharp mask blend weight (1 + gain blends in sharpened detail)
+_SATURATION     = 1.0   # colour saturation multiplier (1.0 = unchanged)
+
+
+def _boost_saturation(img: np.ndarray, saturation: float) -> np.ndarray:
+    """
+    Scale colour saturation of a stretched float32 BGR image in [0, 1].
+
+    Works in HSV so hue is untouched; V is untouched so star cores and the
+    nebula luminance keep their stretch.  Saturation is applied after the
+    stretch — boosting in linear space would amplify chroma noise that the
+    stretch then exaggerates.
+    """
+    if abs(saturation - 1.0) < 1e-3:
+        return img
+    hsv = cv2.cvtColor(np.clip(img, 0.0, 1.0), cv2.COLOR_BGR2HSV)
+    hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0.0, 1.0)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 _STF_MIDTONE_TARGET = 0.12
 
@@ -585,7 +750,7 @@ def _auto_stretch(img: np.ndarray,
 # ── Siril CLI post-processing ─────────────────────────────────────────────────
 
 SIRIL_CLI          = "/mnt/c/Program Files/Siril/bin/siril-cli.exe"
-SIRIL_WIN_WORK_BASE = "/mnt/c/Temp"   # Windows-accessible temp root for Siril jobs
+SIRIL_WIN_WORK_BASE = "/mnt/g/Temp"   # Windows-accessible temp root for Siril jobs
 
 
 def _siril_postprocess(fits_path: str, jpeg_path: str,
@@ -620,10 +785,15 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
     fits_win = to_win(fits_path)
     jpeg_win = to_win(os.path.splitext(jpeg_path)[0])  # Siril appends .jpg itself
 
+    # autostretch args: [-linked] [shadowsclip [targetbg]].
+    # -linked stretches all channels together (no colour shift after the
+    # stack's -rgb_equal).  Target background 0.15 instead of the 0.25
+    # default — the default lifts the sky noise floor well into view
+    # (Seestar's own JPEGs sit around 0.16).
     script = (
         'requires 1.2.0\n'
         f'load "{fits_win}"\n'
-        'autostretch\n'
+        'autostretch -linked -2.80 0.15\n'
         f'savejpg "{jpeg_win}" 95\n'
     )
 
@@ -675,17 +845,28 @@ def _siril_full_stack(
     _extra_stats: Optional[dict] = None,
 ) -> bool:
     """
-    Use Siril CLI for CFA registration + sigma-clip stacking, then debayer the
-    result in Python to produce a 3-channel linear color FITS at output_fits.
+    Use Siril CLI for RCD demosaic + 2-pass registration + weighted sigma-clip
+    stacking, producing a 3-channel linear color FITS at output_fits.
 
-    Siril pipeline (all in CFA/Bayer space):
-      convert light -out=pp_light   → CFA frames indexed as light_ sequence
-      register light_               → star-pattern alignment (sequence r_light_)
-      stack r_light_ rej 3 3        → sigma-clip integration, additive+scale norm
-                                       saves stacked.fit (1-ch float32 Bayer)
+    Siril pipeline:
+      convert light -debayer        → RCD demosaic of the raw CFA frames.
+                                       RCD preserves ~12 % more star sharpness
+                                       than a bilinear debayer and avoids its
+                                       correlated chroma speckle.  (Bayer
+                                       drizzle was also evaluated: same
+                                       sharpness, but ~2× noisier at typical
+                                       frame counts because each colour plane
+                                       only gets ¼ of the samples per frame.)
+      register light_ -2pass        → compute transforms + FWHM stats only;
+                                       picks the best frame as reference
+      seqapplyreg light_            → apply transforms (framing=max)
+      stack r_light_ rej 3 3        → winsorized sigma-clip integration,
+                                       additive+scale norm, FWHM-weighted,
+                                       per-channel background equalisation
+                                       saves stacked.fit (3-ch float32 RGB)
 
-    Python post-step: read stacked.fit → debayer → sky-pedestal subtract → save
-    3-channel float32 FITS to output_fits.
+    Python post-step: read stacked.fit → border crop → sky subtract → denoise
+    → save 3-channel float32 FITS to output_fits.
 
     JPEG generation is NOT done here; call _siril_postprocess or the GraXpert
     pipeline separately on the resulting color FITS.
@@ -714,19 +895,17 @@ def _siril_full_stack(
         os.makedirs(work_dir, exist_ok=True)
 
         # Pre-flight disk-space check.
-        # Each pre-debayered frame is (H × W × 3 channels × 4 bytes float32).
-        # Input frames are uint16 (~12 MB each); Siril writes registered frames
-        # as float32 (~23 MB each).  Budget for both before writing anything.
+        # Raw CFA input (2 B/px) + Siril's debayered RGB copy (uint16, 6 B/px)
+        # + registered float32 RGB frames (12 B/px).
         n = len(selected_files)
         if n > 0:
             import shutil as _shutil
-            sample_raw, _ = _read_fits(selected_files[0])
+            sample_raw, sample_hdr = _read_fits(selected_files[0])
             h_s, w_s = sample_raw.shape[:2]
-            # Input frames written as uint16 (2 bytes/pixel); Siril writes
-            # registered frames as float32 (4 bytes/pixel).  15 % buffer on top.
-            input_bytes  = h_s * w_s * 3 * 2 * n          # uint16 input
-            reg_bytes    = h_s * w_s * 3 * 4 * n          # float32 registration output
-            needed_bytes = (input_bytes + reg_bytes) * 1.15
+            input_bytes  = h_s * w_s * 2 * n              # uint16 CFA input
+            debayer_bytes = h_s * w_s * 3 * 2 * n         # uint16 RGB (convert)
+            reg_bytes    = h_s * w_s * 3 * 4 * n          # float32 registered RGB
+            needed_bytes = (input_bytes + debayer_bytes + reg_bytes) * 1.15
             free_bytes   = _shutil.disk_usage(SIRIL_WIN_WORK_BASE).free
             if needed_bytes > free_bytes:
                 needed_gb = needed_bytes / 1024**3
@@ -741,48 +920,72 @@ def _siril_full_stack(
                     f"only {free_gb:.1f} GB free — reduce max_frames or free space on C:"
                 )
                 return False
+            sample_has_bayerpat = bool(str(sample_hdr.get('BAYERPAT', '')).strip())
 
-        # Debayer each selected frame in Python and write 3-channel float32 FITS.
-        # Registering raw CFA Bayer frames creates systematic color cross-talk:
-        # sub-pixel shifts misalign the GRBG grid, and averaged shifted Bayer
-        # patterns produce the purple/green diagonal band artifact.  Pre-debayering
-        # gives Siril proper RGB images so registration and stacking are colour-clean.
-        progress_cb(0, f"Siril: debayering and writing {n} frames to work dir…")
-        try:
-            from astropy.io import fits as _fits
-        except ImportError:
-            logging.warning("astropy not available for pre-debayer write")
-            return False
-
+        # Copy raw CFA frames into the work dir.  No Python debayer — Siril's
+        # 'convert -debayer' (RCD) does it better than OpenCV's bilinear, and
+        # the Seestar headers already carry BAYERPAT so a byte-for-byte copy
+        # keeps everything Siril needs.  If a header lacks BAYERPAT, rewrite
+        # via astropy adding the pattern detected earlier.
+        progress_cb(0, f"Siril: copying {n} CFA frames to work dir…")
         for i, src in enumerate(selected_files):
-            raw, _ = _read_fits(src)
-            bgr = _debayer(raw, bayer_pattern)                 # uint16 [0,65535]
-            rgb = bgr[:, :, ::-1].transpose(2, 0, 1)          # (3, H, W) RGB
-            hdu = _fits.PrimaryHDU(rgb.astype(np.uint16))
-            hdu.header['COLORMD'] = 'RGB'
-            hdu.writeto(os.path.join(work_dir, f"light_{i:05d}.fit"), overwrite=True)
-            del raw, bgr, rgb, hdu   # return numpy pool memory to OS each frame
-            if (i + 1) % 100 == 0:
-                gc.collect()
+            dst = os.path.join(work_dir, f"raw_{i:05d}.fit")
+            if sample_has_bayerpat:
+                _copy_file_no_sendfile(src, dst)
+            else:
+                from astropy.io import fits as _fits
+                raw, _ = _read_fits(src)
+                hdu = _fits.PrimaryHDU(raw.astype(np.uint16))
+                hdu.header['BAYERPAT'] = bayer_pattern
+                hdu.writeto(dst, overwrite=True)
+                del raw, hdu
             if (i + 1) % 50 == 0 or i + 1 == n:
                 progress_cb(
-                    int(20 * (i + 1) / n),
-                    f"Siril: debayered {i + 1}/{n} frames",
+                    int(15 * (i + 1) / n),
+                    f"Siril: copied {i + 1}/{n} frames",
                 )
 
         work_win = to_win(work_dir)
 
-        # Register and stack pre-debayered RGB FITS.  Siril v1.4 uses r_ prefix.
-        # Omit 'convert': our files are already named light_NNNNN.fit which is
-        # Siril's native sequence format — convert would just write a redundant
-        # third copy of every frame (~23 MB each).  Siril detects the sequence
-        # automatically after 'cd' + 'setext fit'.
+        # Demosaic, register, and stack.
+        #   convert       RCD-debayers every raw_ frame into the light fitseq
+        #                 (single-file sequence; -fitseq avoids Siril's "too
+        #                 many open files" error at large frame counts, and
+        #                 changes the sequence name to "light" with no
+        #                 trailing underscore, unlike multi-file sequences)
+        #   -2pass        registration computes transforms + per-frame FWHM
+        #                 without writing frames, and picks the best-quality
+        #                 frame as the reference automatically
+        #   seqapplyreg   applies the transforms in the reference frame's
+        #                 footprint (default framing=current).  framing=max
+        #                 must NOT be used here: Seestar is alt-az, so
+        #                 multi-night sessions carry large field rotation and
+        #                 the union canvas becomes mostly empty border, which
+        #                 also skews the stretch statistics downstream.
+        #                 Partial-coverage edges are IQR-cropped in Python.
+        #   stack         winsorized 3σ rejection, additive+scale normalisation,
+        #                 frames weighted by registration FWHM, channel
+        #                 backgrounds equalised, output rescaled to [0,1]
+        # NOTE: -fitseq is intentionally NOT used here despite handling >8192
+        # frames without hitting Siril's open-file ceiling. Confirmed via a
+        # controlled A/B test (2026-09-14) that -fitseq's register step fails
+        # on EVERY frame with "Numerical overflow during type conversion" /
+        # "Could not load frame N" — reproduced on plain, ordinary frames with
+        # no WCS/header irregularities, and with -debayer removed entirely.
+        # The old multi-file convert/register (no -fitseq) succeeded 10/10 on
+        # the identical input. This is a Siril 1.4.3 fitseq+register bug, not
+        # a data problem — so max_frames must stay under Siril's open-file
+        # limit (8192 on this system) rather than relying on -fitseq to scale
+        # past it.
         script = (
-            f'requires 1.2.0\n'
+            f'requires 1.4.0\n'
             f'cd "{work_win}"\n'
             f'setext fit\n'
-            f'register light_\n'
-            f'stack r_light_ rej 3 3 -norm=addscale -out=stacked\n'
+            f'convert light -debayer\n'
+            f'register light_ -2pass\n'
+            f'seqapplyreg light_\n'
+            f'stack r_light_ rej 3 3 -norm=addscale -output_norm -rgb_equal '
+            f'-weight=wfwhm -out=stacked\n'
         )
 
         script_path = os.path.join(work_dir, "stack.ssf")
@@ -792,15 +995,32 @@ def _siril_full_stack(
         logging.info(f"Siril full stack: {n} frames  work={work_dir}")
         progress_cb(20, f"Siril: registering and stacking {n} frames…")
 
-        proc = subprocess.run(
-            [SIRIL_CLI, "-s", to_win(script_path)],
-            capture_output=True, text=True, timeout=7200,
-        )
+        # Registration + stacking time scales with frame count; a flat 2h cap
+        # (fine up to ~2000 frames) starves deep pools like multi-night SN
+        # watches. A 2s/frame budget proved too tight in practice — a
+        # 7500-frame run (NGC 5907, 2026-09-14) hit the resulting 15000s
+        # (4h10m) ceiling with convert+register+seqapplyreg already complete
+        # and stack still running. Budget 6s/frame with a 2h floor, capped
+        # at 16h.
+        siril_timeout = max(7200, min(n * 6, 57600))
+        try:
+            proc = subprocess.run(
+                [SIRIL_CLI, "-s", to_win(script_path)],
+                capture_output=True, text=True, timeout=siril_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # Killing the subprocess only reaps the WSL /init interop shim —
+            # the real siril-cli.exe keeps running on the Windows side and
+            # would go on writing into work_dir while the finally block below
+            # deletes it, and would contend with the next attempt for the
+            # same scratch drive.  Reap it properly.
+            _kill_windows_siril()
+            raise
 
         if proc.returncode != 0:
             logging.warning(
                 f"Siril full stack exit {proc.returncode}\n"
-                f"stdout: {proc.stdout[-1000:]}\n"
+                f"{_siril_error_lines(proc.stdout)}"
                 f"stderr: {proc.stderr[-400:]}"
             )
             return False
@@ -873,6 +1093,15 @@ def _siril_full_stack(
             bgr = _subtract_background(bgr, mesh_scale=bg_mesh_scale)
             bgr = np.clip(bgr, 0.0, None)
 
+            # Star colour calibration (SEP aperture photometry white-balance).
+            # Siril's -rgb_equal only equalises the SKY background across
+            # channels; it does not correct per-star colour, so a genuine
+            # Bayer-response imbalance in the source frames (observed as a
+            # green/teal tint on bright stars) passes through uncorrected.
+            # Reuses the same SEP-based star white-balance as the pure-Python
+            # fallback pipeline, applied here so the Siril path gets it too.
+            bgr = _color_calibrate(bgr)
+
             # GraXpert AI denoising on the linear image (before any stretch).
             # Linear data has Gaussian noise characteristics; denoising here gives
             # the model clean signal to work with rather than nonlinearly amplified
@@ -892,7 +1121,15 @@ def _siril_full_stack(
         return True
 
     except subprocess.TimeoutExpired:
-        logging.warning("Siril full stack timed out after 2 hours")
+        logging.warning(
+            f"Siril full stack timed out after {siril_timeout}s "
+            f"({siril_timeout / 3600:.1f} h) on {n} frames — the Windows "
+            f"siril-cli.exe has been killed and the work dir will be removed. "
+            f"Raise the per-frame budget in _siril_full_stack or lower "
+            f"max_frames if this recurs."
+        )
+        progress_cb(0, f"Siril timed out after {siril_timeout / 3600:.1f} h "
+                       f"on {n} frames")
         return False
     except Exception as exc:
         logging.warning(f"Siril full stack error: {exc}")
@@ -927,6 +1164,18 @@ def _graxpert_denoise(
             _status_out.append(s)
 
     try:
+        # The CUDA runtime libs (cublas, cudnn) are installed as pip wheels
+        # under site-packages/nvidia/, which is not on the system loader path.
+        # preload_dlls() (onnxruntime ≥ 1.21) dlopens them from the wheels so
+        # the CUDAExecutionProvider can initialise; without it onnxruntime
+        # silently falls back to CPU on WSL2.
+        try:
+            import onnxruntime as _ort
+            if hasattr(_ort, "preload_dlls"):
+                _ort.preload_dlls()
+        except Exception:
+            pass
+
         import graxpert.ai_model_handling as _gxh
         from graxpert.denoising import denoise as _gx_denoise
         from graxpert.ai_model_handling import (
@@ -1099,6 +1348,15 @@ class StackProcessor:
             if cancel_cb and cancel_cb():
                 raise StackCancelled("Stacking cancelled")
 
+        # Clamp before the copy/scoring phases so an over-large request fails
+        # here instead of after ~1.5 h of work, when Siril's convert aborts.
+        if os.path.isfile(SIRIL_CLI) and max_frames > SIRIL_FRAME_LIMIT:
+            logging.warning(
+                f"max_frames={max_frames} exceeds the Siril open-file limit "
+                f"({SIRIL_MAX_OPEN_FILES}); clamping to {SIRIL_FRAME_LIMIT}"
+            )
+            max_frames = SIRIL_FRAME_LIMIT
+
         t_start = time.monotonic()
         run_stats: dict = {
             'started_utc':    datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -1159,7 +1417,7 @@ class StackProcessor:
                 for ci, src in enumerate(fits_files):
                     _chk()
                     dst = os.path.join(tmp_dir, os.path.basename(src))
-                    shutil.copy2(src, dst)
+                    _copy_file_no_sendfile(src, dst)
                     local_files.append(dst)
                     if (ci + 1) % 50 == 0 or ci + 1 == total:
                         progress_cb(1 + int(9 * (ci + 1) / total),
@@ -1262,6 +1520,27 @@ class StackProcessor:
             run_stats['worst_score']       = round(all_scores[scored[-1]] if scored else 0.0, 2)
             run_stats['floor_score']       = round(floor_score, 2)
 
+            # Persist the selected-frame list (basenames + scores) so a later
+            # Siril-stage failure can be retried without redoing Stage A/B
+            # scoring — a distinct, much cheaper cache than the full-pool
+            # copy cache above, since the selection itself is expensive to
+            # recompute but tiny to store.
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                selection_path = os.path.join(cache_dir, 'last_selection.json')
+                with open(selection_path, 'w') as f:
+                    json.dump({
+                        'max_frames':  max_frames,
+                        'min_quality': min_quality,
+                        'selected':    [
+                            {'file': os.path.basename(selected_files[j]),
+                             'score': round(all_scores[scored[j]], 2)}
+                            for j in range(n_selected)
+                        ],
+                    }, f, indent=2)
+            except OSError:
+                pass
+
             # Reference frame: highest Stage B quality score (best FWHM + stars + SNR)
             ref_rank_idx = max(range(n_selected),
                                key=lambda k: _quality_score(sel_metrics[k]))
@@ -1275,15 +1554,17 @@ class StackProcessor:
             _chk()
 
             # ════════════════════════════════════════════════════════════════
-            # SIRIL PATH — let Siril handle registration, stacking, and preview
+            # SIRIL PATH — let Siril handle demosaic, registration, stacking
             #
             # Siril is a well-tested astronomical image processor.  We hand it
             # the quality-filtered frame list and it does:
-            #   convert light → debayer CFA Bayer frames
-            #   register      → star-pattern alignment
-            #   stack rej     → sigma-clip integration with additive scaling
-            #   autostretch   → preview stretch
-            #   savejpg       → final JPEG
+            #   convert -debayer → RCD demosaic of the raw CFA frames
+            #   register -2pass  → transforms + FWHM stats, best ref frame
+            #   seqapplyreg      → apply transforms (framing=max)
+            #   stack rej        → FWHM-weighted winsorized sigma-clip with
+            #                      additive+scale norm and channel equalisation
+            # then Python crops, subtracts background, denoises, and
+            # _siril_postprocess renders the preview JPEG.
             #
             # If Siril is unavailable (SIRIL_CLI not found) or the run fails,
             # we fall through to our own Python pipeline below.
@@ -1621,7 +1902,8 @@ def rerender_preview(fits_path: str, jpeg_path: str,
                      chroma_k:      int   = _CHROMA_BLUR_K,
                      chroma_sig:    float = _CHROMA_BLUR_SIG,
                      unsharp_gain:  float = _UNSHARP_GAIN,
-                     unsharp_sig:   float = _UNSHARP_SIG) -> str:
+                     unsharp_sig:   float = _UNSHARP_SIG,
+                     saturation:    float = _SATURATION) -> str:
     """
     Regenerate the preview JPEG from an already-stacked FITS file without
     re-running frame alignment.  All post-processing parameters are tunable.
@@ -1669,6 +1951,9 @@ def rerender_preview(fits_path: str, jpeg_path: str,
         bgr = _subtract_background(bgr, mesh_scale=bg_mesh_scale)
         bgr = np.clip(bgr, 0.0, None)
 
+        progress_cb(25, "Colour calibration", 0, 0)
+        bgr = _color_calibrate(bgr)
+
         progress_cb(30, "AI denoising (GraXpert)", 0, 0)
         bgr = _graxpert_denoise(bgr, strength=1.0)
 
@@ -1677,6 +1962,7 @@ def rerender_preview(fits_path: str, jpeg_path: str,
 
         progress_cb(75, "Auto-stretch", 0, 0)
         preview = _auto_stretch(bgr, Q=stretch_q, black_pct=black_pct, white_pct=white_pct)
+        preview = _boost_saturation(preview, saturation)
 
         progress_cb(88, "Noise reduction and sharpening", 0, 0)
         preview_u8 = (preview * 255).astype(np.uint8)
@@ -1713,6 +1999,7 @@ def rerender_preview(fits_path: str, jpeg_path: str,
 
     progress_cb(80, "Auto-stretch", 0, 0)
     preview = _auto_stretch(bgr, Q=stretch_q, black_pct=black_pct)
+    preview = _boost_saturation(preview, saturation)
 
     progress_cb(90, "Noise reduction and sharpening", 0, 0)
     preview_u8 = (preview * 255).astype(np.uint8)
