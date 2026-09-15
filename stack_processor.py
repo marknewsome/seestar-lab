@@ -790,10 +790,22 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
     # stack's -rgb_equal).  Target background 0.15 instead of the 0.25
     # default — the default lifts the sky noise floor well into view
     # (Seestar's own JPEGs sit around 0.16).
+    #
+    # shadowsclip -2.00 (not the more aggressive -2.80): shadowsclip is in
+    # sigma units from the histogram peak, so a steeper (more negative)
+    # value plus a low targetbg means a steeper shadow-region stretch curve
+    # that visibly amplifies real, small residual noise. Confirmed via A/B
+    # test on a known-clean linear FITS (2026-09-15, IC 434/Horsehead,
+    # GraXpert-denoised background measured sigma~8-14): -2.80 produced
+    # sigma~28-34 in the final JPEG (visibly grainy, ~3x the target), while
+    # -2.00 produced sigma~12-13, matching a known-good manual reference
+    # ("clubtalk" export). See project-ngc5907-first-deep-pool-stack-attempt
+    # memory for the full parameter sweep (-2.80/-2.00/-1.50/-1.00/-0.50
+    # shadowsclip x 0.15/0.20/0.25/0.30 targetbg).
     script = (
         'requires 1.2.0\n'
         f'load "{fits_win}"\n'
-        'autostretch -linked -2.80 0.15\n'
+        'autostretch -linked -2.00 0.15\n'
         f'savejpg "{jpeg_win}" 95\n'
     )
 
