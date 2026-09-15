@@ -1177,12 +1177,27 @@ def _graxpert_denoise(
             pass
 
         import graxpert.ai_model_handling as _gxh
+        import graxpert.denoising as _gxd
         from graxpert.denoising import denoise as _gx_denoise
         from graxpert.ai_model_handling import (
             denoise_ai_models_dir, ai_model_path_from_version,
             download_version, latest_version, list_local_versions,
         )
         from graxpert.s3_secrets import denoise_bucket_name
+
+        # GraXpert caches the denoised tile output in a MODULE-LEVEL global
+        # (graxpert.denoising.cached_denoised_image) and only clears it via
+        # its own GUI eventbus (AppEvents.LOAD_IMAGE_REQUEST etc), which this
+        # headless pipeline never fires. Across a long-running server process
+        # that calls denoise() for multiple different images, the second and
+        # later calls reuse the FIRST image's cached tiles regardless of the
+        # new image's shape — confirmed by a live "operands could not be
+        # broadcast together with shapes (1920,1080,3) (1893,1080,3) ..."
+        # failure (2026-09-15) where a Horsehead run silently fell back to
+        # the un-denoised image because a prior NGC 5907 run's differently-
+        # shaped result was still cached. Reset it ourselves before every
+        # call so each image gets a fresh denoise pass.
+        _gxd.reset_cached_denoised_image(None)
 
         # Bypass the fork-based subprocess wrapper — run inference in-process
         # so the CUDA session (created in-process) stays on the same CUDA ctx.
