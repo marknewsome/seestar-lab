@@ -18,10 +18,11 @@ track-path composite.
 | **Image gallery** | Seestar-stacked JPEGs for non-`_sub` comet sessions are browsable via prev/next arrows on the card thumbnail and a full-screen lightbox |
 | **User ratings** | Three-state satisfaction dot on every session card and bingo card: Satisfied (green) / Want more time (amber) / Priority re-image (red). Click to cycle; persists across rescans. "Re-image" filter in the Observing Planner surfaces want-more and priority targets. |
 | **Observing notes** | Free-text textarea on each session card for conditions, issues, and goals. Saves automatically on blur or Ctrl+Enter. A truncated snippet with full-text tooltip appears on bingo cards. |
-| **Sub-frame stacking** | Hybrid pipeline stacks raw `.fit` sub-frames: sharpness + SEP quality selection in Python, per-frame pre-debayer to 3-channel RGB FITS, then Siril CLI for registration and sigma-clip stacking, followed by IQR border crop and JPEG generation. Configurable frame cap (`max_frames`); cancelable at any point. Full post-processing tuning via the **Stack Wizard** (`/stack/wizard/<session>`). |
+| **Sub-frame stacking** | Hybrid pipeline stacks raw `.fit` sub-frames: sharpness + SEP quality selection in Python, then Siril CLI for RCD demosaic, 2-pass registration, and FWHM-weighted winsorized sigma-clip stacking, followed by IQR border crop and JPEG generation. Configurable frame cap (`max_frames`); cancelable at any point. Full post-processing tuning via the **Stack Wizard** (`/stack/wizard/<session>`). |
 | **Comet wizard** | Step-by-step pipeline for `_sub` comet folders: frame selection, stretch/parameter tuning with live preview, stars-fixed animation, comet-nucleus-fixed animation, track composite, and annotated frame review |
 | **Catalog scoreboard** | Messier and Caldwell bingo-card views show which objects have been captured, with progress bar and type filters |
 | **Poster printing** | One-click 13×19" landscape poster of the full Messier or Caldwell catalog: captured objects show their thumbnail, uncaptured show a muted placeholder; designed for photo printers |
+| **Club slideshow** | Full-screen auto-advancing dark-theme slideshow of your captured Messier or Caldwell objects — designed for projector display at a star party or club meeting. Fade transitions, auto-hide controls, keyboard/click navigation, and a progress bar. Only captured objects shown. `/catalog/<type>/slideshow` |
 | **Activity heatmap** | Calendar heatmap showing daily sub counts or session counts across the full observation history |
 | **Live updates** | A Server-Sent Events stream pushes progress to the browser in real time — no polling, no page reloads |
 | **Solar Timelapse wizard** | 3-step wizard: scan a directory of Seestar solar MP4 clips, tune parameters (sampling, stretch, stabilisation, quality filtering), render a disk-normalised VFR timelapse with title card and portrait. Pass 1 disk-detection results are cached so re-renders are fast. Normalised frames are streamed to disk one at a time — memory usage is O(1) regardless of session length. |
@@ -31,6 +32,7 @@ track-path composite.
 | **Transit Planner** | Predicts when tracked satellites (ISS, Hubble, Tiangong, and ~169 other bright objects) will transit the solar or lunar disk. 3-pass algorithm: coarse 1-min grid → 1 s medium scan → 0.05 s ultra-fine contact times. Reports duration, chord % of disk, centerline offset in km, and body altitude/az. Solar transits flagged with filter reminder. TLEs fetched from Celestrak, cached 12 h. |
 | **Result persistence** | Completed solar and lunar timelapse results are saved in browser localStorage (keyed by directory, 30-day TTL). Returning to a previously-rendered directory shows the results without re-rendering. A "Forget" button clears the saved state; "Re-render" re-runs Pass 2+3 using the cached disk-detection data. |
 | **Stack queue** | `/stack/jobs` shows all stacking jobs: active (running job with live progress bar + queued jobs with pulsing indicator) and history (completed/failed jobs with frame counts, wall-clock duration, and links to the result image and run log). Live-updated via SSE. |
+| **Frame quality report** | `/stack/quality/<session>` runs a read-only scoring pass (sharpness + SEP FWHM/eccentricity/star-count/SNR) over every frame in a session — no copy, no stack. Shows a score-distribution histogram with a draggable `max_frames` cutoff line and a sortable per-frame table, so you can see where quality drops off before picking `max_frames`/`min_quality` rather than discovering it after a bad stack. Linked from the Stack Wizard. |
 
 ---
 
@@ -79,7 +81,7 @@ on startup, then idles until the user requests a rescan or transit detection.
 app.py               Flask routes, SSE broadcaster, stack job queue, comet job queue
 scanner.py           Filesystem crawler; builds and diffs session records
 db.py                SQLite persistence (sessions, scanned dirs, stack jobs, meteor impacts)
-stack_processor.py   Sub-frame stacking pipeline (quality selection, pre-debayer, Siril registration+stack, IQR crop)
+stack_processor.py   Sub-frame stacking pipeline (quality selection, Siril RCD demosaic+register+weighted stack, IQR crop)
 comet_processor.py   Comet animation pipeline (star alignment, nucleus detection, animations, track composite)
 catalogs.py          Messier / Caldwell catalog data and DSO type/group mappings
 object_catalog.py    Object-type detection (solar/lunar/planet/comet/messier/…) and descriptions
@@ -155,27 +157,29 @@ stacked JPEG is saved and displayed as the session thumbnail.
 
 ### Pipeline stages
 
-The pipeline is split between Python (quality selection and pre-debayering) and the
-[Siril](https://siril.org/) CLI (registration and stacking).  Siril must be installed on
-Windows and reachable at `C:\Program Files\Siril\bin\siril-cli.exe` from WSL2.
+The pipeline is split between Python (quality selection) and the
+[Siril](https://siril.org/) CLI (demosaic, registration, and stacking — requires
+Siril ≥ 1.4).  Siril must be installed on Windows and reachable at
+`C:\Program Files\Siril\bin\siril-cli.exe` from WSL2.
 
 | # | Stage | Who | Details |
 |---|---|---|---|
 | 1 | **Sharpness scan** | Python | Each FITS file is read as raw Bayer uint16. Laplacian-variance sharpness is scored on the centre quarter. |
 | 2 | **SEP quality metrics** | Python | Source Extractor Python (SEP) measures FWHM, eccentricity, and SNR per frame. Combined score = `(stars × SNR) / FWHM`. |
 | 3 | **Frame selection** | Python | Frames below 40 % of median sharpness are rejected (Stage A). Survivors ranked by combined score; those below `best_score × min_quality` are rejected (Stage B quality floor); remainder capped at `max_frames`. |
-| 4 | **Pre-debayer** | Python | Each selected frame is debayered to BGR, converted to float32, transposed to 3-channel (R,G,B) FITS, and written to `C:\Temp\seestar_siril_{ts}\light_NNNNN.fit`. Siril receives proper colour images — no Bayer-grid registration artifacts. |
-| 5 | **Convert + Register** | Siril | `convert light -out=pp_light` collects all `light*.fit` files into a Siril sequence. `register light_` computes inter-frame transforms using star-pattern matching. |
-| 6 | **Sigma-clip stack** | Siril | `stack r_light_ rej 3 3 -norm=addscale -out=stacked` integrates frames with additive-scale normalisation and 3σ rejection, suppressing hot pixels, cosmic rays, and satellite trails. |
-| 7 | **IQR border crop** | Python | Per-row inter-quartile range of the green channel identifies partial-coverage border rows left by registration. Rows with IQR > 1.5 × median IQR of the image centre are trimmed from top and bottom; leftmost/rightmost fully-covered columns are found by luminance mask. |
-| 8 | **Background subtraction** | Python | SEP sigma-clipped 2D mesh background subtraction applied per channel. `bg_mesh_scale` controls mesh coarseness: higher = fewer, larger cells (better for large galaxies like M101 where fine cells over-subtract galaxy signal); 0 = skip entirely. |
-| 9 | **AI denoising** | GraXpert | GraXpert ONNX model denoises the linear float32 stack before any stretch is applied. Linear data has Gaussian noise characteristics; denoising here gives the model cleaner signal than nonlinearly stretched output would. GPU-accelerated via CUDA when available. Whether GraXpert ran (or fell back) is recorded in the run log. |
-| 10 | **Save FITS** | Python | Denoised linear float32 colour FITS written alongside the output directory for later re-rendering without a full restack. |
-| 11 | **JPEG preview** | Python | Per-channel asinh stretch (Q=8, black_pct=40, white_pct=99.9), YCrCb chroma + luma Gaussian denoise, unsharp mask; JPEG quality 95. Output is vertically flipped to match Seestar app orientation. All params tunable in the Stack Wizard. |
+| 4 | **CFA copy** | Python | Selected frames are copied byte-for-byte (raw Bayer mosaic, `BAYERPAT` header intact) to `C:\Temp\seestar_siril_{ts}\raw_NNNNN.fit`. No Python-side debayer. |
+| 5 | **RCD demosaic** | Siril | `convert light -debayer` demosaics every frame with Siril's RCD algorithm — measurably sharper stars (~12 % better FWHM) and less correlated chroma speckle than the bilinear debayer the pipeline previously used. |
+| 6 | **2-pass register** | Siril | `register light_ -2pass` computes transforms and per-frame FWHM statistics without writing frames, automatically choosing the best-quality frame as reference; `seqapplyreg light_` applies the transforms in the reference frame's footprint (alt-az multi-night sessions carry large field rotation, so a union canvas would be mostly empty border). |
+| 7 | **Weighted sigma-clip stack** | Siril | `stack r_light_ rej 3 3 -norm=addscale -output_norm -rgb_equal -weight=wfwhm -out=stacked` — winsorized 3σ rejection suppresses hot pixels, cosmic rays, and satellite trails; frames are weighted by registration FWHM so poorer-seeing subs contribute less; channel backgrounds are equalised and the output is rescaled to [0,1]. |
+| 8 | **IQR border crop** | Python | Per-row inter-quartile range of the green channel identifies partial-coverage border rows left by registration. Rows with IQR > 1.5 × median IQR of the image centre are trimmed from top and bottom; leftmost/rightmost fully-covered columns are found by luminance mask. |
+| 9 | **Background subtraction** | Python | SEP sigma-clipped 2D mesh background subtraction applied per channel. `bg_mesh_scale` controls mesh coarseness: higher = fewer, larger cells (better for large galaxies like M101 where fine cells over-subtract galaxy signal); 0 = skip entirely. |
+| 10 | **AI denoising** | GraXpert | GraXpert ONNX model denoises the linear float32 stack before any stretch is applied. Linear data has Gaussian noise characteristics; denoising here gives the model cleaner signal than nonlinearly stretched output would. GPU-accelerated via CUDA when available. Whether GraXpert ran (or fell back) is recorded in the run log. |
+| 11 | **Save FITS** | Python | Denoised linear float32 colour FITS written alongside the output directory for later re-rendering without a full restack. |
+| 12 | **JPEG preview** | Siril/Python | Siril `autostretch -linked -2.80 0.15` — linked channels (no colour shift) with target background 0.15 rather than the 0.25 default, which lifted the sky noise floor well into view. Falls back to the Python asinh stretch chain if Siril is unavailable. All stretch params remain tunable in the Stack Wizard. |
 
 Output is registered as the session thumbnail immediately — visible without a rescan.
 
-Work files (~24 MB × 500 frames ≈ 12 GB) are written to `C:\Temp` and cleaned up on
+Work files (~42 MB × 500 frames ≈ 21 GB) are written to `C:\Temp` and cleaned up on
 completion, error, or cancel.
 
 ### max_frames and min_quality
@@ -190,13 +194,26 @@ For example, `min_quality=0.4` keeps only frames that score at least 40 % of the
 frame's score, discarding cloud-degraded or poor-seeing subs even if `max_frames` has not
 been reached.  The number of floor-rejected frames appears in the run log.
 
+`max_frames` and `min_quality` work together, not independently — pushing `max_frames`
+high is only safe when the source pool actually has that many frames clearing a real
+quality floor.  Without a floor, a shallow pool can be padded with poor-quality frames
+just to hit the requested count, which shows up as a sudden quality cliff (washed-out
+signal, noise, alignment artifacts) rather than a graceful falloff.  Check the actual
+score distribution first with the **Frame Quality Report** (`/stack/quality/<session>`,
+linked from the Stack Wizard) before setting either parameter well above the validated
+500–1000 range — it shows a histogram of every frame's quality score with a draggable
+`max_frames` cutoff line, plus a sortable per-frame table (score, FWHM, eccentricity,
+star count, SNR).  Read-only scan; safe to run alongside an active stack job.
+
 ### Memory usage
 
-The main in-process cost is the pre-debayer loop (one frame at a time — O(1) RAM).  Siril
-handles the registration and integration natively, so WSL2 peak RAM is modest compared to
-the old Python pipeline.  Disk space for work files is the main constraint: allow ~25 MB per
-frame (≈ 12 GB for 500 frames).  If WSL2 memory pressure is observed elsewhere, set a
-limit in `%USERPROFILE%\.wslconfig`:
+Python only copies frames and post-processes the single stacked image — O(1) RAM.  Siril
+handles the demosaic, registration, and integration natively, so WSL2 peak RAM is modest
+compared to the old Python pipeline.  Disk space for work files is the main constraint:
+allow ~42 MB per frame (raw CFA copy + Siril's debayered and registered copies; ≈ 21 GB
+for 500 frames).  The pre-flight check fails fast with a clear message if `C:` lacks
+space.  If WSL2 memory pressure is observed elsewhere, set a limit in
+`%USERPROFILE%\.wslconfig`:
 
 ```ini
 [wsl2]
@@ -237,6 +254,7 @@ current preview image with a before/after comparison slider.
 | `luma_k` / `luma_sig` | 9 / 2.0 | Luma Gaussian denoise kernel and sigma |
 | `chroma_k` / `chroma_sig` | 31 / 10 | Chroma Gaussian denoise kernel and sigma |
 | `unsharp_gain` / `unsharp_sig` | 1.35 / 1.5 | Unsharp mask strength and blur radius |
+| `saturation` | 1.0 | Colour saturation multiplier, applied in HSV after the stretch; 1.2–1.5 = typical boost |
 
 ### Re-stack and Re-render
 
@@ -265,9 +283,18 @@ Step 1, allowing you to jump straight to the existing outputs.
 
 - Paste a directory path (or arrive via the session card deep-link `?dir=`)
 - **Find comets** button discovers all comet directories under `SEESTAR_DATA_DIR` automatically
+- **Multi-night combine** — tick the checkboxes next to several discovered directories and click
+  **Scan N combined →** to merge frames from multiple directories into one render (or paste paths
+  separated by `;` into the directory field).  Frames are sorted by observation time across all
+  directories; the first directory is the primary, where the alignment cache and outputs are written
 - Scan reads FITS headers; each frame is shown as a thumbnail card with its date, exposure, and sub-count
+- **Frame-quality histogram** — after the scan, every frame is scored for sharpness (Laplacian
+  variance of the stretched luminance, cached so rescans are instant).  A histogram shows the score
+  distribution, each card gets a colour-coded `Q` badge (relative to the sharpest frame), and a
+  **Reject below** threshold slider previews how many frames would be dropped before you **Apply** —
+  a fast way to cull cloudy or trailed frames without inspecting each thumbnail
 - Click cards to toggle rejection; shift-click for range selection; session-night grouping buttons allow bulk accept/reject
-- Tune stretch parameters (sky percentile, white-point, gamma, noise reduction) with a **live preview** rendered from the highest-nsubs frame — the preview updates as you move the sliders
+- Tune stretch parameters (sky percentile, white-point, gamma, noise reduction) with a **live preview** rendered from the highest-nsubs frame — the preview updates as you move the sliders. The stretch also equalises per-channel means after sky subtraction (neutral-gray white balance) — sky background colour cast drifts session to session (moonlight, airmass, twilight at the edges of a run), and offset-only sky subtraction leaves a visible residual tint that this catches. Noise reduction uses non-local-means (not bilateral): a bilateral filter's effective strength drops off sharply on a full-resolution busy star field relative to what the same parameters achieve on a small crop, so it needs a stronger setting than intuition from a preview crop would suggest to have any visible effect at full frame size — verify at actual output resolution, not on a zoomed-in region
 - **Force re-align** checkbox: ignores the `comet_alignment.json` cache and recomputes star alignment and nucleus detection from scratch.  Use this after correcting a nucleus misdetection so the new hint takes effect even if a cache already exists for star transforms.
 
 **Step 2 — Parameters & render**
@@ -397,12 +424,24 @@ how different the star backgrounds are between nights.
 | No user correction, subsequent frames | Previous frame's detected position *(rolling hint)* | Tracks slight intra-session drift; keeps the search from wandering to a star that happens to be brighter in that frame |
 | User correction provided, any frame | Fixed offset from raw-frame centre, applied identically to every frame | Applied independently per frame — bad detections cannot cascade |
 
-**Rolling hint (no user correction):** After each successful detection the detected raw-frame
-position is used as the search centre for the next frame.  This handles cases where the
-comet has drifted slightly from the frame centre within a long session.  The risk — that a
-single bad detection contaminates all subsequent frames — is accepted as a trade-off because
-the Seestar's comet tracking is generally reliable enough to keep the nucleus within the
-large search radius.
+**Rolling hint (no user correction):** After each *confident* detection the detected
+raw-frame position is used as the search centre for the next frame.  This handles cases
+where the comet has drifted slightly from the frame centre within a long session.
+
+A confidence gate protects against the failure mode this trade-off used to accept
+unconditionally: the diffuseness score for each detection is compared against a running
+median of the last 20 confident scores, and only detections at least
+`NUCLEUS_CONFIDENCE_MIN_RATIO` (default 0.5) of that baseline are allowed to become the next
+frame's search seed. A detection that fails the gate still contributes its (uncertain)
+position to the output list — `_smooth_nucleus_positions`'s Gaussian smoothing and
+gap-interpolation clean up isolated bad points — but the *next* frame's search still starts
+from the last trusted location rather than the glitch. Without this gate a single frame where
+the diffuseness score peaks on a star instead of the coma would seed the next frame's search
+there too, and the tracker could drift off the comet for a run of frames before recovering by
+chance — visible in the nucleus-fixed animation as the comet "jiggling" to a wrong position
+and snapping back. This was reproduced and fixed against a synthetic test sequence with a
+deliberately injected off-comet detection (see `comet_processor.py`'s module docstring,
+"Rolling-hint confidence gate").
 
 **Per-frame user hint (correction mode):** The user clicks a position in the *aligned*
 annotated-frame viewer.  The correction is expressed as a **fixed offset from raw-frame
@@ -487,9 +526,21 @@ where you want a persistent recording alongside the live view.
 - **Live view** — Flask proxies the RTSP stream through `ffmpeg`, re-encoding as MJPEG and
   serving it as `multipart/x-mixed-replace` to a plain `<img>` tag.  No JavaScript library
   is required.  Latency is ~1–3 seconds.
-- **Recording** — a separate `ffmpeg -c copy` process writes the stream directly to an MP4
-  file in `SEESTAR_DATA_DIR/captures/`, preserving the original H.264 stream without
-  re-encoding.  Recording and viewing run independently.
+- **Recording** — a separate `ffmpeg -c copy` process writes the stream to **MPEG-TS**
+  (`.ts`) in `SEESTAR_DATA_DIR/captures/`, preserving the original H.264 stream without
+  re-encoding.  TS is valid at every byte, so a server crash, WSL shutdown, or killed
+  ffmpeg never corrupts a capture.  On stop the file is remuxed to `.mp4` (stream copy,
+  instant); if the remux ever fails the playable `.ts` is kept.  Recording and viewing
+  run independently.
+- **Crash safety** — active recordings are tracked in the SQLite DB.  On server restart,
+  recordings whose ffmpeg survived are **re-adopted** (still stoppable from the UI);
+  ones that died are finalised into playable MP4s automatically.  Reloading the browser
+  rebinds the page to any recordings still running server-side.
+- **Stall detection** — all ffmpeg invocations use a 15 s network read timeout, so a
+  dropped RTSP stream (Seestar sleeping, Wi-Fi blip) ends the recording cleanly instead
+  of hanging forever; the UI surfaces "Recording ended — stream lost" with the saved
+  file rather than ticking a frozen clock.  A 5 GB free-space check runs before each
+  recording starts.
 - **Persistence** — stream configurations (name + URL) are saved in browser localStorage.
   Configured streams reappear on the next visit.
 
@@ -535,6 +586,7 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 | `GET` | `/catalog/caldwell` | Caldwell bingo-card page |
 | `GET` | `/catalog/messier/poster` | Messier 13×19" print poster |
 | `GET` | `/catalog/caldwell/poster` | Caldwell 13×19" print poster |
+| `GET` | `/catalog/<type>/slideshow` | Full-screen captured-objects slideshow (`messier` or `caldwell`) |
 | `GET` | `/activity` | Activity heatmap page |
 | `GET` | `/comet` | Comet wizard page |
 | `GET` | `/impacts` | Lunar impact events page |
@@ -581,7 +633,7 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 |---|---|---|
 | `POST` | `/api/stack/start` | Queue stacking — body: `{"session_name": str, "force": bool, "max_frames": int, "bg_mesh_scale": int, "min_quality": float, "skip_copy": bool}` |
 | `POST` | `/api/stack/cancel` | Cancel active job — body: `{"session_name": str}` |
-| `POST` | `/api/stack/rerender/<session_name>` | Re-render from saved linear FITS — body: `{bg_mesh_scale, stretch_q, black_pct, white_pct, luma_k, luma_sig, chroma_k, chroma_sig, unsharp_gain, unsharp_sig}` |
+| `POST` | `/api/stack/rerender/<session_name>` | Re-render from saved linear FITS — body: `{bg_mesh_scale, stretch_q, black_pct, white_pct, luma_k, luma_sig, chroma_k, chroma_sig, unsharp_gain, unsharp_sig, saturation}` |
 | `GET` | `/api/stack/status` | JSON: all stack job statuses keyed by session name |
 | `GET` | `/api/stack/image/<session_name>` | Serve full-size stacked JPEG |
 | `GET` | `/api/stack/image/previous/<session_name>` | Serve the JPEG from immediately before the last re-render (for before/after compare) |
@@ -593,7 +645,8 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/comet/scan` | Scan a directory for FITS files — body: `{"directory": str}`; returns file list with headers |
+| `POST` | `/api/comet/scan` | Scan directories for FITS files — body: `{"directories": [str, ...]}` (or legacy `{"directory": str}`); returns merged file list sorted by DATE-OBS. With multiple directories, the first is the primary — alignment cache and render outputs live there |
+| `POST` | `/api/comet/quality` | Sharpness scores for a batch of subs — body: `{"paths": [str, ...]}` (max 50/request); returns `{"scores": {path: float\|null}}`. Laplacian variance of percentile-stretched luminance, cached by path + mtime; drives the Step 1 quality histogram |
 | `POST` | `/api/comet/preview-frame` | Render a single FITS frame with custom stretch params — body: `{path, sky_pct, high_pct, gamma, noise, width}`; returns JPEG |
 | `POST` | `/api/comet/render` | Launch processing job — body: `{directory, files[], fps, gamma, sky_pct, high_pct, noise, crop, max_frames, no_cache}`; returns `job_id` |
 | `GET` | `/api/comet/status?job_id=<id>` | JSON: job status, progress pct, log lines |
@@ -604,6 +657,8 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 | `GET` | `/api/comet/frames?dir=<path>` | JSON: list of annotated frame JPEGs in `{dir}/_frames/` |
 | `GET` | `/api/comet/info?name=<name>` | JSON: JPL SBDB designation and orbit class for a comet name |
 | `GET` | `/api/comet/discover` | JSON: all comet session directories found under `SEESTAR_DATA_DIR` |
+| `GET` | `/api/comet/rejections?dir=<path>` | JSON: current per-frame rejection flags for the directory |
+| `POST` | `/api/comet/set_rejections` | Persist frame rejections — body: `{"directory": str, "rejections": {filename: bool}}` |
 
 ### Solar Timelapse
 
@@ -629,9 +684,9 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/capture/mjpeg?url=<rtsp_url>` | MJPEG proxy — streams `multipart/x-mixed-replace` from ffmpeg decoding the RTSP source |
-| `POST` | `/api/capture/record/start` | Start recording — body: `{"rtsp_url": str, "name": str}`; returns `{rec_id, out_path}` |
-| `POST` | `/api/capture/record/stop` | Stop recording — body: `{"rec_id": str}`; returns `{out_path, size_bytes}` |
-| `GET` | `/api/capture/record/status` | JSON: list of active recordings with `{id, name, elapsed_s, size_bytes, out_path}` |
+| `POST` | `/api/capture/record/start` | Start recording to `.ts` — body: `{"rtsp_url": str, "name": str}`; returns `{rec_id, out_path}`; 507 if < 5 GB free |
+| `POST` | `/api/capture/record/stop` | Stop + remux to `.mp4` — body: `{"rec_id": str}`; returns `{id, name, status, out_path, size_bytes, error}` |
+| `GET` | `/api/capture/record/status` | JSON: `{"active": [{id, name, elapsed_s, size_bytes, out_path}], "ended": [...]}` — recordings that died (stream lost) are finalised and reported once under `ended` |
 
 ### Activity
 
@@ -656,14 +711,16 @@ clip path, thumbnail, centroid, peak brightness, and frame timestamps.
 ## Testing
 
 Unit tests cover the pure functions in `stack_processor.py` (quality scoring, frame
-selection, background subtraction, stretch, SCNR, crop, etc.) using synthetic numpy arrays —
-no FITS files or external tools required.
+selection, background subtraction, stretch, SCNR, crop, etc.) and `comet_processor.py`
+(nucleus detection, rolling-hint confidence gating, per-frame white balance, noise
+reduction) using synthetic numpy arrays — no FITS files or external tools required.
 
 ```bash
 ./run_tests.sh          # activates venv and runs pytest -v
 ```
 
-41 tests run in under 0.1 s.  See `tests/test_stack_processor.py`.
+49 tests run in about 1 s.  See `tests/test_stack_processor.py` and
+`tests/test_comet_processor.py`.
 
 ---
 

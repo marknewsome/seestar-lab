@@ -158,6 +158,22 @@ def init_db() -> None:
             "  max_frames      INTEGER DEFAULT 500"
             ");"
         )
+        # capture_recordings table — live RTSP recordings survive restarts
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS capture_recordings ("
+            "  rec_id      TEXT PRIMARY KEY,"
+            "  name        TEXT NOT NULL,"
+            "  rtsp_url    TEXT NOT NULL,"
+            "  ts_path     TEXT NOT NULL,"
+            "  mp4_path    TEXT,"
+            "  pid         INTEGER,"
+            "  status      TEXT NOT NULL DEFAULT 'recording',"
+            "  error_msg   TEXT,"
+            "  size_bytes  INTEGER DEFAULT 0,"
+            "  started_at  TEXT NOT NULL,"
+            "  finished_at TEXT"
+            ");"
+        )
         # Migrations for columns added after initial schema
         for migration in [
             "ALTER TABLE stack_jobs ADD COLUMN max_frames INTEGER DEFAULT 500",
@@ -167,6 +183,46 @@ def init_db() -> None:
                 conn.execute(migration)
             except Exception:
                 pass  # column already exists
+
+
+# ── Capture recordings ────────────────────────────────────────────────────────
+
+def add_capture_recording(rec_id: str, name: str, rtsp_url: str,
+                          ts_path: str, pid: int) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO capture_recordings"
+            " (rec_id, name, rtsp_url, ts_path, pid, status, started_at)"
+            " VALUES (?,?,?,?,?,'recording',datetime('now'))",
+            (rec_id, name, rtsp_url, ts_path, pid),
+        )
+
+
+def finish_capture_recording(rec_id: str, status: str,
+                             mp4_path: Optional[str] = None,
+                             size_bytes: int = 0,
+                             error_msg: Optional[str] = None) -> None:
+    """status: 'done' (clean stop) or 'died' (process ended on its own)."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE capture_recordings SET status=?, mp4_path=?, size_bytes=?,"
+            " error_msg=?, finished_at=datetime('now') WHERE rec_id=?",
+            (status, mp4_path, size_bytes, error_msg, rec_id),
+        )
+
+
+def get_capture_recordings(status: Optional[str] = None,
+                           limit: int = 20) -> list:
+    with _db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM capture_recordings WHERE status=?"
+                " ORDER BY started_at DESC LIMIT ?", (status, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM capture_recordings"
+                " ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────

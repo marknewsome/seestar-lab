@@ -148,6 +148,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import signal
 import time
 import urllib.parse
 from datetime import datetime
@@ -778,7 +779,7 @@ def stack_wizard(session_name: str):
         _STRETCH_Q, _STRETCH_BLACK_PCT, _STRETCH_WHITE_PCT,
         _LUMA_BLUR_K, _LUMA_BLUR_SIG,
         _CHROMA_BLUR_K, _CHROMA_BLUR_SIG,
-        _UNSHARP_GAIN, _UNSHARP_SIG,
+        _UNSHARP_GAIN, _UNSHARP_SIG, _SATURATION,
     )
     job = db.get_stack_job(session_name)
     from pathlib import Path
@@ -798,6 +799,7 @@ def stack_wizard(session_name: str):
         chroma_sig=_CHROMA_BLUR_SIG,
         unsharp_gain=_UNSHARP_GAIN,
         unsharp_sig=_UNSHARP_SIG,
+        saturation=_SATURATION,
     )
     if job:
         defaults["bg_mesh_scale"] = job.get("bg_mesh_scale") or 20
@@ -873,7 +875,7 @@ def api_stack_rerender(session_name: str):
         _STRETCH_Q, _STRETCH_BLACK_PCT, _STRETCH_WHITE_PCT,
         _LUMA_BLUR_K, _LUMA_BLUR_SIG,
         _CHROMA_BLUR_K, _CHROMA_BLUR_SIG,
-        _UNSHARP_GAIN, _UNSHARP_SIG,
+        _UNSHARP_GAIN, _UNSHARP_SIG, _SATURATION,
     )
     body = request.get_json(silent=True) or {}
     bg_mesh_scale = int(body.get("bg_mesh_scale",  20))
@@ -886,6 +888,7 @@ def api_stack_rerender(session_name: str):
     chroma_sig    = float(body.get("chroma_sig",   _CHROMA_BLUR_SIG))
     unsharp_gain  = float(body.get("unsharp_gain", _UNSHARP_GAIN))
     unsharp_sig   = float(body.get("unsharp_sig",  _UNSHARP_SIG))
+    saturation    = max(0.0, min(3.0, float(body.get("saturation", _SATURATION))))
 
     frames_total    = job.get("frames_total", 0) or 0
     frames_accepted = job.get("frames_accepted", 0) or 0
@@ -918,7 +921,8 @@ def api_stack_rerender(session_name: str):
                              chroma_k=chroma_k,
                              chroma_sig=chroma_sig,
                              unsharp_gain=unsharp_gain,
-                             unsharp_sig=unsharp_sig)
+                             unsharp_sig=unsharp_sig,
+                             saturation=saturation)
             db.finish_stack_job(session_name, output_path,
                                 frames_accepted, frames_total)
             _broadcast({"type": "stack_done", "session_name": session_name,
@@ -1077,8 +1081,9 @@ The image went through this pipeline:
   3. GraXpert AI denoising on linear data
   4. SCNR green suppression
   5. Asinh stretch with black-point and white-point percentiles
-  6. YCrCb luma and chroma Gaussian denoising
-  7. Unsharp mask for sharpening
+  6. HSV saturation boost (after stretch)
+  7. YCrCb luma and chroma Gaussian denoising
+  8. Unsharp mask for sharpening
 
 PARAMETERS (all numeric):
   bg_mesh_scale : 0=skip subtraction; 8=coarse (large galaxies like M31/M101);
@@ -1095,12 +1100,16 @@ PARAMETERS (all numeric):
   unsharp_sig   : Sharpening radius 0.5–3. Default 1.5.
   chroma_k      : Colour-noise kernel (odd, 1–51). Higher=smoother colours, stars lose hue.
   chroma_sig    : Colour-noise sigma 1–20. Higher=stronger. Default 10.
+  saturation    : Colour saturation multiplier 0–3. 1.0=unchanged, 1.2–1.5=typical
+                  boost, <1 mutes colour. Default 1.0.
 
 COMMON PROBLEMS AND FIXES:
   Core/nucleus pure white (blown out) → raise white_pct toward 99.99
   Core/nucleus too dim               → lower white_pct toward 99.0–99.5
   Q seems to have no effect on core  → white_pct is the real lever for core brightness
   Color speckles / RGB noise         → raise chroma_k or chroma_sig
+  Colours look washed out / grey     → raise saturation toward 1.3–1.5
+  Garish over-saturated colour       → lower saturation toward 1.0
   Background too bright / grey sky   → raise black_pct; lower stretch_q
   Stars look blurry / soft           → lower luma_k and luma_sig; raise unsharp_gain
   Halos or ringing around stars      → lower unsharp_gain or unsharp_sig
@@ -1128,12 +1137,190 @@ Return ONLY a single valid JSON object — no markdown, no code fences, no comme
     "unsharp_gain":  <number or null>,
     "unsharp_sig":   <number or null>,
     "chroma_k":      <number or null>,
-    "chroma_sig":    <number or null>
+    "chroma_sig":    <number or null>,
+    "saturation":    <number or null>
   },
   "reasoning": "one sentence per changed parameter explaining why"
 }
 Set any parameter to null if it looks good and needs no change.\
 """
+
+
+_quality_jobs: dict[str, dict] = {}
+_quality_jobs_lock = threading.Lock()
+
+
+def _run_quality_scan(session_name: str, fits_files: list[str]) -> None:
+    from stack_processor import score_session_frames, StackCancelled
+
+    with _quality_jobs_lock:
+        job = _quality_jobs[session_name]
+        cancel_flag = job["cancel_flag"]
+
+    def progress_cb(pct: int, stage: str) -> None:
+        with _quality_jobs_lock:
+            _quality_jobs[session_name].update(pct=pct, stage=stage)
+
+    try:
+        frames = score_session_frames(fits_files, progress_cb=progress_cb,
+                                       cancel_cb=cancel_flag.is_set)
+        with _quality_jobs_lock:
+            _quality_jobs[session_name].update(
+                status="done", pct=100, stage="Done", frames=frames,
+            )
+    except StackCancelled:
+        with _quality_jobs_lock:
+            _quality_jobs[session_name].update(status="cancelled", stage="Cancelled")
+    except Exception as exc:
+        with _quality_jobs_lock:
+            _quality_jobs[session_name].update(status="error", stage=str(exc))
+
+
+@app.route("/api/stack/quality/<path:session_name>", methods=["POST"])
+def api_stack_quality_start(session_name: str):
+    """Kick off a read-only quality scan (Stage A + Stage B) over every FITS
+    file in a session, without stacking or copying anything.  Safe to run
+    alongside an active stack job on the same or a different session."""
+    from pathlib import Path as _Path
+
+    with _quality_jobs_lock:
+        existing = _quality_jobs.get(session_name)
+        if existing and existing["status"] == "running":
+            return jsonify({"status": "already_running"}), 409
+
+    sessions_list = db.get_all_sessions()
+    session = next((s for s in sessions_list if s["object_name"] == session_name), None)
+    if not session:
+        return jsonify({"error": "session not found"}), 404
+
+    FITS_EXT = {".fit", ".fits", ".fts"}
+    fits_files: list[str] = []
+    for dir_path in session.get("paths", []):
+        try:
+            for fname in sorted(os.listdir(dir_path)):
+                if not fname.startswith(".") and _Path(fname).suffix.lower() in FITS_EXT:
+                    fits_files.append(os.path.join(dir_path, fname))
+        except OSError:
+            pass
+
+    if not fits_files:
+        return jsonify({"error": "no FITS files found in session"}), 400
+
+    cancel_flag = threading.Event()
+    with _quality_jobs_lock:
+        _quality_jobs[session_name] = {
+            "status": "running", "pct": 0, "stage": "Starting…",
+            "frames": None, "total": len(fits_files), "cancel_flag": cancel_flag,
+        }
+
+    threading.Thread(target=_run_quality_scan, args=(session_name, fits_files),
+                      daemon=True, name=f"quality-{session_name}").start()
+    return jsonify({"status": "started", "total": len(fits_files)})
+
+
+@app.route("/api/stack/quality/<path:session_name>")
+def api_stack_quality_status(session_name: str):
+    with _quality_jobs_lock:
+        job = _quality_jobs.get(session_name)
+        if not job:
+            return jsonify({"status": "none"}), 404
+        return jsonify({
+            "status": job["status"], "pct": job["pct"], "stage": job["stage"],
+            "total": job["total"], "frames": job["frames"],
+        })
+
+
+@app.route("/api/stack/quality/<path:session_name>/cancel", methods=["POST"])
+def api_stack_quality_cancel(session_name: str):
+    with _quality_jobs_lock:
+        job = _quality_jobs.get(session_name)
+        if job and job["status"] == "running":
+            job["cancel_flag"].set()
+    return jsonify({"status": "cancelling"})
+
+
+@app.route("/stack/quality/<path:session_name>")
+def stack_quality_page(session_name: str):
+    """Per-frame quality report page: histogram + sortable table."""
+    return render_template("stack_quality.html", session_name=session_name)
+
+
+_temp_jobs: dict[str, dict] = {}
+_temp_jobs_lock = threading.Lock()
+
+
+def _run_temp_survey(session_name: str, fits_files: list[str]) -> None:
+    from stack_processor import survey_session_temps
+
+    def progress_cb(pct: int, stage: str) -> None:
+        with _temp_jobs_lock:
+            _temp_jobs[session_name].update(pct=pct, stage=stage)
+
+    try:
+        result = survey_session_temps(fits_files, progress_cb=progress_cb)
+        with _temp_jobs_lock:
+            _temp_jobs[session_name].update(
+                status="done", pct=100, stage="Done", result=result,
+            )
+    except Exception as exc:
+        with _temp_jobs_lock:
+            _temp_jobs[session_name].update(status="error", stage=str(exc))
+
+
+@app.route("/api/stack/temp/<path:session_name>", methods=["POST"])
+def api_stack_temp_start(session_name: str):
+    """
+    Kick off a per-night sensor-temperature survey for a session: samples
+    CCD-TEMP (header-only reads, no pixel data) grouped by capture date, so
+    a multi-night session shows which nights ran warm vs cool rather than
+    one averaged figure. The Seestar has no active sensor cooling, so this
+    directly predicts stacked-image noise floor — see STACKING_RECIPE.md.
+    """
+    from pathlib import Path as _Path
+
+    with _temp_jobs_lock:
+        existing = _temp_jobs.get(session_name)
+        if existing and existing["status"] == "running":
+            return jsonify({"status": "already_running"}), 409
+
+    sessions_list = db.get_all_sessions()
+    session = next((s for s in sessions_list if s["object_name"] == session_name), None)
+    if not session:
+        return jsonify({"error": "session not found"}), 404
+
+    FITS_EXT = {".fit", ".fits", ".fts"}
+    fits_files: list[str] = []
+    for dir_path in session.get("paths", []):
+        try:
+            for fname in sorted(os.listdir(dir_path)):
+                if not fname.startswith(".") and _Path(fname).suffix.lower() in FITS_EXT:
+                    fits_files.append(os.path.join(dir_path, fname))
+        except OSError:
+            pass
+
+    if not fits_files:
+        return jsonify({"error": "no FITS files found in session"}), 400
+
+    with _temp_jobs_lock:
+        _temp_jobs[session_name] = {
+            "status": "running", "pct": 0, "stage": "Starting…", "result": None,
+        }
+
+    threading.Thread(target=_run_temp_survey, args=(session_name, fits_files),
+                      daemon=True, name=f"temp-{session_name}").start()
+    return jsonify({"status": "started", "total": len(fits_files)})
+
+
+@app.route("/api/stack/temp/<path:session_name>")
+def api_stack_temp_status(session_name: str):
+    with _temp_jobs_lock:
+        job = _temp_jobs.get(session_name)
+        if not job:
+            return jsonify({"status": "none"}), 404
+        return jsonify({
+            "status": job["status"], "pct": job["pct"], "stage": job["stage"],
+            "result": job["result"],
+        })
 
 
 @app.route("/api/stack/analyze/<path:session_name>", methods=["POST"])
@@ -1161,7 +1348,7 @@ def api_stack_analyze(session_name: str):
     current_params = {k: body.get(k) for k in (
         "bg_mesh_scale", "stretch_q", "black_pct", "white_pct",
         "luma_k", "luma_sig", "unsharp_gain", "unsharp_sig",
-        "chroma_k", "chroma_sig",
+        "chroma_k", "chroma_sig", "saturation",
     ) if body.get(k) is not None}
 
     with open(jpeg_path, "rb") as f:
@@ -1398,6 +1585,79 @@ def _comet_thumb_bytes(fits_path: str, width: int = 240) -> bytes:
     return bytes(buf)
 
 
+def _comet_frame_quality(fits_path: str) -> float:
+    """Sharpness score for one sub: Laplacian variance of the stretched luminance.
+
+    The luminance is normalised with the same percentile stretch as the
+    thumbnails, so scores are comparable across frames regardless of sky
+    brightness.  Cloudy or star-trailed frames score low.  Scores are
+    relative — only meaningful within one scan, not across objects.
+    Cached on disk keyed by path + mtime.
+    """
+    import cv2
+    import numpy as np
+    from astropy.io import fits as _fits
+
+    mtime = int(os.path.getmtime(fits_path))
+    key   = hashlib.md5(f"{fits_path}:{mtime}:quality".encode()).hexdigest()
+    cache = os.path.join(_COMET_THUMB_DIR, key + ".q")
+    if os.path.isfile(cache):
+        try:
+            with open(cache) as fh:
+                return float(fh.read())
+        except (OSError, ValueError):
+            pass
+
+    with _fits.open(fits_path, memmap=False) as hdul:
+        hdr = hdul[0].header
+        raw = hdul[0].data
+    bscale = float(hdr.get("BSCALE", 1))
+    bzero  = float(hdr.get("BZERO",  0))
+
+    if raw.ndim == 3 and raw.shape[0] == 3:
+        lum = np.mean(raw.astype(np.float32), axis=0) * bscale + bzero
+    else:
+        # Bayer mosaic: green pixels dominate luminance; the mosaic pattern
+        # is constant across frames so it cancels out of the relative score.
+        lum = raw.astype(np.float32) * bscale + bzero
+
+    # Downsample to ~640 px wide — fast, and suppresses per-pixel noise so
+    # the Laplacian responds to stars rather than read noise.
+    h_px, w_px = lum.shape
+    if w_px > 640:
+        th  = int(h_px * 640 / w_px)
+        lum = cv2.resize(lum, (640, th), interpolation=cv2.INTER_AREA)
+
+    sky = np.percentile(lum, 25)
+    hi  = np.percentile(lum[lum > sky] - sky, 99.5) if np.any(lum > sky) else 1.0
+    lum = np.clip((lum - sky) / max(hi, 1e-9), 0, 1)
+    score = float(cv2.Laplacian(lum, cv2.CV_32F).var())
+
+    try:
+        with open(cache, "w") as fh:
+            fh.write(repr(score))
+    except OSError:
+        pass
+    return score
+
+
+@app.route("/api/comet/quality", methods=["POST"])
+def api_comet_quality():
+    """Compute sharpness scores for a batch of subs — body: {"paths": [...]}."""
+    body  = request.get_json(silent=True) or {}
+    paths = body.get("paths", [])[:50]
+    scores = {}
+    for p in paths:
+        if not isinstance(p, str) or not os.path.isfile(p):
+            scores[p] = None
+            continue
+        try:
+            scores[p] = _comet_frame_quality(p)
+        except Exception:
+            scores[p] = None
+    return jsonify({"scores": scores})
+
+
 def _comet_output_exists(directory: str, name: str):
     p = os.path.join(directory, name)
     return p if os.path.isfile(p) else None
@@ -1600,39 +1860,55 @@ def comet_results() -> str:
 
 @app.route("/api/comet/scan", methods=["POST"])
 def api_comet_scan():
-    body      = request.get_json(silent=True) or {}
-    directory = body.get("directory", "").strip()
-    if not directory or not os.path.isdir(directory):
-        return jsonify({"error": f"Directory not found: {directory}"}), 400
+    """Scan one or more directories of .fit subs, merged and sorted by DATE-OBS.
+
+    Body: {"directories": [path, ...]} or legacy {"directory": path}.
+    The first directory is the primary — alignment cache and render outputs
+    live there when frames from multiple directories are combined.
+    """
+    body = request.get_json(silent=True) or {}
+    dirs = [d.strip() for d in (body.get("directories") or []) if d and d.strip()]
+    if not dirs:
+        single = body.get("directory", "").strip()
+        if single:
+            dirs = [single]
+    if not dirs:
+        return jsonify({"error": "No directory given"}), 400
+    for d in dirs:
+        if not os.path.isdir(d):
+            return jsonify({"error": f"Directory not found: {d}"}), 400
 
     from astropy.io import fits as _fits
 
     files = []
-    for f in sorted(_Path(directory).glob("*.fit")):
-        try:
-            with _fits.open(str(f), memmap=False) as hdul:
-                hdr = hdul[0].header
-            stem  = f.stem
-            parts = stem.split("_")
-            nsubs = 1
-            if parts[0].lower() == "stacked":
-                try:
-                    nsubs = int(parts[1])
-                except (IndexError, ValueError):
-                    pass
-            files.append({
-                "path":      str(f),
-                "filename":  f.name,
-                "date_obs":  hdr.get("DATE-OBS", ""),
-                "exptime":   float(hdr.get("EXPTIME", 0)),
-                "nsubs":     nsubs,
-                "thumb_url": f"/api/comet/thumb?path={urllib.parse.quote(str(f))}",
-            })
-        except Exception:
-            continue
+    for directory in dirs:
+        for f in sorted(_Path(directory).glob("*.fit")):
+            try:
+                with _fits.open(str(f), memmap=False) as hdul:
+                    hdr = hdul[0].header
+                stem  = f.stem
+                parts = stem.split("_")
+                nsubs = 1
+                if parts[0].lower() == "stacked":
+                    try:
+                        nsubs = int(parts[1])
+                    except (IndexError, ValueError):
+                        pass
+                files.append({
+                    "path":      str(f),
+                    "filename":  f.name,
+                    "dir":       directory,
+                    "date_obs":  hdr.get("DATE-OBS", ""),
+                    "exptime":   float(hdr.get("EXPTIME", 0)),
+                    "nsubs":     nsubs,
+                    "thumb_url": f"/api/comet/thumb?path={urllib.parse.quote(str(f))}",
+                })
+            except Exception:
+                continue
 
     files.sort(key=lambda x: x["date_obs"])
-    return jsonify({"directory": directory, "count": len(files), "files": files})
+    return jsonify({"directory": dirs[0], "directories": dirs,
+                    "count": len(files), "files": files})
 
 
 @app.route("/api/comet/thumb")
@@ -2042,12 +2318,13 @@ def api_solar_status():
 
 @app.route("/api/solar/output")
 def api_solar_output():
-    """Serve a solar output file (mp4 / jpg) by absolute path."""
+    """Serve a solar/capture output file (mp4 / ts / jpg) by absolute path."""
     path = request.args.get("path", "")
     if not path or not os.path.isfile(path):
         abort(404)
     ext  = os.path.splitext(path)[1].lower()
-    mime = {".mp4": "video/mp4", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext)
+    mime = {".mp4": "video/mp4", ".ts": "video/mp2t",
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext)
     if not mime:
         abort(400)
     return send_file(path, mimetype=mime, conditional=True)
@@ -2637,6 +2914,130 @@ _capture_lock = threading.Lock()
 
 _FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 
+# Abort any network read that stalls for 15 s — without this an RTSP drop
+# (Seestar sleeping, Wi-Fi blip) leaves ffmpeg hung forever and the recording
+# silently frozen while the UI clock keeps ticking.
+_FF_STALL_ARGS = ["-rw_timeout", "15000000"]   # microseconds
+
+
+def _rec_alive(rec: dict) -> bool:
+    """True if the recording's ffmpeg is still running (own child or adopted pid)."""
+    proc = rec.get("proc")
+    if proc is not None:
+        return proc.poll() is None
+    pid = rec.get("pid")
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _rec_terminate(rec: dict, timeout: float = 10.0) -> None:
+    """SIGTERM the recorder (ffmpeg finalises output on TERM); SIGKILL if stuck."""
+    proc = rec.get("proc")
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return
+    # Adopted after a server restart — not our child, so poll the pid.
+    pid = rec.get("pid")
+    if not pid:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not _rec_alive(rec):
+                return
+            time.sleep(0.2)
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _remux_recording(ts_path: str) -> tuple:
+    """
+    Remux a finished MPEG-TS recording to .mp4 (stream copy, no re-encode).
+    Returns (mp4_path | None, error | None).  The .ts is deleted on success.
+    """
+    if not os.path.isfile(ts_path) or os.path.getsize(ts_path) == 0:
+        return None, "no data recorded"
+    mp4_path = os.path.splitext(ts_path)[0] + ".mp4"
+    try:
+        result = subprocess.run(
+            [_FFMPEG, "-y", "-i", ts_path, "-c", "copy",
+             "-movflags", "+faststart", mp4_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=300,
+        )
+        if result.returncode == 0 and os.path.getsize(mp4_path) > 0:
+            os.unlink(ts_path)
+            return mp4_path, None
+        err = (result.stderr or "")[-200:]
+    except Exception as exc:
+        err = str(exc)
+    # Remux failed — keep the .ts (it is playable as-is)
+    try:
+        if os.path.isfile(mp4_path):
+            os.unlink(mp4_path)
+    except OSError:
+        pass
+    return ts_path, f"remux failed ({err}); kept .ts"
+
+
+def _finalize_recording(rec: dict, status: str) -> dict:
+    """Stop (if needed) and remux a recording; persist outcome to the DB."""
+    if _rec_alive(rec):
+        _rec_terminate(rec)
+    out_path, err = _remux_recording(rec["ts_path"])
+    size = 0
+    if out_path:
+        try:
+            size = os.path.getsize(out_path)
+        except OSError:
+            pass
+    if out_path is None:
+        status = "died"
+    db.finish_capture_recording(rec["id"], status,
+                                mp4_path=out_path, size_bytes=size,
+                                error_msg=err)
+    return {"id": rec["id"], "name": rec["name"], "status": status,
+            "out_path": out_path, "size_bytes": size, "error": err}
+
+
+def _recover_capture_recordings() -> None:
+    """
+    On startup: re-adopt recordings whose ffmpeg survived a server restart
+    (they become orphans, still writing), and finalise ones whose process
+    died while the server was down — the .ts format means those files are
+    still playable and can be remuxed.
+    """
+    for row in db.get_capture_recordings(status="recording"):
+        rec = {"id": row["rec_id"], "name": row["name"],
+               "ts_path": row["ts_path"], "pid": row["pid"],
+               "proc": None, "started": time.time()}
+        if _rec_alive(rec):
+            with _capture_lock:
+                _capture_recs[rec["id"]] = rec
+            print(f"[startup] Re-adopted live recording '{row['name']}' "
+                  f"(pid {row['pid']})")
+        else:
+            info = _finalize_recording(rec, "died")
+            print(f"[startup] Finalised interrupted recording "
+                  f"'{row['name']}' → {info['out_path']}")
+
 
 @app.route("/capture")
 def capture_page():
@@ -2654,6 +3055,7 @@ def api_capture_mjpeg():
         cmd = [
             _FFMPEG,
             "-rtsp_transport", "tcp",
+            *_FF_STALL_ARGS,
             "-i", url,
             "-f", "image2pipe",
             "-vcodec", "mjpeg",
@@ -2697,8 +3099,12 @@ def api_capture_mjpeg():
         finally:
             try:
                 proc.terminate()
+                proc.wait(timeout=3)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     return Response(
         generate(),
@@ -2717,18 +3123,33 @@ def api_capture_record_start():
     captures_dir = os.path.join(DATA_DIR, "captures")
     os.makedirs(captures_dir, exist_ok=True)
 
+    # Free-space guard: stream copy runs at a few GB/hour with no natural end.
+    try:
+        free_gb = shutil.disk_usage(captures_dir).free / 1024**3
+        if free_gb < 5:
+            return jsonify({"error":
+                f"Only {free_gb:.1f} GB free on the capture drive — "
+                "free some space before recording"}), 507
+    except OSError:
+        pass
+
     safe_name = re.sub(r"[^\w\-]", "_", name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{safe_name}_{timestamp}.mp4"
-    out_path = os.path.join(captures_dir, filename)
+    # Record to MPEG-TS: every byte of a .ts is playable, so a server crash,
+    # WSL shutdown, or killed ffmpeg never corrupts the capture.  The file is
+    # remuxed to .mp4 (stream copy, instant) when the recording stops.
+    ts_path = os.path.join(captures_dir, f"{safe_name}_{timestamp}.ts")
 
     cmd = [
         _FFMPEG,
         "-rtsp_transport", "tcp",
+        *_FF_STALL_ARGS,
         "-i", rtsp_url,
         "-c", "copy",
+        "-f", "mpegts",
+        "-flush_packets", "1",   # write through — a hard kill loses ≤ 1 packet
         "-y",
-        out_path,
+        ts_path,
     ]
     try:
         proc = subprocess.Popen(
@@ -2744,12 +3165,14 @@ def api_capture_record_start():
         _capture_recs[rec_id] = {
             "id": rec_id,
             "name": name,
-            "out_path": out_path,
+            "ts_path": ts_path,
             "started": time.time(),
             "proc": proc,
+            "pid": proc.pid,
         }
+    db.add_capture_recording(rec_id, name, rtsp_url, ts_path, proc.pid)
 
-    return jsonify({"rec_id": rec_id, "out_path": out_path})
+    return jsonify({"rec_id": rec_id, "out_path": ts_path})
 
 
 @app.route("/api/capture/record/stop", methods=["POST"])
@@ -2761,37 +3184,26 @@ def api_capture_record_stop():
     if not rec:
         return jsonify({"error": "Recording not found"}), 404
 
-    proc = rec["proc"]
-    try:
-        proc.terminate()
-        proc.wait(timeout=5)
-    except Exception:
-        pass
-
-    out_path = rec["out_path"]
-    size_bytes = 0
-    try:
-        size_bytes = os.path.getsize(out_path)
-    except OSError:
-        pass
-
-    return jsonify({"out_path": out_path, "size_bytes": size_bytes})
+    info = _finalize_recording(rec, "done")
+    return jsonify(info)
 
 
 @app.route("/api/capture/record/status")
 def api_capture_record_status():
+    """Active recordings + any that ended on their own (stream lost, ffmpeg
+    died).  Ended ones are finalised (remuxed) here and reported once under
+    "ended" so the UI can surface the failure instead of silently dropping it."""
     result = []
     dead = []
     with _capture_lock:
         for rec_id, rec in list(_capture_recs.items()):
-            proc = rec["proc"]
-            if proc.poll() is not None:
-                dead.append(rec_id)
+            if not _rec_alive(rec):
+                dead.append(rec)
+                _capture_recs.pop(rec_id, None)
                 continue
-            out_path = rec["out_path"]
             size_bytes = 0
             try:
-                size_bytes = os.path.getsize(out_path)
+                size_bytes = os.path.getsize(rec["ts_path"])
             except OSError:
                 pass
             result.append({
@@ -2799,11 +3211,10 @@ def api_capture_record_status():
                 "name": rec["name"],
                 "elapsed_s": time.time() - rec["started"],
                 "size_bytes": size_bytes,
-                "out_path": out_path,
+                "out_path": rec["ts_path"],
             })
-        for rec_id in dead:
-            _capture_recs.pop(rec_id, None)
-    return jsonify(result)
+    ended = [_finalize_recording(rec, "died") for rec in dead]
+    return jsonify({"active": result, "ended": ended})
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
@@ -2882,6 +3293,12 @@ if __name__ == "__main__":
             })
     if pending_stack:
         print(f"[startup] Re-queued {len(pending_stack)} interrupted stack job(s).")
+
+    # Re-adopt or finalise live-capture recordings from a previous run.
+    try:
+        _recover_capture_recordings()
+    except Exception as exc:
+        print(f"[startup] Capture recovery error: {exc}")
 
     # Backfill missing video durations (one-time, silently skips when all done).
     _bf = threading.Thread(target=_backfill_video_durations, daemon=True, name="duration-backfill")

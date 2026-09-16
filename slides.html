@@ -175,34 +175,148 @@
       <ul>
         <li>Local Flask web app — runs on your PC, opens in any browser</li>
         <li>Points at your Seestar data directory and auto-scans sessions</li>
-        <li>Messier &amp; Caldwell catalog matching</li>
-        <li>Transit and impact event detection</li>
-        <li class="accent"><strong>Comet Wizard</strong> — the star of the show</li>
+        <li>Messier &amp; Caldwell catalog matching, poster printing, club slideshow</li>
+        <li><strong class="accent">Sub-frame stacking</strong> — hybrid Python + Siril pipeline with AI denoising</li>
+        <li><strong class="accent2">Stack Wizard</strong> — post-processing tuning with before/after compare</li>
+        <li><strong class="warn">Transit Planner</strong> — predict ISS / Hubble transits of Sun or Moon</li>
+        <li><strong class="accent">Comet Wizard</strong> — end-to-end comet animation pipeline</li>
       </ul>
-      <div class="hl" style="margin-top:1em">
+      <div class="hl" style="margin-top:0.8em">
         No cloud, no subscription, no upload.<br>
         Your data stays on your machine.
       </div>
     </div>
     <div>
-      <div class="card" style="margin-bottom:0.7em">
+      <div class="card" style="margin-bottom:0.5em">
         <h3>✦ Sessions</h3>
-        <p>Browse every night's data, view thumbnails, filter by object or date</p>
+        <p>Browse every night's data, view thumbnails, ratings, observing notes</p>
       </div>
-      <div class="card" style="margin-bottom:0.7em">
+      <div class="card" style="margin-bottom:0.5em">
         <h3>🔭 Catalog</h3>
-        <p>Auto-matched to Messier / Caldwell with completion tracking</p>
+        <p>Auto-matched to Messier / Caldwell — bingo card, poster, slideshow</p>
+      </div>
+      <div class="card" style="margin-bottom:0.5em">
+        <h3>🌞 Solar / 🌕 Lunar</h3>
+        <p>Disk-normalised VFR timelapse wizards with O(1) RAM streaming</p>
       </div>
       <div class="card">
         <h3>☄ Comet Wizard</h3>
-        <p>End-to-end comet animation pipeline with interactive frame review</p>
+        <p>Stars-fixed + nucleus-fixed animations, track composite, frame review</p>
       </div>
     </div>
   </div>
 </section>
 
 
-<!-- ─── 4. COMET WIZARD OVERVIEW ─────────────────────────────────────────── -->
+<!-- ─── 4. SUB-FRAME STACKING ─────────────────────────────────────────── -->
+<section>
+  <h2>Sub-Frame Stacking</h2>
+  <p class="dim" style="margin-bottom:0.7em">Hybrid pipeline for <span class="mono">_sub</span> session folders — Python quality selection · Siril registration · Python post-processing</p>
+  <div class="steps">
+    <div class="step"><strong>① Quality scan</strong>Laplacian sharpness<br>+ SEP FWHM/SNR</div>
+    <span class="step-arrow">→</span>
+    <div class="step"><strong>② Frame select</strong>sharpness floor<br>score floor<br>cap at max_frames</div>
+    <span class="step-arrow">→</span>
+    <div class="step"><strong>③ Pre-debayer</strong>3-ch RGB FITS<br>(no Bayer artefacts)</div>
+    <span class="step-arrow">→</span>
+    <div class="step"><strong>④ Siril</strong>star registration<br>3σ sigma-clip stack</div>
+    <span class="step-arrow">→</span>
+    <div class="step"><strong>⑤ Post</strong>IQR border crop<br>background sub<br>GraXpert AI denoise<br>asinh stretch</div>
+  </div>
+  <div class="cols cols-2" style="margin-top:0.8em">
+    <div>
+      <h3>GraXpert AI denoising</h3>
+      <p>Runs on the <em>linear</em> float32 stack — before any stretch. Linear data has Gaussian noise characteristics ideal for the ONNX model. GPU-accelerated via CUDA. Whether GraXpert ran or fell back is recorded in the run log.</p>
+      <div class="hl amber" style="margin-top:0.6em">
+        Why pre-debayer? Stacking raw Bayer frames with sub-pixel registration shifts misaligns the GRBG grid → systematic colour band artefacts. Giving Siril 3-channel RGB FITS eliminates this.
+      </div>
+    </div>
+    <div>
+      <div class="hl">
+        <strong>500 frames M101:</strong> ~31 min · spiral arms clearly visible<br>
+        <strong>1 500 frames M101:</strong> ~66 min · significantly deeper
+      </div>
+      <div class="hl blue" style="margin-top:0.5em">
+        <strong>Cancel</strong> at any point — pipeline stops cleanly after the current frame; no partial output written.
+      </div>
+      <div class="hl" style="margin-top:0.5em">
+        <strong>Stack queue</strong> at <span class="mono">/stack/jobs</span> — history, durations, log and image links; live SSE progress.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 5. STACK WIZARD ────────────────────────────────────────────────── -->
+<section>
+  <h2>Stack Wizard — Post-Processing Tuning</h2>
+  <p class="dim" style="margin-bottom:0.7em"><span class="mono">/stack/wizard/&lt;session&gt;</span> · left panel: all knobs · right panel: before/after compare slider</p>
+  <div class="cols cols-2">
+    <div>
+      <h3>Tunable parameters</h3>
+      <ul>
+        <li><strong class="accent">bg_mesh_scale</strong> — background mesh coarseness (0 = skip; 8 = large galaxies like M101; 40 = compact nebulae)</li>
+        <li><strong class="accent">stretch_q</strong> — asinh shadow aggressiveness (4 = gentle → 15 = aggressive)</li>
+        <li><strong class="accent">black_pct / white_pct</strong> — black point and highlight clip percentiles</li>
+        <li><strong class="accent">luma / chroma denoise</strong> — Gaussian kernel and sigma, separately tuned</li>
+        <li><strong class="accent">unsharp mask</strong> — gain and blur radius</li>
+      </ul>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:0.5em">
+        <h3>⚡ Re-render</h3>
+        <p>Applies changed params to saved linear FITS in seconds — no re-stack needed</p>
+      </div>
+      <div class="card" style="margin-bottom:0.5em">
+        <h3>🔄 Revert</h3>
+        <p>Restores params from before the last re-render or preset load</p>
+      </div>
+      <div class="card" style="margin-bottom:0.5em">
+        <h3>🤖 Ollama AI analysis</h3>
+        <p>Sends current JPEG to a local vision model; streams back diagnosis + suggested param changes</p>
+      </div>
+      <div class="card">
+        <h3>💾 Download</h3>
+        <p>JPEG with EXIF metadata or 16-bit TIFF; integration time and all params baked in</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 6. TRANSIT PLANNER ────────────────────────────────────────────── -->
+<section>
+  <h2>Transit Planner — Catch the ISS on the Sun or Moon</h2>
+  <div class="cols cols-2">
+    <div>
+      <h3>What it predicts</h3>
+      <ul>
+        <li>ISS, Hubble, Tiangong, and ~169 other tracked bright objects</li>
+        <li>Transits of the <strong class="accent">solar disk</strong> or <strong class="accent2">lunar disk</strong> — or both simultaneously</li>
+        <li>Contact times c1 / mid / c2 resolved to <strong class="warn">0.05-second</strong> precision</li>
+        <li>Duration, chord % of disk, centerline offset in km, body altitude/az</li>
+      </ul>
+      <div class="hl amber" style="margin-top:0.6em">
+        ☀ Solar filter reminder on every Sun transit event — can't miss it
+      </div>
+    </div>
+    <div>
+      <h3>3-pass algorithm</h3>
+      <div class="steps" style="flex-direction:column; align-items:flex-start; gap:0.4em; margin-bottom:0.6em">
+        <div class="step" style="width:100%"><strong>Pass 1 — Coarse</strong>1-min grid · ~169 sats × 7 days in ~43 s total</div>
+        <div class="step" style="width:100%"><strong>Pass 2 — Medium</strong>1-second scan on candidate windows</div>
+        <div class="step" style="width:100%"><strong>Pass 3 — Ultra-fine</strong>0.05-second contact times</div>
+      </div>
+      <div class="hl blue">
+        TLEs from Celestrak · cached 12 h · de421 ephemeris auto-downloaded<br>
+        Notable-only mode (ISS + Hubble + Tiangong): ~2 s
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─── 7. COMET WIZARD OVERVIEW ─────────────────────────────────────────── -->
 <section>
   <h2>The Comet Wizard — Three Steps</h2>
   <div class="steps">
@@ -241,7 +355,7 @@
 </section>
 
 
-<!-- ─── 5. PASS 1 — STAR ALIGNMENT ───────────────────────────────────────── -->
+<!-- ─── 8. PASS 1 — STAR ALIGNMENT ───────────────────────────────────────── -->
 <section>
   <h2>Pipeline — Pass 1: Star Alignment</h2>
   <span class="pass">PASS 1</span><span style="font-size:0.8em; color:var(--dim)">every frame → reference frame similarity transform</span>
@@ -273,7 +387,7 @@
 </section>
 
 
-<!-- ─── 6. PASS 2 — NUCLEUS DETECTION ────────────────────────────────────── -->
+<!-- ─── 9. PASS 2 — NUCLEUS DETECTION ────────────────────────────────────── -->
 <section>
   <h2>Pipeline — Pass 2: Nucleus Detection</h2>
   <span class="pass p2">PASS 2</span><span style="font-size:0.8em; color:var(--dim)">locate the comet head in every frame</span>
@@ -304,7 +418,7 @@
 </section>
 
 
-<!-- ─── 7. STARS-FIXED ANIMATION ─────────────────────────────────────────── -->
+<!-- ─── 10. STARS-FIXED ANIMATION ─────────────────────────────────────────── -->
 <section>
   <h2>Output 1 — Stars-Fixed Animation</h2>
   <span class="pass p3">PASS 3</span><span style="font-size:0.8em; color:var(--dim)">union canvas · fill composite · blend</span>
@@ -329,7 +443,7 @@
 </section>
 
 
-<!-- ─── 8. NUCLEUS-FIXED ANIMATION ───────────────────────────────────────── -->
+<!-- ─── 11. NUCLEUS-FIXED ANIMATION ───────────────────────────────────────── -->
 <section>
   <h2>Output 2 — Nucleus-Fixed Animation</h2>
   <span class="pass p4">PASS 4</span><span style="font-size:0.8em; color:var(--dim)">nucleus re-centred · deep stack · trail removal</span>
@@ -354,7 +468,7 @@
 </section>
 
 
-<!-- ─── 9. STACKS & SPECIAL OUTPUTS ──────────────────────────────────────── -->
+<!-- ─── 12. STACKS & SPECIAL OUTPUTS ──────────────────────────────────────── -->
 <section>
   <h2>Additional Outputs</h2>
   <div class="cols cols-3">
@@ -384,7 +498,7 @@
 </section>
 
 
-<!-- ─── 10. DISPLAY STRETCH ───────────────────────────────────────────────── -->
+<!-- ─── 13. DISPLAY STRETCH ───────────────────────────────────────────────── -->
 <section>
   <h2>Display Stretch Pipeline</h2>
   <p class="dim" style="margin-bottom:0.8em">Applied to every output frame — tunable via the Parameters page</p>
@@ -418,7 +532,7 @@
 </section>
 
 
-<!-- ─── 11. FRAME REVIEW WORKFLOW ─────────────────────────────────────────── -->
+<!-- ─── 14. FRAME REVIEW WORKFLOW ─────────────────────────────────────────── -->
 <section>
   <h2>Frame Review Workflow</h2>
   <div class="cols cols-2">
@@ -442,7 +556,7 @@
 </section>
 
 
-<!-- ─── 12. TECH STACK ────────────────────────────────────────────────────── -->
+<!-- ─── 15. TECH STACK ────────────────────────────────────────────────────── -->
 <section>
   <h2>Under the Hood</h2>
   <div class="cols cols-3">
@@ -475,7 +589,7 @@
 </section>
 
 
-<!-- ─── 13. EXAMPLE RESULTS ───────────────────────────────────────────────── -->
+<!-- ─── 16. EXAMPLE RESULTS ───────────────────────────────────────────────── -->
 <section>
   <h2>Example — C/2025 A6 (Lemmon)</h2>
   <div class="cols cols-2">
@@ -507,7 +621,7 @@
 </section>
 
 
-<!-- ─── 14. LIVE DEMO ─────────────────────────────────────────────────────── -->
+<!-- ─── 17. LIVE DEMO ─────────────────────────────────────────────────────── -->
 <section class="title-slide">
   <span class="comet-icon">🖥</span>
   <h1 style="color: var(--accent2);">Live Demo</h1>
@@ -521,7 +635,7 @@
 </section>
 
 
-<!-- ─── 15. WHAT'S NEXT ────────────────────────────────────────────────────── -->
+<!-- ─── 18. WHAT'S NEXT ────────────────────────────────────────────────────── -->
 <section>
   <h2>Ideas &amp; Future Work</h2>
   <div class="cols cols-2">
@@ -550,7 +664,7 @@
 </section>
 
 
-<!-- ─── 16. CLOSING ───────────────────────────────────────────────────────── -->
+<!-- ─── 19. CLOSING ───────────────────────────────────────────────────────── -->
 <section class="title-slide">
   <span class="comet-icon">☄</span>
   <h1>Thank you</h1>

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frame Quality — {{ session_name }} — Seestar Lab</title>
+  <link rel="stylesheet" href="{{ static_ver('css/style.css') }}" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <style>
+    .sq-page { max-width: 980px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+    .sq-sub { font-size: 0.78rem; color: var(--text-muted); margin: 0 0 1rem; }
+
+    .sq-progress-wrap {
+      height: 6px; border-radius: 3px; background: var(--border);
+      overflow: hidden; margin: 0.6rem 0 1.2rem;
+    }
+    .sq-progress-fill {
+      height: 100%; background: var(--accent, #4a9eff); transition: width 0.3s;
+    }
+    .sq-status-line { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.4rem; }
+
+    .sq-stats-row {
+      display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.6rem;
+      margin: 1rem 0 1.4rem;
+    }
+    .sq-stat {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 6px; padding: 0.6rem 0.8rem;
+    }
+    .sq-stat-label {
+      font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-muted); margin-bottom: 0.2rem;
+    }
+    .sq-stat-value { font-size: 1.05rem; font-weight: 600; }
+
+    .sq-section-title {
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 1.6rem 0 0.6rem;
+      padding-bottom: 0.3rem; border-bottom: 1px solid var(--border);
+    }
+
+    .sq-hist-wrap { position: relative; }
+    #sq-hist-canvas { width: 100%; height: 220px; display: block; }
+    .sq-hist-tooltip {
+      position: absolute; pointer-events: none; display: none;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.72rem;
+      white-space: nowrap; transform: translate(-50%, -110%);
+    }
+
+    .sq-cutoff-row {
+      display: flex; align-items: center; gap: 1.2rem; margin: 0.8rem 0 0.2rem;
+      font-size: 0.8rem; flex-wrap: wrap;
+    }
+    .sq-cutoff-row label { display: flex; align-items: center; gap: 0.4rem; }
+    .sq-cutoff-row input[type=range] { width: 220px; }
+    .sq-cutoff-readout { color: var(--text-muted); font-size: 0.76rem; }
+
+    table.sq-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+    table.sq-table th, table.sq-table td {
+      padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border);
+      text-align: right; white-space: nowrap;
+    }
+    table.sq-table th:first-child, table.sq-table td:first-child { text-align: left; }
+    table.sq-table th {
+      cursor: pointer; user-select: none; color: var(--text-muted);
+      font-weight: 500; position: sticky; top: 0; background: var(--bg);
+    }
+    table.sq-table th.sq-sorted::after { content: ' \25BE'; }
+    table.sq-table th.sq-sorted-asc::after { content: ' \25B4'; }
+    .sq-table-wrap { max-height: 480px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+    tr.sq-row-rejected { opacity: 0.45; }
+    tr.sq-row-error td { color: #e06060; }
+    .sq-fname { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+
+    .sq-empty { font-size: 0.82rem; color: var(--text-muted); padding: 1rem 0; }
+    .sq-btn {
+      font-size: 0.78rem; padding: 0.35rem 0.8rem; border-radius: 5px;
+      border: 1px solid var(--border); background: var(--surface);
+      color: var(--text); cursor: pointer;
+    }
+    .sq-btn:hover { background: var(--border); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div class="brand">
+      <span class="brand-icon">✦</span>
+      <span class="brand-name">Seestar Lab</span>
+    </div>
+    <nav class="site-nav">
+      <a class="nav-link" href="/">Sessions</a>
+      <a class="nav-link" href="/catalog/messier">Messier</a>
+      <a class="nav-link" href="/catalog/caldwell">Caldwell</a>
+      <a class="nav-link" href="/activity">Activity</a>
+      <a class="nav-link" href="/comet">Comet</a>
+      <a class="nav-link" href="/solar">Solar</a>
+      <a class="nav-link" href="/lunar">Lunar</a>
+      <a class="nav-link" href="/planner">Planner</a>
+        <a class="nav-link" href="/planner/transits">Transits</a>
+      <a class="nav-link" href="/capture">Capture</a>
+      <a class="nav-link active" href="/stack/jobs">Queue</a>
+    </nav>
+  </div>
+</header>
+
+<main class="sq-page">
+  <h1 style="font-size:1.1rem;margin:0 0 0.2rem">Frame Quality — {{ session_name }}</h1>
+  <p class="sq-sub">
+    Read-only scan: Stage A sharpness + Stage B SEP metrics (FWHM, eccentricity, star count, SNR)
+    on every frame — no copying, no stacking. Safe to run alongside an active stack job.
+  </p>
+
+  <div id="sq-controls">
+    <button class="sq-btn" id="sq-start-btn">Start scan</button>
+  </div>
+
+  <div id="sq-progress" style="display:none">
+    <div class="sq-status-line" id="sq-status-line">Starting…</div>
+    <div class="sq-progress-wrap"><div class="sq-progress-fill" id="sq-progress-fill" style="width:0%"></div></div>
+  </div>
+
+  <div id="sq-results" style="display:none">
+
+    <div class="sq-stats-row">
+      <div class="sq-stat"><div class="sq-stat-label">Total frames</div><div class="sq-stat-value" id="sq-stat-total">—</div></div>
+      <div class="sq-stat"><div class="sq-stat-label">Stage A pass</div><div class="sq-stat-value" id="sq-stat-a">—</div></div>
+      <div class="sq-stat"><div class="sq-stat-label">Stage B scored</div><div class="sq-stat-value" id="sq-stat-b">—</div></div>
+      <div class="sq-stat"><div class="sq-stat-label">Read errors</div><div class="sq-stat-value" id="sq-stat-err">—</div></div>
+      <div class="sq-stat"><div class="sq-stat-label">Score range</div><div class="sq-stat-value" id="sq-stat-range">—</div></div>
+    </div>
+
+    <div class="sq-section-title">Score distribution</div>
+    <div class="sq-hist-wrap">
+      <canvas id="sq-hist-canvas"></canvas>
+      <div class="sq-hist-tooltip" id="sq-hist-tooltip"></div>
+    </div>
+
+    <div class="sq-cutoff-row">
+      <label>
+        max_frames cutoff:
+        <input type="range" id="sq-cutoff-slider" min="1" value="500">
+        <span class="sq-cutoff-readout" id="sq-cutoff-readout"></span>
+      </label>
+      <span class="sq-cutoff-readout" id="sq-cutoff-score"></span>
+    </div>
+
+    <div class="sq-section-title">Per-frame detail</div>
+    <div class="sq-table-wrap">
+      <table class="sq-table" id="sq-table">
+        <thead>
+          <tr>
+            <th data-key="file">File</th>
+            <th data-key="score" class="sq-sorted">Score</th>
+            <th data-key="fwhm">FWHM</th>
+            <th data-key="eccentricity">Ecc.</th>
+            <th data-key="star_count">Stars</th>
+            <th data-key="snr">SNR</th>
+            <th data-key="sharpness">Sharp.</th>
+            <th data-key="stage_a_pass">Stage A</th>
+          </tr>
+        </thead>
+        <tbody id="sq-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="sq-empty" class="sq-empty">No scan run yet for this session.</div>
+</main>
+
+<script>
+const SESSION_NAME = {{ session_name | tojson }};
+let frames = [];
+let sortKey = 'score';
+let sortAsc = false;
+let pollTimer = null;
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function fmt(v, digits) {
+  return (v === null || v === undefined) ? '—' : Number(v).toFixed(digits);
+}
+
+async function startScan() {
+  document.getElementById('sq-empty').style.display = 'none';
+  document.getElementById('sq-results').style.display = 'none';
+  document.getElementById('sq-progress').style.display = 'block';
+  document.getElementById('sq-start-btn').disabled = true;
+  try {
+    const r = await fetch(`/api/stack/quality/${encodeURIComponent(SESSION_NAME)}`, {method: 'POST'});
+    if (!r.ok && r.status !== 409) {
+      const body = await r.json().catch(() => ({}));
+      alert('Could not start scan: ' + (body.error || r.status));
+      document.getElementById('sq-start-btn').disabled = false;
+      document.getElementById('sq-progress').style.display = 'none';
+      return;
+    }
+  } catch (e) {
+    alert('Could not start scan: ' + e);
+    document.getElementById('sq-start-btn').disabled = false;
+    return;
+  }
+  poll();
+}
+
+async function poll() {
+  try {
+    const r = await fetch(`/api/stack/quality/${encodeURIComponent(SESSION_NAME)}`);
+    if (r.ok) {
+      const job = await r.json();
+      document.getElementById('sq-status-line').textContent =
+        `${job.stage || ''}  (${job.pct || 0}%)`;
+      document.getElementById('sq-progress-fill').style.width = (job.pct || 0) + '%';
+
+      if (job.status === 'done' && job.frames) {
+        frames = job.frames;
+        document.getElementById('sq-progress').style.display = 'none';
+        document.getElementById('sq-start-btn').disabled = false;
+        document.getElementById('sq-start-btn').textContent = 'Re-scan';
+        renderResults();
+        return;
+      }
+      if (job.status === 'error') {
+        document.getElementById('sq-status-line').textContent = 'Error: ' + job.stage;
+        document.getElementById('sq-start-btn').disabled = false;
+        return;
+      }
+      if (job.status === 'cancelled') {
+        document.getElementById('sq-progress').style.display = 'none';
+        document.getElementById('sq-start-btn').disabled = false;
+        return;
+      }
+    }
+  } catch {}
+  pollTimer = setTimeout(poll, 1000);
+}
+
+function renderResults() {
+  document.getElementById('sq-results').style.display = 'block';
+
+  const total   = frames.length;
+  const stageA  = frames.filter(f => f.stage_a_pass).length;
+  const stageB  = frames.filter(f => f.score > 0).length;
+  const errors  = frames.filter(f => f.error).length;
+  const scores  = frames.filter(f => f.score > 0).map(f => f.score);
+  const minS    = scores.length ? Math.min(...scores) : 0;
+  const maxS    = scores.length ? Math.max(...scores) : 0;
+
+  document.getElementById('sq-stat-total').textContent = total;
+  document.getElementById('sq-stat-a').textContent = `${stageA} (${total ? Math.round(100*stageA/total) : 0}%)`;
+  document.getElementById('sq-stat-b').textContent = `${stageB} (${total ? Math.round(100*stageB/total) : 0}%)`;
+  document.getElementById('sq-stat-err').textContent = errors;
+  document.getElementById('sq-stat-range').textContent = `${fmt(minS,1)} – ${fmt(maxS,1)}`;
+
+  const slider = document.getElementById('sq-cutoff-slider');
+  slider.max = Math.max(stageB, 1);
+  slider.value = Math.min(500, stageB);
+  slider.oninput = () => { drawHistogram(); updateCutoffReadout(); };
+  updateCutoffReadout();
+
+  drawHistogram();
+  sortAndRenderTable();
+
+  const headers = document.querySelectorAll('#sq-table th[data-key]');
+  headers.forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      if (sortKey === key) { sortAsc = !sortAsc; } else { sortKey = key; sortAsc = false; }
+      headers.forEach(h => h.classList.remove('sq-sorted', 'sq-sorted-asc'));
+      th.classList.add(sortAsc ? 'sq-sorted-asc' : 'sq-sorted');
+      sortAndRenderTable();
+    };
+  });
+}
+
+function updateCutoffReadout() {
+  const slider = document.getElementById('sq-cutoff-slider');
+  const n = parseInt(slider.value, 10);
+  const scored = frames.filter(f => f.score > 0).slice().sort((a,b) => b.score - a.score);
+  const cutoffScore = scored.length ? (scored[Math.min(n, scored.length) - 1]?.score ?? 0) : 0;
+  document.getElementById('sq-cutoff-readout').textContent = `keep best ${n} of ${scored.length}`;
+  document.getElementById('sq-cutoff-score').textContent =
+    `score cutoff: ${fmt(cutoffScore, 2)}`;
+}
+
+function drawHistogram() {
+  const canvas = document.getElementById('sq-hist-canvas');
+  const wrap   = canvas.parentElement;
+  const dpr    = window.devicePixelRatio || 1;
+  const cssW   = wrap.clientWidth;
+  const cssH   = 220;
+  canvas.width  = cssW * dpr;
+  canvas.height = cssH * dpr;
+  canvas.style.width  = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const scored = frames.filter(f => f.score > 0).map(f => f.score);
+  if (!scored.length) return;
+
+  const nBins = 40;
+  const minS = Math.min(...scored), maxS = Math.max(...scored);
+  const range = Math.max(maxS - minS, 1e-6);
+  const bins = new Array(nBins).fill(0);
+  scored.forEach(s => {
+    let idx = Math.floor((s - minS) / range * nBins);
+    if (idx >= nBins) idx = nBins - 1;
+    if (idx < 0) idx = 0;
+    bins[idx]++;
+  });
+  const maxCount = Math.max(...bins, 1);
+
+  const padL = 36, padB = 20, padT = 8, padR = 8;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+  const barW  = plotW / nBins;
+
+  const style = getComputedStyle(document.body);
+  const barColor = style.getPropertyValue('--accent').trim() || '#4a9eff';
+  const gridColor = style.getPropertyValue('--border').trim() || '#333';
+  const textColor = style.getPropertyValue('--text-muted').trim() || '#999';
+
+  ctx.strokeStyle = gridColor;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT); ctx.lineTo(padL, cssH - padB); ctx.lineTo(cssW - padR, cssH - padB);
+  ctx.stroke();
+
+  ctx.fillStyle = textColor;
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText(maxCount, padL - 4, padT + 8);
+  ctx.fillText('0', padL - 4, cssH - padB);
+  ctx.textAlign = 'center';
+  ctx.fillText(fmt(minS,0), padL, cssH - 4);
+  ctx.fillText(fmt(maxS,0), cssW - padR, cssH - 4);
+
+  // Cutoff marker: score at the current max_frames slider position
+  const slider = document.getElementById('sq-cutoff-slider');
+  const n = slider ? parseInt(slider.value, 10) : null;
+  const sortedDesc = scored.slice().sort((a,b) => b - a);
+  const cutoffScore = (n && sortedDesc.length) ? sortedDesc[Math.min(n, sortedDesc.length) - 1] : null;
+
+  bins.forEach((count, i) => {
+    const x = padL + i * barW;
+    const h = (count / maxCount) * plotH;
+    const binLo = minS + (i / nBins) * range;
+    const isKept = cutoffScore !== null && binLo >= cutoffScore;
+    ctx.fillStyle = isKept ? barColor : gridColor;
+    ctx.fillRect(x + 1, cssH - padB - h, Math.max(barW - 2, 1), h);
+  });
+
+  if (cutoffScore !== null) {
+    const cx = padL + ((cutoffScore - minS) / range) * plotW;
+    ctx.strokeStyle = '#e06060';
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(cx, padT); ctx.lineTo(cx, cssH - padB);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function sortAndRenderTable() {
+  const sorted = frames.slice().sort((a, b) => {
+    let av = a[sortKey], bv = b[sortKey];
+    if (av === null || av === undefined) av = -Infinity;
+    if (bv === null || bv === undefined) bv = -Infinity;
+    if (typeof av === 'boolean') { av = av ? 1 : 0; bv = bv ? 1 : 0; }
+    if (typeof av === 'string') return sortAsc ? String(av).localeCompare(bv) : String(bv).localeCompare(av);
+    return sortAsc ? av - bv : bv - av;
+  });
+
+  const tbody = document.getElementById('sq-tbody');
+  tbody.innerHTML = sorted.map(f => {
+    const cls = f.error ? 'sq-row-error' : (!f.stage_a_pass ? 'sq-row-rejected' : '');
+    return `<tr class="${cls}">
+      <td class="sq-fname" title="${esc(f.file)}">${esc(f.file)}</td>
+      <td>${fmt(f.score, 2)}</td>
+      <td>${fmt(f.fwhm, 2)}</td>
+      <td>${fmt(f.eccentricity, 3)}</td>
+      <td>${f.star_count ?? '—'}</td>
+      <td>${fmt(f.snr, 1)}</td>
+      <td>${fmt(f.sharpness, 0)}</td>
+      <td>${f.error ? esc(f.error) : (f.stage_a_pass ? 'pass' : 'reject')}</td>
+    </tr>`;
+  }).join('');
+}
+
+document.getElementById('sq-start-btn').addEventListener('click', startScan);
+
+// If a scan is already running or finished for this session, pick it up immediately.
+(async () => {
+  try {
+    const r = await fetch(`/api/stack/quality/${encodeURIComponent(SESSION_NAME)}`);
+    if (r.ok) {
+      const job = await r.json();
+      if (job.status === 'running') {
+        document.getElementById('sq-empty').style.display = 'none';
+        document.getElementById('sq-progress').style.display = 'block';
+        document.getElementById('sq-start-btn').disabled = true;
+        poll();
+      } else if (job.status === 'done' && job.frames) {
+        document.getElementById('sq-empty').style.display = 'none';
+        frames = job.frames;
+        document.getElementById('sq-start-btn').textContent = 'Re-scan';
+        renderResults();
+      }
+    }
+  } catch {}
+})();
+</script>
+</body>
+</html>

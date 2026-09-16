@@ -3,10 +3,13 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 
 const state = {
-  directory:       "",
-  allFiles:        [],   // [{path, filename, date_obs, exptime, nsubs, thumb_url, sessionIdx}]
+  directory:       "",   // primary dir — alignment cache + outputs live here
+  directories:     [],   // all scanned dirs (multi-night support)
+  allFiles:        [],   // [{path, filename, dir, date_obs, exptime, nsubs, thumb_url, sessionIdx, quality}]
   sessions:        [],   // [{label, indices:[]}]
   rejected:        new Set(),
+  scanGen:         0,    // bumped on each scan to cancel stale quality fetches
+  qualityMax:      null, // highest sharpness score in this scan
   lastClickedIdx:  null, // for shift+click range
   jobId:           null,
   pollTimer:       null,
@@ -152,29 +155,57 @@ async function loadDiscovery() {
     }
     picker.innerHTML = "";
     data.comets.forEach(c => {
-      const row = document.createElement("button");
+      const row = document.createElement("div");
       row.className = "comet-pick-row";
       row.innerHTML =
-        `<span class="pick-name">${c.name}</span>` +
+        `<input type="checkbox" class="pick-check" title="Combine with other nights" />` +
+        `<button class="pick-name-btn"><span class="pick-name">${c.name}</span></button>` +
         `<span class="pick-meta">${c.fits_count > 0 ? c.fits_count + " subs" : "no subs"}</span>`;
-      row.addEventListener("click", () => {
+      row.querySelector(".pick-name-btn").addEventListener("click", () => {
         $("comet-dir").value = c.path;
         picker.style.display = "none";
         // Auto-scan immediately
         $("scan-btn").click();
       });
+      row.dataset.path = c.path;
+      row.querySelector(".pick-check").addEventListener("change", updatePickFooter);
       picker.appendChild(row);
     });
+
+    // Footer button: scan all checked directories combined
+    const footer = document.createElement("div");
+    footer.className = "comet-pick-footer";
+    footer.innerHTML =
+      `<button class="btn btn-sm btn-primary" id="scan-selected-btn" style="display:none;"></button>` +
+      `<span class="pick-footer-hint">tick boxes to combine multiple nights/directories</span>`;
+    footer.querySelector("#scan-selected-btn").addEventListener("click", () => {
+      const paths = [...picker.querySelectorAll(".pick-check:checked")]
+        .map(cb => cb.closest(".comet-pick-row").dataset.path);
+      if (!paths.length) return;
+      $("comet-dir").value = paths.join(" ; ");
+      picker.style.display = "none";
+      $("scan-btn").click();
+    });
+    picker.appendChild(footer);
   } catch (err) {
     picker.innerHTML = `<span class="picker-error">Network error: ${err}</span>`;
   }
 }
 
+function updatePickFooter() {
+  const picker = $("comet-picker");
+  const btn    = picker.querySelector("#scan-selected-btn");
+  if (!btn) return;
+  const n = picker.querySelectorAll(".pick-check:checked").length;
+  btn.style.display = n > 0 ? "inline-flex" : "none";
+  btn.textContent   = `Scan ${n} combined →`;
+}
+
 // ── Step 1: Scan ──────────────────────────────────────────────────────────────
 
 $("scan-btn").addEventListener("click", async () => {
-  const dir = $("comet-dir").value.trim();
-  if (!dir) return;
+  const dirs = $("comet-dir").value.split(";").map(s => s.trim()).filter(Boolean);
+  if (!dirs.length) return;
 
   $("scan-btn").disabled = true;
   $("scan-btn").textContent = "Scanning…";
@@ -182,14 +213,16 @@ $("scan-btn").addEventListener("click", async () => {
   $("scan-status").textContent = "Reading FITS headers…";
   $("thumb-grid").innerHTML = "";
   $("bulk-controls").style.display = "none";
+  $("quality-panel").style.display = "none";
   state.allFiles  = [];
   state.rejected  = new Set();
+  state.scanGen++;
 
   try {
     const res  = await fetch("/api/comet/scan", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({directory: dir}),
+      body: JSON.stringify({directories: dirs}),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -198,6 +231,7 @@ $("scan-btn").addEventListener("click", async () => {
     }
 
     state.directory      = data.directory;
+    state.directories    = data.directories || [data.directory];
     state.allFiles       = data.files;
     state.lastClickedIdx = null;
     state.sessions       = detectSessions(state.allFiles);
@@ -209,14 +243,17 @@ $("scan-btn").addEventListener("click", async () => {
       state.allFiles.forEach(f => { if (f.nsubs > best.nsubs) best = f; });
       state.refPath = best.path;
     }
+    const dirNote = state.directories.length > 1
+      ? ` from ${state.directories.length} directories` : "";
     $("scan-status").textContent =
       `Found ${data.count} sub${data.count !== 1 ? "s" : ""}` +
       ` across ${state.sessions.length} night${state.sessions.length !== 1 ? "s" : ""}` +
-      ` — thumbnails loading…`;
+      dirNote + ` — thumbnails loading…`;
     renderSessionBar();
     renderGrid();
     $("bulk-controls").style.display = "flex";
     updateBulkSummary();
+    fetchQualityScores();
   } catch (err) {
     $("scan-status").textContent = `Network error: ${err}`;
   } finally {
@@ -316,7 +353,9 @@ function renderGrid() {
     meta.className = "thumb-meta";
     meta.innerHTML =
       `<span class="thumb-date">${fmtDate(f.date_obs)}</span>` +
-      `<span class="thumb-info">${f.exptime}s · ${f.nsubs} sub${f.nsubs !== 1 ? "s" : ""}</span>`;
+      `<span class="thumb-info">${f.exptime}s · ${f.nsubs} sub${f.nsubs !== 1 ? "s" : ""}` +
+      ` <span class="thumb-quality"></span></span>`;
+    if (state.directories.length > 1) card.title = f.path;
 
     card.append(stripe, img, badge, overlay, meta);
     card.addEventListener("click", e => onCardClick(e, idx, card));
@@ -364,6 +403,131 @@ $("reject-all-btn").addEventListener("click", () => {
   syncCardClasses();
   updateSessionButtons();
   updateBulkSummary();
+});
+
+// ── Frame-quality histogram ───────────────────────────────────────────────────
+
+const QUALITY_BATCH = 20;   // frames per /api/comet/quality request
+const QUALITY_BINS  = 30;
+
+async function fetchQualityScores() {
+  const gen   = state.scanGen;
+  const files = state.allFiles;
+  if (!files.length) return;
+  state.qualityMax = null;
+  files.forEach(f => { f.quality = undefined; });
+
+  $("quality-panel").style.display  = "block";
+  $("quality-threshold").disabled   = true;
+  $("apply-threshold-btn").disabled = true;
+  $("quality-histogram").innerHTML  = "";
+  $("quality-progress").textContent = `scoring 0 / ${files.length}…`;
+
+  for (let i = 0; i < files.length; i += QUALITY_BATCH) {
+    if (gen !== state.scanGen) return;   // a new scan started — abandon
+    const batch = files.slice(i, i + QUALITY_BATCH);
+    try {
+      const res = await fetch("/api/comet/quality", {
+        method:  "POST",
+        headers: {"Content-Type": "application/json"},
+        body:    JSON.stringify({paths: batch.map(f => f.path)}),
+      });
+      const scores = (await res.json()).scores || {};
+      batch.forEach(f => { f.quality = scores[f.path] ?? null; });
+    } catch (_) {
+      batch.forEach(f => { f.quality = null; });
+    }
+    if (gen !== state.scanGen) return;
+    const done = Math.min(i + QUALITY_BATCH, files.length);
+    $("quality-progress").textContent = `scoring ${done} / ${files.length}…`;
+    refreshQualityUI();
+  }
+  if (gen !== state.scanGen) return;
+  $("quality-progress").textContent = `${files.length} frames scored`;
+  $("quality-threshold").disabled = false;
+  refreshQualityUI();
+}
+
+function _qualityPct(f) {
+  return (f.quality != null && state.qualityMax > 0)
+    ? Math.round(f.quality / state.qualityMax * 100) : null;
+}
+
+function refreshQualityUI() {
+  const scored = state.allFiles.filter(f => f.quality != null);
+  state.qualityMax = scored.length ? Math.max(...scored.map(f => f.quality)) : null;
+  renderQualityHistogram();
+  state.allFiles.forEach((f, idx) => {
+    const el = document.querySelector(`.comet-thumb-card[data-idx="${idx}"] .thumb-quality`);
+    if (!el) return;
+    const pct = _qualityPct(f);
+    if (pct == null) { el.textContent = ""; return; }
+    el.textContent = `Q${pct}`;
+    el.classList.toggle("q-good", pct >= 70);
+    el.classList.toggle("q-mid",  pct >= 40 && pct < 70);
+    el.classList.toggle("q-poor", pct < 40);
+  });
+  updateThresholdPreview();
+}
+
+function renderQualityHistogram() {
+  const hist = $("quality-histogram");
+  hist.innerHTML = "";
+  if (!state.qualityMax) return;
+  const counts = new Array(QUALITY_BINS).fill(0);
+  state.allFiles.forEach(f => {
+    const pct = _qualityPct(f);
+    if (pct == null) return;
+    const bin = Math.min(QUALITY_BINS - 1, Math.floor(pct / 100 * QUALITY_BINS));
+    counts[bin]++;
+  });
+  const maxCount = Math.max(...counts, 1);
+  counts.forEach((c, b) => {
+    const bar = document.createElement("div");
+    bar.className    = "quality-bar";
+    bar.style.height = (c / maxCount * 100) + "%";
+    const lo = Math.round(b / QUALITY_BINS * 100);
+    const hi = Math.round((b + 1) / QUALITY_BINS * 100);
+    bar.title = `${lo}–${hi}%: ${c} frame${c !== 1 ? "s" : ""}`;
+    hist.appendChild(bar);
+  });
+}
+
+function updateThresholdPreview() {
+  const v     = parseInt($("quality-threshold").value);
+  const valEl = $("quality-threshold-val");
+  if (!state.qualityMax || v <= 0) {
+    valEl.textContent = "off";
+    $("apply-threshold-btn").disabled = true;
+  } else {
+    const n = state.allFiles.filter(f => {
+      const pct = _qualityPct(f);
+      return pct != null && pct < v && !state.rejected.has(f.path);
+    }).length;
+    valEl.textContent = `${v}% — rejects ${n} more`;
+    $("apply-threshold-btn").disabled = n === 0;
+  }
+  // Tint histogram bars below the threshold (by bin midpoint)
+  const bars = $("quality-histogram").children;
+  for (let b = 0; b < bars.length; b++) {
+    const mid = (b + 0.5) / QUALITY_BINS * 100;
+    bars[b].classList.toggle("below", v > 0 && mid < v);
+  }
+}
+
+$("quality-threshold").addEventListener("input", updateThresholdPreview);
+
+$("apply-threshold-btn").addEventListener("click", () => {
+  const v = parseInt($("quality-threshold").value);
+  if (v <= 0 || !state.qualityMax) return;
+  state.allFiles.forEach(f => {
+    const pct = _qualityPct(f);
+    if (pct != null && pct < v) state.rejected.add(f.path);
+  });
+  syncCardClasses();
+  updateSessionButtons();
+  updateBulkSummary();
+  updateThresholdPreview();
 });
 
 // ── Step 2: Parameters ────────────────────────────────────────────────────────

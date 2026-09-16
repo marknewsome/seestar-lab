@@ -131,7 +131,7 @@
       <!-- Manual directory + scan -->
       <div class="dir-row">
         <input id="comet-dir" class="dir-input" type="text"
-               placeholder="select a comet above, or type a path" />
+               placeholder="select a comet above, or type a path (separate multiple nights with ;)" />
         <button class="btn btn-primary" id="scan-btn">Scan</button>
       </div>
 
@@ -143,6 +143,22 @@
         <button class="btn btn-sm" id="reject-all-btn">Reject All</button>
         <span class="bulk-hint">Shift+click to select a range</span>
         <span class="bulk-summary" id="bulk-summary"></span>
+      </div>
+
+      <!-- Frame-quality histogram (populated by JS after scan) -->
+      <div class="quality-panel" id="quality-panel" style="display:none;">
+        <div class="quality-panel-header">
+          <span class="quality-title">Frame quality — sharpness</span>
+          <span class="quality-progress" id="quality-progress"></span>
+        </div>
+        <div class="quality-histogram" id="quality-histogram"></div>
+        <div class="quality-controls">
+          <label class="quality-thresh-label" for="quality-threshold">Reject below</label>
+          <input type="range" id="quality-threshold" min="0" max="95" step="1" value="0" disabled />
+          <span class="quality-thresh-val" id="quality-threshold-val">off</span>
+          <button class="btn btn-sm" id="apply-threshold-btn" disabled>Apply</button>
+          <span class="quality-hint">scores are relative to the sharpest frame in this scan</span>
+        </div>
       </div>
 
       <!-- Session filter bar (rendered by JS) -->

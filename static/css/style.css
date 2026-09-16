@@ -1899,6 +1899,96 @@ main {
   font-size: 0.78rem;
   color: var(--text-muted);
 }
+.pick-check {
+  margin-right: 0.6rem;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.pick-name-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.comet-pick-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.45rem 0.85rem;
+  border-top: 1px solid var(--border);
+}
+.pick-footer-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Frame-quality histogram panel */
+.quality-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 0.9rem;
+}
+.quality-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+.quality-title {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.quality-progress {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.quality-histogram {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 70px;
+  margin-bottom: 0.55rem;
+}
+.quality-bar {
+  flex: 1;
+  background: var(--accent);
+  opacity: 0.75;
+  border-radius: 2px 2px 0 0;
+  min-height: 2px;
+  transition: background var(--transition);
+}
+.quality-bar.below { background: #b91c1c; }
+.quality-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+#quality-threshold { width: 180px; }
+.quality-thresh-label, .quality-thresh-val {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.quality-thresh-val { min-width: 9.5em; }
+.quality-hint {
+  margin-left: auto;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Per-thumb quality badge */
+.thumb-quality { font-size: 0.62rem; font-weight: 700; }
+.thumb-quality.q-good { color: #4ade80; }
+.thumb-quality.q-mid  { color: #fbbf24; }
+.thumb-quality.q-poor { color: #f87171; }
 .picker-loading, .picker-empty, .picker-error {
   display: block;
   padding: 0.6rem 0.85rem;
@@ -3603,6 +3693,12 @@ select.lw-param-input { width: auto; text-align: left; }
 .cap-saved-info a {
   color: #5599ff;
   margin-left: 0.5rem;
+}
+
+.cap-rec-warn {
+  color: #fcd34d;
+  font-size: 0.75rem;
+  margin-left: 0.4rem;
 }
 
 /* ── Recordings section ──────────────────────────────────────────────────── */

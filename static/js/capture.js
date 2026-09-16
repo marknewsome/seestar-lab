@@ -140,6 +140,59 @@ function renderCard(stream) {
     }
   });
 
+  // ── Recording UI state helpers ─────────────────────────────────────────────
+  // Persist recId with the stream in localStorage so a page refresh can
+  // rebind to the live server-side recording instead of losing control of it.
+  function persistRecId(recId) {
+    const streams = loadStreams();
+    const s = streams.find(x => x.id === id);
+    if (!s) return;
+    if (recId) s.recId = recId; else delete s.recId;
+    saveStreams(streams);
+  }
+
+  function setRecordingActive(recId, elapsedS) {
+    const state = cardState[id];
+    state.recId = recId;
+    state.recStart = Date.now() - (elapsedS || 0) * 1000;
+    recDot.style.display = "";
+    recBtn.textContent = "⏹ Stop";
+    recBtn.disabled = false;
+    savedInfo.style.display = "none";
+    persistRecId(recId);
+    clearInterval(state.recTimer);
+    state.recTimer = setInterval(() => {
+      recStatus.textContent = fmtElapsed((Date.now() - state.recStart) / 1000);
+    }, 1000);
+    startPolling();
+  }
+
+  function finishRecordingUI(info, message) {
+    const state = cardState[id];
+    clearInterval(state.recTimer);
+    state.recId = null;
+    state.recStart = null;
+    state.recTimer = null;
+    persistRecId(null);
+    recDot.style.display = "none";
+    recStatus.textContent = message || "";
+    recBtn.textContent = "⏺ Record";
+    recBtn.disabled = !state.connected;
+    checkStopPolling();
+    if (info && info.out_path) {
+      const fname = info.out_path.split("/").pop();
+      const size  = fmtBytes(info.size_bytes || 0);
+      const warn  = info.error ? ` <span class="cap-rec-warn">${escHtml(info.error)}</span>` : "";
+      savedInfo.innerHTML = `Saved: <strong>${escHtml(fname)}</strong> (${size})
+        <a href="/api/solar/output?path=${encodeURIComponent(info.out_path)}" target="_blank">Download</a>${warn}`;
+      savedInfo.style.display = "";
+      showRecordingsSection(info.out_path, fname, size);
+    }
+  }
+
+  cardState[id].setRecordingActive = setRecordingActive;
+  cardState[id].finishRecordingUI  = finishRecordingUI;
+
   // ── Record / Stop ──────────────────────────────────────────────────────────
   recBtn.addEventListener("click", async () => {
     const state = cardState[id];
@@ -153,26 +206,13 @@ function renderCard(stream) {
           body: JSON.stringify({ rec_id: state.recId }),
         });
         const data = await res.json();
-        clearInterval(state.recTimer);
-        state.recId = null;
-        state.recStart = null;
-        state.recTimer = null;
-        recDot.style.display = "none";
-        recStatus.textContent = "";
-        recBtn.textContent = "⏺ Record";
-        recBtn.disabled = false;
-        checkStopPolling();
-
-        // Show saved info
-        const fname = data.out_path ? data.out_path.split("/").pop() : "";
-        const size  = data.size_bytes ? fmtBytes(data.size_bytes) : "";
-        savedInfo.innerHTML = `Saved: <strong>${escHtml(fname)}</strong> (${size})
-          <a href="/api/solar/output?path=${encodeURIComponent(data.out_path)}" target="_blank">Download</a>`;
-        savedInfo.style.display = "";
-        showRecordingsSection(data.out_path, fname, size);
+        if (!res.ok || data.error && !data.out_path) {
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+        finishRecordingUI(data, "");
       } catch (e) {
         recBtn.disabled = false;
-        recStatus.textContent = "Stop failed";
+        recStatus.textContent = "Stop failed: " + e.message;
       }
     } else {
       // Start
@@ -186,21 +226,8 @@ function renderCard(stream) {
           body: JSON.stringify({ rtsp_url: streamUrl, name: streamName }),
         });
         const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        state.recId = data.rec_id;
-        state.recStart = Date.now();
-        recDot.style.display = "";
-        recBtn.textContent = "⏹ Stop";
-        recBtn.disabled = false;
-        savedInfo.style.display = "none";
-
-        // Client-side elapsed clock
-        state.recTimer = setInterval(() => {
-          const elapsed = (Date.now() - state.recStart) / 1000;
-          recStatus.textContent = fmtElapsed(elapsed);
-        }, 1000);
-
-        startPolling();
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+        setRecordingActive(data.rec_id, 0);
       } catch (e) {
         recBtn.disabled = false;
         recStatus.textContent = "Start failed: " + e.message;
@@ -266,24 +293,57 @@ function checkStopPolling() {
 
 async function pollStatus() {
   try {
-    const res  = await fetch("/api/capture/record/status");
-    const list = await res.json();
-    // Update size display for each active recording
-    for (const rec of list) {
-      // Find card for this rec
-      for (const [streamId, state] of Object.entries(cardState)) {
-        if (state.recId === rec.id) {
-          const card = document.querySelector(`.cap-card[data-stream-id="${streamId}"]`);
-          if (card) {
-            const recStatus = card.querySelector(".cap-rec-status");
-            const elapsed = (Date.now() - state.recStart) / 1000;
-            recStatus.textContent = `${fmtElapsed(elapsed)} · ${fmtBytes(rec.size_bytes)}`;
-          }
+    const res    = await fetch("/api/capture/record/status");
+    const data   = await res.json();
+    const active = data.active || [];
+    const ended  = data.ended  || [];
+
+    for (const [streamId, state] of Object.entries(cardState)) {
+      if (!state.recId) continue;
+      const rec = active.find(r => r.id === state.recId);
+      if (rec) {
+        const card = document.querySelector(`.cap-card[data-stream-id="${streamId}"]`);
+        if (card) {
+          const recStatus = card.querySelector(".cap-rec-status");
+          const elapsed = (Date.now() - state.recStart) / 1000;
+          recStatus.textContent = `${fmtElapsed(elapsed)} · ${fmtBytes(rec.size_bytes)}`;
         }
+      } else {
+        // Recording vanished from the active list — the stream dropped or
+        // ffmpeg died.  Surface it instead of ticking a frozen clock.
+        const e = ended.find(r => r.id === state.recId) || null;
+        state.finishRecordingUI(e, "⚠ Recording ended — stream lost");
       }
     }
   } catch {
     // ignore poll errors
+  }
+}
+
+// ── Rebind to server-side recordings after a page load ───────────────────────
+
+async function rebindRecordings() {
+  let data;
+  try {
+    const res = await fetch("/api/capture/record/status");
+    data = await res.json();
+  } catch {
+    return;
+  }
+  const active  = data.active || [];
+  const streams = loadStreams();
+  for (const s of streams) {
+    if (!s.recId) continue;
+    const st  = cardState[s.id];
+    const rec = active.find(r => r.id === s.recId);
+    if (rec && st) {
+      st.setRecordingActive(rec.id, rec.elapsed_s);
+    } else if (st) {
+      // Ended while this page was away; the server already finalised it.
+      st.finishRecordingUI(
+        (data.ended || []).find(r => r.id === s.recId) || null,
+        "Recording ended while away");
+    }
   }
 }
 
@@ -310,6 +370,10 @@ function init() {
     grid.appendChild(card);
     card.querySelector(".cap-url-input").focus();
   });
+
+  // Reattach to any recordings still running server-side (page refresh,
+  // browser restart, or even a Flask restart — recordings are DB-backed).
+  rebindRecordings();
 }
 
 document.addEventListener("DOMContentLoaded", init);

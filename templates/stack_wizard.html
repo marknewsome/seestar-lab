@@ -319,6 +319,9 @@
       <span style="color:var(--text)">{{ job.frames_accepted or 0 }} / {{ job.frames_total or '?' }} frames</span>
     </div>
     {% endif %}
+    <div style="font-size:0.72rem;margin-bottom:0.5rem">
+      <a href="/stack/quality/{{ session_name | urlencode }}">View per-frame quality report →</a>
+    </div>
 
     <!-- ── Presets ─────────────────────────────────────────────────────────── -->
     <div class="sw-title">Presets</div>
@@ -453,6 +456,18 @@
              value="{{ defaults.chroma_sig }}" />
     </div>
     <p class="sw-hint">Higher = smoother colors but stars lose hue. 31/10 is a safe default.</p>
+
+    <!-- ── Colour ─────────────────────────────────────────────────────────── -->
+    <div class="sw-title">Colour</div>
+
+    <div class="sw-row">
+      <label class="sw-label">
+        Saturation
+        <span class="sw-sub">1.0 = unchanged · 1.2–1.5 typical boost</span>
+      </label>
+      <input id="inp-saturation" class="sw-input" type="number" min="0" max="3" step="0.05"
+             value="{{ defaults.saturation }}" />
+    </div>
 
     <!-- ── Actions ────────────────────────────────────────────────────────── -->
     <div class="sw-title">Actions</div>
@@ -666,6 +681,7 @@ const DEFAULTS = {
   unsharpSig:  {{ defaults.unsharp_sig | float }},
   chromaK:     {{ defaults.chroma_k | int }},
   chromaSig:   {{ defaults.chroma_sig | float }},
+  saturation:  {{ defaults.saturation | float }},
 };
 
 function getParams() {
@@ -682,6 +698,7 @@ function getParams() {
     unsharp_sig:  parseFloat(document.getElementById('inp-unsharp-sig').value),
     chroma_k:     parseInt(document.getElementById('inp-chroma-k').value),
     chroma_sig:   parseFloat(document.getElementById('inp-chroma-sig').value),
+    saturation:   parseFloat(document.getElementById('inp-saturation').value),
   };
 }
 
@@ -698,6 +715,7 @@ function resetDefaults() {
   document.getElementById('inp-unsharp-sig').value  = DEFAULTS.unsharpSig;
   document.getElementById('inp-chroma-k').value    = DEFAULTS.chromaK;
   document.getElementById('inp-chroma-sig').value  = DEFAULTS.chromaSig;
+  document.getElementById('inp-saturation').value  = DEFAULTS.saturation;
 }
 
 // ── Running state ─────────────────────────────────────────────────────────────
@@ -865,7 +883,7 @@ function showInfoStrip(accepted, total) {
   paramsEl.textContent =
     `bg=${p.bg_mesh_scale} · Q=${p.stretch_q} · blk=${p.black_pct}% · wht=${p.white_pct}% · ` +
     `luma ${p.luma_k}×${p.luma_k}/σ${p.luma_sig} · unsharp ${p.unsharp_gain}/σ${p.unsharp_sig} · ` +
-    `chroma ${p.chroma_k}×${p.chroma_k}/σ${p.chroma_sig}`;
+    `chroma ${p.chroma_k}×${p.chroma_k}/σ${p.chroma_sig} · sat ${p.saturation}`;
   document.getElementById('sw-info').style.display = '';
 }
 
@@ -876,6 +894,7 @@ const PARAM_LABELS = {
   bg_mesh_scale:'bg scale', stretch_q:'Q', black_pct:'black%', white_pct:'white%',
   luma_k:'luma k', luma_sig:'luma σ', unsharp_gain:'unsharp gain',
   unsharp_sig:'unsharp σ', chroma_k:'chroma k', chroma_sig:'chroma σ',
+  saturation:'saturation',
 };
 
 function snapshotParams() {
@@ -890,6 +909,7 @@ function doRevert() {
     luma_k:'inp-luma-k', luma_sig:'inp-luma-sig',
     unsharp_gain:'inp-unsharp-gain', unsharp_sig:'inp-unsharp-sig',
     chroma_k:'inp-chroma-k', chroma_sig:'inp-chroma-sig',
+    saturation:'inp-saturation',
   };
   for (const [k, id] of Object.entries(MAP)) {
     if (previousParams[k] != null) {
@@ -1015,6 +1035,7 @@ function applyPreset(name) {
     luma_k:        'inp-luma-k',       luma_sig:      'inp-luma-sig',
     unsharp_gain:  'inp-unsharp-gain', unsharp_sig:   'inp-unsharp-sig',
     chroma_k:      'inp-chroma-k',     chroma_sig:    'inp-chroma-sig',
+    saturation:    'inp-saturation',
   };
   for (const [k, id] of Object.entries(MAP)) {
     if (p[k] != null) {
@@ -1177,7 +1198,7 @@ function showAnalysis(a, currentParams) {
     bg_mesh_scale: 'bg scale', stretch_q: 'Q', black_pct: 'black %',
     white_pct: 'white %', luma_k: 'luma k', luma_sig: 'luma σ',
     unsharp_gain: 'unsharp gain', unsharp_sig: 'unsharp σ',
-    chroma_k: 'chroma k', chroma_sig: 'chroma σ',
+    chroma_k: 'chroma k', chroma_sig: 'chroma σ', saturation: 'saturation',
   };
   const chips = Object.entries(_pendingSuggestions)
     .filter(([, v]) => v != null)
@@ -1221,6 +1242,7 @@ function applyAnalysis() {
     unsharp_sig:   'inp-unsharp-sig',
     chroma_k:      'inp-chroma-k',
     chroma_sig:    'inp-chroma-sig',
+    saturation:    'inp-saturation',
   };
   for (const [k, v] of Object.entries(_pendingSuggestions)) {
     if (v != null && MAP[k]) {
