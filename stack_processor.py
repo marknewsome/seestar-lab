@@ -189,6 +189,28 @@ def _read_fits(path: str) -> tuple[np.ndarray, dict]:
     return np.clip(physical, 0, 65535).astype(np.uint16), header
 
 
+def _read_fits_header(path: str) -> dict:
+    """Read only a FITS file's header, without loading the pixel payload.
+
+    Much cheaper than _read_fits() when only metadata (e.g. CCD-TEMP,
+    DATE-OBS) is needed — avoids reading/allocating the ~4MB pixel array
+    per frame, which matters when sampling many files across a session.
+    """
+    with open(path, 'rb') as f:
+        raw_header = b''
+        found_end  = False
+        while not found_end:
+            block = f.read(2880)
+            if not block:
+                break
+            raw_header += block
+            for i in range(0, len(block), 80):
+                if block[i:i + 3] == b'END':
+                    found_end = True
+                    break
+    return _parse_fits_header(raw_header)
+
+
 # ── Quality assessment ─────────────────────────────────────────────────────────
 
 def _sharpness(raw_bayer: np.ndarray) -> float:
@@ -488,6 +510,86 @@ def score_session_frames(
                         f"Stage B: {bi + 1}/{len(stage_a_indices)}")
 
     return results
+
+
+# ── Sensor temperature survey ──────────────────────────────────────────────────
+
+# Seestar has no active sensor cooling; CCD-TEMP (recorded per-frame) drives
+# the stacked-image noise floor directly — a session captured near 9°C
+# reproducibly stacks far cleaner than one captured near 20-30°C. See
+# STACKING_RECIPE.md for the measurements behind this.
+_TEMP_WARN_C = 18.0   # mean CCD-TEMP above this: flag as likely-noisy in the UI
+
+_DATE_RE = re.compile(r'(\d{8})-\d{6}')
+
+
+def survey_session_temps(
+    fits_files:  list[str],
+    per_night_sample: int = 8,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> dict:
+    """
+    Group a session's FITS files by capture night (from the YYYYMMDD in each
+    filename) and sample CCD-TEMP from a handful of frames per night —
+    header-only reads, no pixel data, so this stays fast even on
+    multi-thousand-frame sessions.
+
+    Returns {
+      'nights': [{'date': 'YYYY-MM-DD', 'frame_count': int,
+                  'temp_mean': float, 'temp_min': float, 'temp_max': float,
+                  'warn': bool}, ...]  (sorted oldest to newest),
+      'overall_mean': float | None,
+    }
+    Nights with no readable CCD-TEMP are omitted from 'nights' but still
+    counted in the session; frame_count reflects ALL files that date, not
+    just the sampled ones used for the temperature reading.
+    """
+    by_date: dict[str, list[str]] = {}
+    for fpath in fits_files:
+        m = _DATE_RE.search(os.path.basename(fpath))
+        date_key = m.group(1) if m else 'unknown'
+        by_date.setdefault(date_key, []).append(fpath)
+
+    dates = sorted(by_date.keys())
+    nights = []
+    all_temps: list[float] = []
+
+    for i, date_key in enumerate(dates):
+        files = by_date[date_key]
+        # evenly spaced sample across this night's files
+        n = min(per_night_sample, len(files))
+        idxs = sorted(set(int(j * (len(files) - 1) / max(n - 1, 1)) for j in range(n)))
+        temps: list[float] = []
+        for idx in idxs:
+            try:
+                hdr = _read_fits_header(files[idx])
+                t = hdr.get('CCD-TEMP')
+                if t is not None:
+                    temps.append(float(t))
+            except Exception:
+                pass
+
+        if temps:
+            mean_t = float(np.mean(temps))
+            nights.append({
+                'date':        f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                                if date_key != 'unknown' else 'unknown',
+                'frame_count': len(files),
+                'temp_mean':   round(mean_t, 1),
+                'temp_min':    round(min(temps), 1),
+                'temp_max':    round(max(temps), 1),
+                'warn':        mean_t > _TEMP_WARN_C,
+            })
+            all_temps.extend(temps)
+
+        if progress_cb:
+            progress_cb(int(100 * (i + 1) / len(dates)),
+                        f"Sampling night {i + 1}/{len(dates)}: {date_key}")
+
+    return {
+        'nights':       nights,
+        'overall_mean': round(float(np.mean(all_temps)), 1) if all_temps else None,
+    }
 
 
 # ── Weighted sigma-clipped integration ────────────────────────────────────────
