@@ -936,6 +936,28 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
         if os.path.isfile(expected) and expected != jpeg_path:
             os.replace(expected, jpeg_path)
 
+        # Chroma-only denoise on the stretched JPEG. Siril's autostretch
+        # path has no color noise reduction of its own (unlike the Python
+        # fallback pipeline's _denoise_sharpen); on warm-sensor sessions
+        # residual per-channel noise reads visually as color speckle even
+        # though luminance noise (the dominant, largely capture-limited
+        # component) is unaffected. Confirmed 2026-09-16 on NGC 7000
+        # (20.5C session): Cr/Cb std roughly halved (7.0/6.3 -> 3.1/2.4),
+        # luma essentially unchanged (46.85 -> 46.82) — real, visible
+        # reduction in color mottling without touching brightness noise.
+        try:
+            img = cv2.imread(jpeg_path)
+            if img is not None:
+                ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+                y, cr, cb = cv2.split(ycrcb)
+                cr = cv2.GaussianBlur(cr, (_CHROMA_BLUR_K, _CHROMA_BLUR_K), _CHROMA_BLUR_SIG)
+                cb = cv2.GaussianBlur(cb, (_CHROMA_BLUR_K, _CHROMA_BLUR_K), _CHROMA_BLUR_SIG)
+                out = cv2.cvtColor(cv2.merge([y, cr, cb]), cv2.COLOR_YCrCb2BGR)
+                cv2.imwrite(jpeg_path, out, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        except Exception as exc:
+            import logging
+            logging.warning(f"Chroma denoise on Siril preview failed: {exc}")
+
         return True
 
     except Exception as exc:
