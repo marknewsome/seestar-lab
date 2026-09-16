@@ -236,28 +236,33 @@ darks/bias calibration, which is the most likely explanation) is not
 directly reproducible from available data — worth investigating if pursuing
 this further, but not yet solved.
 
-## Known issue: chroma-blur color shift (as of this writing, unresolved)
+## Chroma denoising on the Siril autostretch path
 
 Siril's own `autostretch` path has no color-noise reduction — on a
 warm-sensor session, residual per-channel noise reads visually as colorful
 speckle even though the underlying luminance noise (the larger, genuinely
-capture-limited component) is separate. A straightforward fix — Gaussian
-blur on the Cr/Cb channels in 8-bit YCrCb space, applied to the final
-stretched JPEG — measurably helps (chroma std roughly halved to fully
-halved depending on how noisy the source was) and visibly improves the
-image. **But it introduces a real color-channel shift of its own** in dark
-background regions: a corner patch that was correctly neutral (or even
-G-lowest) before the blur can come out with G as the *highest* channel
-afterward — a visible green tint. Root cause not yet confirmed, but the
-leading theory is 8-bit YCrCb's clipping/rounding behavior on near-zero
-background pixels during the blur+round-trip; the fix is likely to blur in
-float32 (converting to/from YCrCb without the intermediate uint8 clip) or a
-different color space (Lab) rather than the current uint8 approach. Always
-validate any change to this step by checking per-corner channel ordering in
-dark background patches against a known-good baseline — an average σ
-number improving is not sufficient to confirm this class of bug is fixed,
-since a color shift and a noise reduction can both move σ in the same
-direction while one of them is a real regression.
+capture-limited component) is separate. The fix: Gaussian blur on the Cr/Cb
+channels in 8-bit YCrCb space, applied to the final stretched JPEG,
+measurably reduces chroma noise (roughly halved to more than halved
+depending on how noisy the source was) without materially affecting
+luminance — confirmed on two independent targets.
+
+An apparent "color-channel shift" was suspected during initial testing (a
+corner patch that should have stayed neutral appeared to gain a green tint
+after the blur) but this was a **test-methodology mistake, not a real
+effect**: the comparison had accidentally been run against the pipeline's
+*pre-calibration* intermediate FITS (`<name>_linear.fits`, written before
+`_subtract_background`/`_color_calibrate` run — see "Pipeline overview"
+above) instead of the actual, fully-calibrated output FITS the real
+pipeline uses. Once corrected to compare against the right file, the
+chroma-blur output matched the no-blur baseline's color balance almost
+exactly (same channel ordering, sub-1-unit differences) while still
+delivering the real chroma-noise reduction. Confirmed via both a synthetic
+neutral-image test (blur alone introduces no measurable tint) and the
+corrected real-data comparison. **When testing any postprocess-stage
+change against saved intermediate files, always verify which file was
+actually loaded (log the path, don't assume) — this exact mistake recurred
+twice in one investigation before being caught for good.**
 
 ## Known issue: green tint on bright stars, separate from the chroma-blur bug
 
