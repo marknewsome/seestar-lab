@@ -877,6 +877,7 @@ def api_stack_rerender(session_name: str):
         _CHROMA_BLUR_K, _CHROMA_BLUR_SIG,
         _UNSHARP_GAIN, _UNSHARP_SIG, _SATURATION,
         _CORE_PROTECT, _CORE_PCT, _CORE_Q,
+        _STAR_REDUCE, _STAR_REDUCE_MAXR,
     )
     body = request.get_json(silent=True) or {}
     bg_mesh_scale = int(body.get("bg_mesh_scale",  20))
@@ -893,6 +894,8 @@ def api_stack_rerender(session_name: str):
     core_protect  = bool(body.get("core_protect",  _CORE_PROTECT))
     core_pct      = float(body.get("core_pct",     _CORE_PCT))
     core_Q        = float(body.get("core_Q",       _CORE_Q))
+    star_reduce      = max(0.0, min(1.0, float(body.get("star_reduce", _STAR_REDUCE))))
+    star_reduce_maxr = int(body.get("star_reduce_maxr", _STAR_REDUCE_MAXR))
 
     frames_total    = job.get("frames_total", 0) or 0
     frames_accepted = job.get("frames_accepted", 0) or 0
@@ -929,7 +932,9 @@ def api_stack_rerender(session_name: str):
                              saturation=saturation,
                              core_protect=core_protect,
                              core_pct=core_pct,
-                             core_Q=core_Q)
+                             core_Q=core_Q,
+                             star_reduce=star_reduce,
+                             star_reduce_maxr=star_reduce_maxr)
             db.finish_stack_job(session_name, output_path,
                                 frames_accepted, frames_total)
             _broadcast({"type": "stack_done", "session_name": session_name,

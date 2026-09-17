@@ -776,6 +776,75 @@ def _scnr_green(img: np.ndarray) -> np.ndarray:
     return result
 
 
+def _reduce_stars(img: np.ndarray, amount: float = 0.5, max_radius: int = 25) -> np.ndarray:
+    """
+    Shrink star PSFs on an already-stretched float32 BGR image in [0, 1] so
+    faint nebulosity reads more clearly without a dense star field competing
+    for attention. Detects real stars with SEP (same tool already used for
+    frame quality scoring and colour calibration elsewhere in this file) and
+    erodes each one toward the local background — this transforms genuine
+    star pixels from the stack, it does not delete, replace, or synthesise
+    anything.
+
+    amount: 0 = no change, 1 = maximum shrink (roughly halves apparent
+    radius for a typical star). max_radius: stars larger than this many
+    pixels (e.g. an oversaturated primary) are skipped — very large blobs
+    are usually a nebula core or a badly saturated star, not a point source,
+    and eroding them tends to look like a hole rather than a smaller star.
+    """
+    if amount <= 0:
+        return img
+
+    luma = (0.114 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.299 * img[:, :, 2]).astype(np.float64)
+    luma = np.ascontiguousarray(luma)
+    try:
+        import sep
+        # Dense star fields (e.g. Milky Way star-cloud targets like the Veil
+        # Nebula) can trip SEP's default 300,000-pixel active-object limit at
+        # thresh=5.0, since nearly every pixel is "above threshold" somewhere
+        # in a crowded frame. Raise it generously rather than let extract()
+        # raise and silently no-op the whole function on exactly the fields
+        # that most need star reduction — confirmed hitting the default limit
+        # on C34's 663-sub field, 2026-09-17.
+        sep.set_extract_pixstack(2_000_000)
+        bkg  = sep.Background(luma)
+        data = np.ascontiguousarray((luma - bkg.back()).astype(np.float64))
+        objs = sep.extract(data, thresh=5.0, err=bkg.globalrms, minarea=5)
+    except Exception:
+        return img
+    if len(objs) == 0:
+        return img
+
+    h, w = luma.shape
+    # Build one mask: for each detected star, a filled circle a bit larger
+    # than its own SEP semi-major axis — this is the region eroded toward
+    # background. Skipping objects bigger than max_radius leaves nebula
+    # cores / very large saturated blobs untouched.
+    star_mask = np.zeros((h, w), dtype=np.uint8)
+    for o in objs:
+        r = float(max(o['a'], o['b'])) * 2.2
+        if r > max_radius or r < 1.0:
+            continue
+        cv2.circle(star_mask, (int(round(o['x'])), int(round(o['y']))), int(round(r)), 255, -1)
+    if not np.any(star_mask):
+        return img
+
+    # Erosion kernel scales with `amount`; min-filtering each channel inside
+    # the star mask pulls the bright core inward toward the surrounding
+    # (dimmer) pixels, which reads as a smaller, tighter star.
+    k = max(3, int(round(amount * 7)) | 1)  # odd kernel size, grows with amount
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    eroded = np.empty_like(img)
+    for c in range(3):
+        eroded[:, :, c] = cv2.erode(img[:, :, c], kernel)
+
+    # Feather the mask edge so the transition isn't a hard circle boundary.
+    mask_f = cv2.GaussianBlur(star_mask.astype(np.float32) / 255.0, (0, 0), sigmaX=1.5)
+    mask_f = np.clip(mask_f * amount, 0.0, 1.0)[:, :, None]
+
+    return img * (1.0 - mask_f) + eroded * mask_f
+
+
 # ── Crop ──────────────────────────────────────────────────────────────────────
 
 def _auto_crop(img: np.ndarray, valid_mask: np.ndarray, margin: int = 12) -> np.ndarray:
@@ -808,6 +877,8 @@ _CHROMA_BLUR_SIG = 10   # chroma Gaussian sigma
 _UNSHARP_SIG    = 1.5   # unsharp mask blur sigma
 _UNSHARP_GAIN   = 1.35  # unsharp mask blend weight (1 + gain blends in sharpened detail)
 _SATURATION     = 1.0   # colour saturation multiplier (1.0 = unchanged)
+_STAR_REDUCE       = 0.0  # 0 = off, up to 1.0 = maximum star shrink (see _reduce_stars)
+_STAR_REDUCE_MAXR  = 25    # px; stars larger than this are skipped (nebula cores, saturated primaries)
 
 
 def _boost_saturation(img: np.ndarray, saturation: float) -> np.ndarray:
@@ -928,7 +999,11 @@ SIRIL_WIN_WORK_BASE = "/mnt/g/Temp"   # Windows-accessible temp root for Siril j
 
 
 def _siril_postprocess(fits_path: str, jpeg_path: str,
-                       progress_cb: Optional[Callable] = None) -> bool:
+                       progress_cb: Optional[Callable] = None,
+                       shadowsclip: float = -2.00,
+                       targetbg:    float = 0.15,
+                       chroma_k:    int   = _CHROMA_BLUR_K,
+                       chroma_sig:  float = _CHROMA_BLUR_SIG) -> bool:
     """
     Call the Windows Siril CLI to produce a finished JPEG from a linear FITS.
 
@@ -936,6 +1011,12 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
     denoising are applied upstream (in _siril_full_stack) on the linear FITS
     before this function is called.  Falls back silently to our own preview
     pipeline if Siril is not installed or the script fails.
+
+    shadowsclip/targetbg are Siril's own autostretch controls (sigma units
+    from the histogram peak / target background level — see the defaults'
+    rationale below); chroma_k/chroma_sig control the post-stretch chroma
+    denoise, matching the Python pipeline's equivalent knob so the Wizard's
+    sliders mean the same thing regardless of which stretch path ran.
 
     Returns True if Siril succeeded, False if fallback is needed.
     """
@@ -979,7 +1060,7 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
     script = (
         'requires 1.2.0\n'
         f'load "{fits_win}"\n'
-        'autostretch -linked -2.00 0.15\n'
+        f'autostretch -linked {shadowsclip:.2f} {targetbg:.2f}\n'
         f'savejpg "{jpeg_win}" 95\n'
     )
 
@@ -1022,8 +1103,8 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
             if img is not None:
                 ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
                 y, cr, cb = cv2.split(ycrcb)
-                cr = cv2.GaussianBlur(cr, (_CHROMA_BLUR_K, _CHROMA_BLUR_K), _CHROMA_BLUR_SIG)
-                cb = cv2.GaussianBlur(cb, (_CHROMA_BLUR_K, _CHROMA_BLUR_K), _CHROMA_BLUR_SIG)
+                cr = cv2.GaussianBlur(cr, (chroma_k, chroma_k), chroma_sig)
+                cb = cv2.GaussianBlur(cb, (chroma_k, chroma_k), chroma_sig)
                 out = cv2.cvtColor(cv2.merge([y, cr, cb]), cv2.COLOR_YCrCb2BGR)
                 cv2.imwrite(jpeg_path, out, [cv2.IMWRITE_JPEG_QUALITY, 95])
         except Exception as exc:
@@ -2129,7 +2210,9 @@ def rerender_preview(fits_path: str, jpeg_path: str,
                      saturation:    float = _SATURATION,
                      core_protect:  bool  = _CORE_PROTECT,
                      core_pct:      float = _CORE_PCT,
-                     core_Q:        float = _CORE_Q) -> str:
+                     core_Q:        float = _CORE_Q,
+                     star_reduce:      float = _STAR_REDUCE,
+                     star_reduce_maxr: int   = _STAR_REDUCE_MAXR) -> str:
     """
     Regenerate the preview JPEG from an already-stacked FITS file without
     re-running frame alignment.  All post-processing parameters are tunable.
@@ -2172,7 +2255,6 @@ def rerender_preview(fits_path: str, jpeg_path: str,
             pass
 
     if has_linear:
-        # Full Python pipeline on the pre-bg-subtraction linear data
         progress_cb(10, "Background subtraction", 0, 0)
         bgr = _subtract_background(bgr, mesh_scale=bg_mesh_scale)
         bgr = np.clip(bgr, 0.0, None)
@@ -2186,22 +2268,78 @@ def rerender_preview(fits_path: str, jpeg_path: str,
         progress_cb(60, "SCNR green suppression", 0, 0)
         bgr = _scnr_green(bgr)
 
-        progress_cb(75, "Auto-stretch", 0, 0)
-        preview = _auto_stretch(bgr, Q=stretch_q, black_pct=black_pct, white_pct=white_pct,
-                                core_protect=core_protect, core_pct=core_pct, core_Q=core_Q)
-        preview = _boost_saturation(preview, saturation)
+        # Prefer Siril's own autostretch (histogram-transform-function based)
+        # over the Python asinh curve — it is the same stretch the ORIGINAL
+        # full-stack job uses (_siril_full_stack -> _siril_postprocess), and
+        # confirmed materially better at preserving faint, low-contrast
+        # structure (e.g. filamentary targets like the Veil Nebula: Siril
+        # recovered detail the Python asinh curve nearly erased, 2026-09-17).
+        # core_protect is Python-only (no Siril equivalent), so fall back to
+        # the Python path whenever it's requested; also fall back whenever
+        # Siril itself is unavailable or the CLI call fails.
+        siril_ok = False
+        if not core_protect:
+            # Map the Wizard's Python-stretch sliders onto Siril's own
+            # autostretch controls so they stay meaningful on this path
+            # instead of silently doing nothing. Approximate, not exact —
+            # the two curves aren't the same shape — but keeps the sliders
+            # live rather than dead controls whenever Siril runs.
+            #   targetbg    ~ black_pct's 0-90 range  -> Siril's 0.05-0.30
+            #   shadowsclip ~ stretch_q's 1-30 range   -> Siril's -0.5..-2.8
+            # white_pct has no Siril equivalent (autostretch has no white-
+            # point percentile control) and is ignored on this path.
+            targetbg    = 0.05 + (max(0.0, min(90.0, black_pct)) / 90.0) * 0.25
+            shadowsclip = -0.5 - (max(1.0, min(30.0, stretch_q)) - 1.0) / 29.0 * 2.3
 
-        progress_cb(88, "Noise reduction and sharpening", 0, 0)
-        preview_u8 = (preview * 255).astype(np.uint8)
-        preview_u8 = _denoise_sharpen(preview_u8,
-                                      luma_k=luma_k, luma_sig=luma_sig,
-                                      chroma_k=chroma_k, chroma_sig=chroma_sig,
-                                      unsharp_gain=unsharp_gain, unsharp_sig=unsharp_sig)
+            tmp_fits = str(Path(jpeg_path).with_name(
+                Path(jpeg_path).stem + '_rerender_tmp.fits'))
+            try:
+                _write_fits(tmp_fits, bgr, 'rerender_tmp')
+                progress_cb(70, "Siril autostretch", 0, 0)
+                siril_ok = _siril_postprocess(
+                    tmp_fits, jpeg_path,
+                    progress_cb=lambda p, msg, *_a: progress_cb(70 + int(p * 0.15), msg, 0, 0),
+                    shadowsclip=shadowsclip, targetbg=targetbg,
+                    chroma_k=chroma_k, chroma_sig=chroma_sig,
+                )
+            finally:
+                try:
+                    os.unlink(tmp_fits)
+                except OSError:
+                    pass
 
-        progress_cb(97, "Saving JPEG", 0, 0)
-        ok = cv2.imwrite(jpeg_path, preview_u8[::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
-        if not ok:
-            raise RuntimeError(f"Failed to write JPEG to {jpeg_path}")
+            if siril_ok and star_reduce > 0:
+                # Siril already wrote the JPEG; star reduction needs to run
+                # on those pixels, so reload, apply, and re-save.
+                progress_cb(90, "Reducing stars", 0, 0)
+                img = cv2.imread(jpeg_path)
+                if img is not None:
+                    preview = _reduce_stars(img[::-1].astype(np.float32) / 255.0,
+                                            amount=star_reduce, max_radius=star_reduce_maxr)
+                    preview_u8 = np.clip(preview * 255.0, 0, 255).astype(np.uint8)
+                    cv2.imwrite(jpeg_path, preview_u8[::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        if not siril_ok:
+            progress_cb(75, "Auto-stretch", 0, 0)
+            preview = _auto_stretch(bgr, Q=stretch_q, black_pct=black_pct, white_pct=white_pct,
+                                    core_protect=core_protect, core_pct=core_pct, core_Q=core_Q)
+            preview = _boost_saturation(preview, saturation)
+
+            if star_reduce > 0:
+                progress_cb(82, "Reducing stars", 0, 0)
+                preview = _reduce_stars(preview, amount=star_reduce, max_radius=star_reduce_maxr)
+
+            progress_cb(88, "Noise reduction and sharpening", 0, 0)
+            preview_u8 = (preview * 255).astype(np.uint8)
+            preview_u8 = _denoise_sharpen(preview_u8,
+                                          luma_k=luma_k, luma_sig=luma_sig,
+                                          chroma_k=chroma_k, chroma_sig=chroma_sig,
+                                          unsharp_gain=unsharp_gain, unsharp_sig=unsharp_sig)
+
+            progress_cb(97, "Saving JPEG", 0, 0)
+            ok = cv2.imwrite(jpeg_path, preview_u8[::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if not ok:
+                raise RuntimeError(f"Failed to write JPEG to {jpeg_path}")
         progress_cb(100, "Done", 0, 0)
         return jpeg_path
 
