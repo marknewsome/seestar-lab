@@ -876,6 +876,7 @@ def api_stack_rerender(session_name: str):
         _LUMA_BLUR_K, _LUMA_BLUR_SIG,
         _CHROMA_BLUR_K, _CHROMA_BLUR_SIG,
         _UNSHARP_GAIN, _UNSHARP_SIG, _SATURATION,
+        _CORE_PROTECT, _CORE_PCT, _CORE_Q,
     )
     body = request.get_json(silent=True) or {}
     bg_mesh_scale = int(body.get("bg_mesh_scale",  20))
@@ -889,6 +890,9 @@ def api_stack_rerender(session_name: str):
     unsharp_gain  = float(body.get("unsharp_gain", _UNSHARP_GAIN))
     unsharp_sig   = float(body.get("unsharp_sig",  _UNSHARP_SIG))
     saturation    = max(0.0, min(3.0, float(body.get("saturation", _SATURATION))))
+    core_protect  = bool(body.get("core_protect",  _CORE_PROTECT))
+    core_pct      = float(body.get("core_pct",     _CORE_PCT))
+    core_Q        = float(body.get("core_Q",       _CORE_Q))
 
     frames_total    = job.get("frames_total", 0) or 0
     frames_accepted = job.get("frames_accepted", 0) or 0
@@ -922,7 +926,10 @@ def api_stack_rerender(session_name: str):
                              chroma_sig=chroma_sig,
                              unsharp_gain=unsharp_gain,
                              unsharp_sig=unsharp_sig,
-                             saturation=saturation)
+                             saturation=saturation,
+                             core_protect=core_protect,
+                             core_pct=core_pct,
+                             core_Q=core_Q)
             db.finish_stack_job(session_name, output_path,
                                 frames_accepted, frames_total)
             _broadcast({"type": "stack_done", "session_name": session_name,

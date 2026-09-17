@@ -287,3 +287,75 @@ or reference-star selection needs tuning, independent of the separate
 dark-background chroma-blur issue above. Two distinct known color-accuracy
 issues exist in this pipeline as of this writing; do not conflate them when
 debugging either one.
+
+## Known limitation: bright-core targets (M42-class) — core still clips to flat white
+
+M42 (Orion Nebula, 500×10s subs) initially stacked very poorly with the
+frame-wide default parameters (`bg_mesh_scale=20`, `white_pct=99.9`): the
+whole frame read as washed-out with heavy color speckle in the nebulosity,
+because those defaults were tuned on fainter, more diffuse targets and are
+wrong for a target this bright and compact.
+
+**Parameter re-tuning fixed the nebulosity/noise problem completely:**
+`bg_mesh_scale=8` (coarse mesh — a bright extended nebula shouldn't have its
+own glow subtracted as sky, same reasoning as M101) + `white_pct=98.0`
+(down from 99.9) via `rerender_preview` recovered clean wispy structure,
+accurate color, and no speckle. Re-render only — no re-stack needed, seconds
+not minutes, since `_linear.fits` already existed.
+
+**The Trapezium core itself is still flat white with no structure**, and
+this is a *different* problem from the above — not a parameter-tuning
+question. M42's core is bright enough, over a small enough area, that no
+single global (or even region-local) percentile-based stretch curve can
+preserve both it and the faint outer nebulosity simultaneously: whatever
+`white_pct` reveals the outer wisps will always clip the much-brighter core
+to 1.0 on all channels.
+
+**Three attempts at a masked "highlight recovery" curve (2026-09-16) all
+failed, for three different, instructive reasons** — do not re-attempt this
+exact approach without addressing all three:
+
+1. *v1 — global luminance-percentile mask, region-local white = absolute max.*
+   Produced star-shaped ring halos on ordinary bright stars all over the
+   frame (a plain percentile threshold on luminance selects every bright
+   star, not just the nebula core — there is no size/shape information in a
+   percentile), AND a black hole in the core itself (using the raw pixel
+   *maximum* as the local white reference is dominated by single hot-pixel
+   outliers, crushing the rest of the masked region toward black by
+   comparison).
+2. *v2 — masked on stretched (post-arcsinh) luminance instead of raw.*
+   Fixed the star-halo problem (morphological opening now correctly
+   distinguishes small star PSFs from the one large contiguous core region)
+   but the black hole persisted **and got slightly worse**. Root cause:
+   `arcsinh` saturates hard near 1.0, so "quite bright" and "genuinely
+   blown out" pixels are indistinguishable once you've already stretched —
+   masking on the stretched result cannot recover information the stretch
+   already destroyed.
+3. *v3 — masked on raw linear luminance (correct), but with too strict a
+   percentile threshold (99.95) so the mask covered a tiny fraction (~1000
+   px) of the actual ~40,000-px blown region.* Widening the mask threshold
+   to match `white_pct` (98.0, so the mask actually covers the whole
+   visually-clipped area) **brought the black hole straight back** — because
+   a mask that's finally the right *size* still spans a huge internal
+   brightness range (from "just barely clips the main curve" to "the actual
+   Trapezium saturation core"), and percentile-normalizing *that whole
+   region* to its own black/white points repeats the exact same failure
+   mode as the original frame-wide stretch, just at smaller scale. The
+   region's own 99.9th-percentile white reference sits almost at 1.0 (nearly
+   the full dynamic range), so most of the region's pixels — which are only
+   moderately above the outer threshold, not truly saturated — compute to
+   near-zero after the second arcsinh curve.
+
+**Conclusion: any single-pair-of-percentiles stretch (global or region-
+local) structurally cannot solve this** — the core spans too many orders of
+magnitude internally for one black/white point pair to serve well. A real
+fix needs either genuine local/spatially-adaptive tone mapping (e.g. CLAHE
+on luminance, applied to the already-stretched result so it locally
+re-expands contrast using neighborhood statistics rather than one global
+pair of percentiles) or literal star/nebula layer separation (SEP-detect and
+mask out stars, stretch the starless nebula and a separate star layer with
+independently-tuned curves, recombine) — not attempted yet. The scaffolding
+for a masked approach (`_auto_stretch`'s `core_protect`/`core_pct`/`core_Q`
+params, `stack_processor.py`) is left in place but **defaults to off**
+(`_CORE_PROTECT = False`) since it does not currently produce a usable
+result; do not enable it without addressing the above.

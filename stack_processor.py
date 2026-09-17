@@ -798,6 +798,9 @@ def _auto_crop(img: np.ndarray, valid_mask: np.ndarray, margin: int = 12) -> np.
 _STRETCH_Q          = 8.0   # asinh stretch aggressiveness (5=gentle, 8=aggressive)
 _STRETCH_BLACK_PCT  = 40    # percentile used as black point (50=median; lower reveals fainter structure)
 _STRETCH_WHITE_PCT  = 99.9  # percentile used as white reference (lower = brighter core, more star clipping)
+_CORE_PROTECT       = False # re-stretch clipped-white pixels with a gentler curve instead of flat white
+_CORE_PCT           = 99.95 # luminance percentile above which a pixel is considered "clipped core", not just a bright star
+_CORE_Q             = 2.0   # asinh Q for the core's own curve (lower = gentler = more headroom before it also clips)
 _LUMA_BLUR_K    = 9     # luma Gaussian kernel size (must be odd)
 _LUMA_BLUR_SIG  = 2     # luma Gaussian sigma
 _CHROMA_BLUR_K  = 31    # chroma Gaussian kernel size (must be odd)
@@ -828,13 +831,33 @@ _STF_MIDTONE_TARGET = 0.12
 def _auto_stretch(img: np.ndarray,
                   Q: float          = _STRETCH_Q,
                   black_pct: float  = _STRETCH_BLACK_PCT,
-                  white_pct: float  = _STRETCH_WHITE_PCT) -> np.ndarray:
+                  white_pct: float  = _STRETCH_WHITE_PCT,
+                  core_protect: bool = _CORE_PROTECT,
+                  core_pct:     float = _CORE_PCT,
+                  core_Q:       float = _CORE_Q) -> np.ndarray:
     """
     Per-channel asinh stretch for preview JPEGs.
 
     black_pct percentile → black point; white_pct percentile → white reference.
     Q controls shadow aggressiveness: 5 = gentle, 8 = moderate, 15 = aggressive.
     Lower white_pct brightens the core (at the cost of more star clipping).
+
+    core_protect: for targets with a small, very bright core well above
+    white_pct (e.g. M42's Trapezium) the normal curve clips the whole core
+    to flat white with no structure. When enabled, pixels above core_pct on
+    the RAW LINEAR luminance (not the stretched result — arcsinh saturates
+    near 1.0, which makes "quite bright" and "genuinely blown out" pixels
+    indistinguishable post-stretch) that also sit in a spatially large
+    clipped region (not an isolated star PSF — see below) are re-stretched
+    with their own curve, using black/white points local to that region
+    (not the frame-wide black_pct, which is tuned for the faint nebula and
+    is far too low for the core's own brightness range), then feathered
+    back in via a distance-transform mask so there's no hard seam.
+
+    The connected-component + morphological-opening step is what keeps
+    ordinary stars out of the mask (a compact nebula core is dozens of
+    pixels across at typical plate scales; a star's saturated peak is a
+    handful of pixels and gets opened away), so per-star halos don't appear.
     """
     result = np.zeros_like(img, dtype=np.float32)
     denom  = float(np.arcsinh(Q))
@@ -846,7 +869,56 @@ def _auto_stretch(img: np.ndarray,
         linear = np.clip((ch - lo) / span, 0.0, None)
         result[:, :, c] = np.clip(np.arcsinh(linear * Q) / denom, 0.0, 1.0)
 
-    return result
+    if not core_protect:
+        return result
+
+    # Identify clipped pixels on the RAW linear luminance, not the post-arcsinh
+    # result — arcsinh saturates hard near 1.0, so "quite bright" and "actually
+    # blown out" both read back as ~1.0 in the stretched result and become
+    # indistinguishable. On the linear data, core_pct (e.g. 99.95) reliably
+    # isolates only the genuinely brightest handful of pixels.
+    linear_luma = 0.114 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.299 * img[:, :, 2]
+    core_thr = float(np.percentile(linear_luma, core_pct))
+    clipped = linear_luma >= core_thr
+    if not np.any(clipped):
+        return result
+
+    # Morphological opening removes small blobs (star PSFs, typically a few
+    # pixels to ~10px across even when saturated) while leaving large
+    # contiguous clipped regions (a nebula core spans dozens+ pixels) intact.
+    # This is what keeps the effect off ordinary stars without needing a
+    # separate per-star exclusion list.
+    kernel = np.ones((9, 9), np.uint8)
+    opened = cv2.morphologyEx(clipped.astype(np.uint8) * 255,
+                              cv2.MORPH_OPEN, kernel)
+    if not np.any(opened):
+        return result
+
+    # Feather the mask edge with a distance transform so the blend fades in
+    # smoothly over ~15px rather than at a hard pixel boundary.
+    dist = cv2.distanceTransform(opened, cv2.DIST_L2, 5)
+    feather_px = 15.0
+    mask = np.clip(dist / feather_px, 0.0, 1.0).astype(np.float32)
+
+    # Core curve gets its OWN black and white points from the masked region's
+    # own linear values — the frame-wide black_pct is tuned for the faint
+    # nebula and is far too low for this much brighter region (using it here
+    # was the bug that crushed the core toward black). Low/high percentiles
+    # *within the region* instead span the core's own actual brightness range.
+    core_denom = float(np.arcsinh(core_Q))
+    core_result = np.zeros_like(img, dtype=np.float32)
+    region = mask > 0
+    for c in range(3):
+        ch = img[:, :, c]
+        vals = ch[region]
+        lo = float(np.percentile(vals, 1.0))
+        hi = float(np.percentile(vals, 99.9))
+        span = max(hi - lo, 1e-10)
+        linear = np.clip((ch - lo) / span, 0.0, None)
+        core_result[:, :, c] = np.clip(np.arcsinh(linear * core_Q) / core_denom, 0.0, 1.0)
+
+    mask3 = mask[:, :, None]
+    return result * (1.0 - mask3) + core_result * mask3
 
 
 # ── Siril CLI post-processing ─────────────────────────────────────────────────
@@ -2054,7 +2126,10 @@ def rerender_preview(fits_path: str, jpeg_path: str,
                      chroma_sig:    float = _CHROMA_BLUR_SIG,
                      unsharp_gain:  float = _UNSHARP_GAIN,
                      unsharp_sig:   float = _UNSHARP_SIG,
-                     saturation:    float = _SATURATION) -> str:
+                     saturation:    float = _SATURATION,
+                     core_protect:  bool  = _CORE_PROTECT,
+                     core_pct:      float = _CORE_PCT,
+                     core_Q:        float = _CORE_Q) -> str:
     """
     Regenerate the preview JPEG from an already-stacked FITS file without
     re-running frame alignment.  All post-processing parameters are tunable.
@@ -2112,7 +2187,8 @@ def rerender_preview(fits_path: str, jpeg_path: str,
         bgr = _scnr_green(bgr)
 
         progress_cb(75, "Auto-stretch", 0, 0)
-        preview = _auto_stretch(bgr, Q=stretch_q, black_pct=black_pct, white_pct=white_pct)
+        preview = _auto_stretch(bgr, Q=stretch_q, black_pct=black_pct, white_pct=white_pct,
+                                core_protect=core_protect, core_pct=core_pct, core_Q=core_Q)
         preview = _boost_saturation(preview, saturation)
 
         progress_cb(88, "Noise reduction and sharpening", 0, 0)
