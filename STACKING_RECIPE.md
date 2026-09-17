@@ -290,6 +290,19 @@ debugging either one.
 
 ## Known limitation: bright-core targets (M42-class) — core still clips to flat white
 
+**Also confirmed on M13 (Hercules Cluster, globular, 500×10s subs, 2026-09-17):**
+same failure mode, different target class — a globular cluster's densely
+packed core is extremely bright relative to the surrounding field for the
+same reason M42's Trapezium is (a small, very bright region inside a
+normally-exposed frame), and it clips to a flat white blob with no resolved
+stars. A gentler stretch (targetbg/shadowsclip re-tuned toward less
+aggressive) was tried via re-render and made the result *worse* — materially
+more background grain/noise, purple-tinted sky, and no core recovery — so
+the original default stretch is the better result to keep. This is now two
+independently confirmed cases (an emission nebula core and a globular
+cluster core) of the same structural limitation described below, not an
+M42-specific quirk.
+
 M42 (Orion Nebula, 500×10s subs) initially stacked very poorly with the
 frame-wide default parameters (`bg_mesh_scale=20`, `white_pct=99.9`): the
 whole frame read as washed-out with heavy color speckle in the nebulosity,
