@@ -372,3 +372,109 @@ for a masked approach (`_auto_stretch`'s `core_protect`/`core_pct`/`core_Q`
 params, `stack_processor.py`) is left in place but **defaults to off**
 (`_CORE_PROTECT = False`) since it does not currently produce a usable
 result; do not enable it without addressing the above.
+
+## Next attempt at core-blowout: single-sub star layer, not a masked curve
+
+Insight (2026-09-17): comparing our stack against the Seestar app's own
+onboard live-stacked result on the same target showed the vendor stacker
+does NOT blow out bright stars the way our deep stack does — this is the
+standard reason astrophotographers run star removal (StarNet/
+StarXTerminator-style tools) before stretching: it sidesteps the dynamic-
+range conflict entirely rather than trying to solve it within one curve.
+
+**Why this is a different (and more promising) approach than the abandoned
+masked-curve attempts above:** those all tried to solve "one stretch curve,
+two dynamic ranges" *within the deep stack itself*. But the deep stack's
+stars are the actual problem — 500 frames of accumulated signal makes a
+star's peak proportionally far more saturated than in any single sub, while
+the faint nebula needs exactly that accumulated depth to be visible at all.
+Pulling the star layer from a SINGLE sub (or a very light stack) instead of
+the full deep stack sidesteps the conflict rather than fighting it: the
+nebula layer gets the full aggressive stretch it needs with no stars in the
+way to blow out, and the star layer comes from data that was never so
+deeply saturated in the first place.
+
+**Planned pipeline (prototype target: M42, existing data/baseline in
+astro/stacks/M42/):**
+1. SEP-detect stars on the deep stack's linear data (reuse existing
+   detection code — `_reduce_stars`, `_color_calibrate` already do this)
+2. Build a starless layer: mask out detected stars from the deep stack,
+   inpaint or fill from local background
+3. Stretch the starless layer aggressively (current pipeline's approach,
+   tuned for faint structure — no core-blowout risk with stars removed)
+4. Pick one well-exposed single sub (or a very small/light stack — few
+   frames, not the full pool) as the star source; register it to the deep
+   stack's frame if needed
+5. Detect + isolate just the star layer from that single-sub source,
+   stretch it separately with its own (gentler, since less accumulated
+   signal) curve
+6. Screen/lighten-blend the two layers back together
+
+Once working, expose as a user-selectable Stack Wizard option (a checkbox/
+toggle alongside the existing tunable params) rather than an always-on
+behavior — this is a bigger structural change than the other tunables, and
+different targets may still do better with the existing simple stretch.
+
+### Prototype results (2026-09-17): mechanism validated, core-blowout not yet solved
+
+Built and tested the full pipeline above end-to-end on M42, in stages, each
+one exposing a real bug fixed before moving on:
+
+1. **Naive star detection caught the Trapezium itself** as one giant "star"
+   (measured `a≈210px` semi-major axis vs ~5-10px for real stars) —
+   inpainting it away wiped out the entire nebula core, leaving a flat grey
+   blob with visible inpaint sunburst artifacts. Fix: size cap (~10-12px)
+   on detected objects before building the star mask.
+2. **Size cap alone wasn't enough** — small bright knots *within* the
+   crowded Trapezium region still individually passed the size filter.
+   Fix: added SEP's `flag == 0` check (rejects blended/contaminated
+   detections) plus a roundness check (`a/b < 2.0`, real stars are round,
+   nebula-wisp fragments tend to be elongated) plus an explicit spatial
+   exclusion circle around the known core coordinates as a belt-and-braces
+   backstop.
+3. **Assumed Siril's own registration-reference sub was already pixel-
+   aligned to the deep stack's frame** (same filename Siril itself picked
+   as reference) — wrong. Measured directly: 24×196px offset between the
+   deep stack's brightest pixel and the same target's location in the
+   "reference" sub. The deep stack's border-crop + background-mesh
+   subtraction shift the effective coordinate origin relative to the raw,
+   uncropped sub — being *Siril's* registration reference doesn't mean
+   pre-aligned to *our* post-processed frame. Fix: real `astroalign`
+   registration (`aa.find_transform` + `aa.apply_transform`, same library
+   already used in `comet_processor.py`) — found a genuine 13.1° rotation
+   + large translation between the two frames; after applying it, the
+   brightest-pixel offset dropped to 1×0px.
+
+**With all three fixed, the mechanism works cleanly**: starless deep-stack
+layer (full nebula structure, no inpaint artifacts, no core damage) +
+properly-registered single-sub star layer (233 clean, correctly-sized,
+correctly-positioned stars) blend via `np.maximum` per channel into a
+result with rich wispy nebula detail and clean stars, matching the quality
+of the best M42 render achieved so far (`_retest_wp98.jpg`).
+
+**Still open: the actual core-blowout goal is NOT yet solved by this.** The
+Trapezium was deliberately *excluded* from star detection (correctly — it
+isn't a star), so it stays part of the starless nebula layer and still gets
+crushed to flat white by the same single global stretch curve problem
+diagnosed earlier in this document. This prototype validates the star/
+nebula separation *mechanism*, not a fix for the nebula-core brightness
+itself.
+
+**Natural next step, using the same machinery just built:** apply the same
+single-sub-source trick to the CORE, not just stars — the 500-frame deep
+stack's Trapezium is saturated because 500 frames of accumulated signal
+pushed it there; a single 10s sub's own core brightness is far less
+saturated (same reasoning that motivated pulling stars from one sub in the
+first place). Extract just the core region from the same registered single
+sub, stretch it with its own gentle curve, and blend it in the same way as
+the star layer — rather than trying to solve "one curve, whole dynamic
+range" within the deep stack's core pixels the way the three earlier
+core_protect attempts did (and failed).
+
+Not yet implemented — next-session work. Prototype scripts are ad-hoc
+(scratchpad, not committed) — the working version of this logic still
+needs to be written into `stack_processor.py` as reusable functions
+(`_extract_stars_from_sub`, `_build_starless_layer`, register + blend) and
+wired through `rerender_preview`/the Stack Wizard as a user-selectable
+option once the core-brightness piece is also solved, per the user's
+request.
