@@ -478,3 +478,54 @@ needs to be written into `stack_processor.py` as reusable functions
 wired through `rerender_preview`/the Stack Wizard as a user-selectable
 option once the core-brightness piece is also solved, per the user's
 request.
+
+## Star/nebula separation ported to stack_processor.py, tested on a dense field (2026-09-19)
+
+Ported the validated M42 prototype into real functions: `_detect_point_stars`,
+`_build_starless_layer`, `_register_to`, `_extract_star_layer`,
+`_starless_blend`, wired through `rerender_preview`
+(`starless_blend`/`starless_star_sub` params) and `/api/stack/rerender`.
+`starless_star_sub` accepts either a single raw sub path (cheap, low star
+count) or a list of raw sub paths (lightly Siril-stacked first via
+`_siril_full_stack` for much better star-detection SNR).
+
+**Two real bugs found and fixed while testing on SH2-142** (a Milky Way
+star-cloud field, ~9,624 detected stars — far denser than M42's ~450):
+
+1. *Stale server process.* The running Flask dev server (`debug=False`, no
+   reloader) had `stack_processor` imported in memory from BEFORE tonight's
+   edits — every rerender call silently ran old code regardless of what was
+   on disk. Symptom: results identical to a known-broken earlier attempt no
+   matter what was changed. No amount of code fixing helps until the server
+   process is actually restarted — remember this for any future live-testing
+   session against the running app, not just this feature.
+2. *Shape mismatch in `_register_to`.* `aa.apply_transform`'s output takes
+   the TARGET's shape, not the source's, but the code allocated `aligned =
+   np.zeros_like(source)` — when a light sub-stack's own border-crop trimmed
+   a different row count (1919 vs the deep stack's 1920) than the deep
+   stack's own crop did, writing per-channel results threw a broadcast
+   `ValueError`. Fixed: allocate against `target_luma.shape` instead.
+
+**With both fixed, the pipeline runs to completion without falling back —
+but the visual result on this dense field is not clean.** Visible soft
+halo/blur artifacts around many stars, and slight overall softness vs the
+plain stack. Suspected cause, not yet confirmed: at ~9,624 detected stars
+the per-star inpaint-mask circles (radius = 2.5× each star's own SEP a/b)
+overlap into much larger contiguous "holes" than on M42's sparser field,
+and `cv2.INPAINT_TELEA` filling a large contiguous region convincingly is a
+harder problem than filling isolated small circles — the artifact reads
+like inpaint-boundary softness bleeding into the surrounding real pixels
+where the mask covers a large fraction of a local neighborhood.
+
+**Not yet fixed.** Next steps to try, in likely order of impact:
+- Tighten the mask radius multiplier (currently 2.5×) for dense fields, or
+  scale it inversely with local star density instead of a fixed constant
+- Investigate `cv2.INPAINT_NS` (Navier-Stokes) as an alternative to TELEA —
+  different failure characteristics on large contiguous regions
+- Consider capping how much of the frame the starless mask is allowed to
+  cover before falling back to `_reduce_stars`'s lighter erosion approach
+  instead (i.e. pick the technique per-field based on measured star
+  density, not a single hardcoded approach)
+
+Restored SH2-142's known-good plain stack (`save/SH2-142_320frames_2026-09-19.jpg`)
+after each failed attempt rather than leaving a broken result in place.

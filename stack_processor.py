@@ -845,6 +845,233 @@ def _reduce_stars(img: np.ndarray, amount: float = 0.5, max_radius: int = 25) ->
     return img * (1.0 - mask_f) + eroded * mask_f
 
 
+# ── Star/nebula separation (full removal + single-sub star layer) ────────────
+#
+# _reduce_stars() above (erosion) works for moderately star-rich targets but
+# does not meaningfully declutter a Milky-Way-saturated field — shrinking
+# each star's radius a little does nothing when star COUNT, not individual
+# star size, is the dominant visual problem. Confirmed 2026-09-19 on SH2-142
+# (dense Cygnus star cloud): star_reduce=0.9 produced no visible change.
+#
+# This is the heavier alternative validated as a prototype 2026-09-17/18:
+# remove stars from the deep stack entirely (inpaint), stretch the starless
+# nebula aggressively with no stars left to blow out, and separately pull a
+# star layer from ONE registered single sub (far less accumulated signal
+# than the deep stack, so its own stars are much less saturated) to recombine.
+
+_STARLESS_MAX_RADIUS = 12    # px; excludes large bright non-stellar blobs (nebula cores)
+_STARLESS_MAX_ELONG  = 2.5   # a/b ratio; real stars are round, nebula wisps are elongated
+_STAR_LAYER_MAX_RADIUS = 10
+_STAR_LAYER_MAX_ELONG  = 2.0
+
+
+def _detect_point_stars(luma: np.ndarray, max_radius: float, max_elong: float,
+                        require_clean_flag: bool = False):
+    """
+    SEP-detect compact, round, isolated sources on a float32/float64
+    luminance array — i.e. real point-source stars, excluding large bright
+    blobs (nebula cores/knots) and elongated features (wisps, diffraction
+    spikes). Returns the filtered SEP object array.
+
+    require_clean_flag additionally drops SEP's flagged (blended/saturated/
+    edge) detections — useful for a single sub's star layer, where a
+    contaminated detection would otherwise leak nebula-core fragments into
+    the star mask (confirmed necessary on M42's Trapezium, 2026-09-17).
+    """
+    import sep
+    luma64 = np.ascontiguousarray(luma.astype(np.float64))
+    sep.set_extract_pixstack(2_000_000)
+    bkg = sep.Background(luma64)
+    sub = np.ascontiguousarray((luma64 - bkg.back()).astype(np.float64))
+    objs = sep.extract(sub, thresh=5.0, err=bkg.globalrms, minarea=5)
+
+    keep = []
+    for o in objs:
+        if require_clean_flag and o['flag'] != 0:
+            continue
+        a, b = float(o['a']), float(o['b'])
+        r = max(a, b)
+        if r > max_radius or r < 1.0:
+            continue
+        if b > 0 and (a / b) > max_elong:
+            continue
+        keep.append(o)
+    return keep
+
+
+def _build_starless_layer(img: np.ndarray) -> np.ndarray:
+    """
+    Remove point-source stars from a calibrated linear BGR image via
+    SEP detection + OpenCV inpainting, leaving nebula/galaxy structure
+    (including bright compact features like an emission-nebula core)
+    intact. The size/elongation filter in _detect_point_stars is what
+    keeps a bright nebula core from being detected as one giant "star"
+    and inpainted away — confirmed necessary on M42's Trapezium
+    (measured ~210px semi-major axis vs ~5-10px for real stars).
+    """
+    luma = 0.114 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.299 * img[:, :, 2]
+    stars = _detect_point_stars(luma, _STARLESS_MAX_RADIUS, _STARLESS_MAX_ELONG)
+
+    h, w = luma.shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for o in stars:
+        r = max(int(round(max(float(o['a']), float(o['b'])) * 2.5)), 3)
+        cv2.circle(mask, (int(round(o['x'])), int(round(o['y']))), r, 255, -1)
+    if not np.any(mask):
+        return img.copy()
+
+    starless = img.copy()
+    for c in range(3):
+        ch = img[:, :, c]
+        scale = max(float(np.percentile(ch, 99.5)), 1e-8)
+        ch_u8 = np.clip(ch / scale * 255.0, 0, 255).astype(np.uint8)
+        inpainted_u8 = cv2.inpaint(ch_u8, mask, 5, cv2.INPAINT_TELEA)
+        starless[:, :, c] = inpainted_u8.astype(np.float32) / 255.0 * scale
+    return starless
+
+
+def _register_to(source: np.ndarray, target_luma: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Register a calibrated linear BGR `source` image onto `target_luma`'s
+    frame via astroalign (star-pattern matching), warping all 3 channels
+    with the same transform. Returns None if no reliable transform is
+    found (e.g. too few matching stars).
+
+    Do NOT assume a single sub is already pixel-aligned to a deep stack's
+    frame just because Siril picked it as the registration reference —
+    the deep stack's own border-crop and background-mesh subtraction shift
+    the effective coordinate origin. Confirmed on M42: a 24x196px offset
+    between the "reference" sub and the deep stack before registration,
+    reduced to 1x0px after. Always register explicitly.
+    """
+    import astroalign as aa
+    src_luma = (0.114 * source[:, :, 0] + 0.587 * source[:, :, 1]
+              + 0.299 * source[:, :, 2]).astype(np.float32)
+    try:
+        transform, _ = aa.find_transform(
+            src_luma, target_luma, detection_sigma=5, max_control_points=60,
+        )
+    except Exception:
+        return None
+
+    # aa.apply_transform's output takes TARGET's shape, not source's — the two
+    # can legitimately differ (e.g. a light sub-stack's own border-crop trims
+    # a different row/column count than the deep stack's crop did, even from
+    # the same source data). Allocate against target_luma, not source, or a
+    # shape mismatch throws when writing per-channel results.
+    aligned = np.zeros((target_luma.shape[0], target_luma.shape[1], 3), dtype=source.dtype)
+    for c in range(3):
+        aligned_ch, _footprint = aa.apply_transform(transform, source[:, :, c], target_luma)
+        aligned[:, :, c] = aligned_ch
+    return aligned
+
+
+def _extract_star_layer(aligned_sub: np.ndarray, exclude_xy: Optional[tuple] = None,
+                        exclude_radius: float = 80.0) -> np.ndarray:
+    """
+    Isolate just the point-source stars from a registered single-sub image
+    (already in the deep stack's coordinate frame — see _register_to),
+    zeroing everything else. exclude_xy/exclude_radius optionally excludes
+    a known bright-core region (e.g. an emission nebula's brightest knot)
+    from star detection as a belt-and-braces backstop on top of the
+    size/elongation/flag filters — confirmed useful on M42's Trapezium,
+    which produced a few small "clean" detections even after filtering.
+    """
+    luma = (0.114 * aligned_sub[:, :, 0] + 0.587 * aligned_sub[:, :, 1]
+          + 0.299 * aligned_sub[:, :, 2])
+    stars = _detect_point_stars(luma, _STAR_LAYER_MAX_RADIUS, _STAR_LAYER_MAX_ELONG,
+                                require_clean_flag=True)
+
+    h, w = luma.shape
+    mask = np.zeros((h, w), dtype=np.float32)
+    for o in stars:
+        if exclude_xy is not None:
+            dx = float(o['x']) - exclude_xy[0]
+            dy = float(o['y']) - exclude_xy[1]
+            if (dx * dx + dy * dy) ** 0.5 < exclude_radius:
+                continue
+        r = max(max(float(o['a']), float(o['b'])) * 3.0, 3.0)
+        cv2.circle(mask, (int(round(o['x'])), int(round(o['y']))), int(round(r)), 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=1.5)
+    return aligned_sub * mask[:, :, None]
+
+
+def _starless_blend(deep_calibrated: np.ndarray, star_sub_path,
+                    bayer_pattern: str = 'GRBG',
+                    progress_cb: Optional[Callable] = None) -> np.ndarray:
+    """
+    Full star/nebula separation pipeline: build a starless layer from the
+    deep (calibrated, linear) stack, register+extract a star layer from a
+    lighter-SNR source, and recombine via per-channel max (screen-like
+    blend that keeps whichever layer is brighter at each pixel — the
+    starless layer everywhere except at star positions, where the aligned
+    star retains its own, less-saturated brightness).
+
+    star_sub_path: EITHER a single raw CFA .fit path (str) — cheap, but
+    only detects a single sub's own star population, which on a dense
+    field can be far fewer than the deep stack resolves (confirmed on
+    SH2-142: a single sub found ~1,400-2,400 stars vs the 320-frame deep
+    stack's 9,624 — restoring under a fifth of the field's actual stars)
+    — OR a list of raw CFA .fit paths (list[str]), which are lightly
+    stacked via Siril first (10-30 frames recommended: enough SNR to
+    detect a field's real star population without accumulating anywhere
+    near the deep stack's own saturation). Falls back to the unmodified
+    deep stack if registration, stacking, or star detection fails.
+    """
+    deep_luma = (0.114 * deep_calibrated[:, :, 0] + 0.587 * deep_calibrated[:, :, 1]
+               + 0.299 * deep_calibrated[:, :, 2]).astype(np.float32)
+    if progress_cb is None:
+        progress_cb = lambda p, msg, *a: None
+
+    try:
+        if isinstance(star_sub_path, (list, tuple)):
+            # Light sub-stack: reuse _siril_full_stack for register+stack+
+            # calibrate on a small frame count, then read its own output.
+            tmp_fits = os.path.join(
+                tempfile.gettempdir(), f"starless_substack_{int(time.time())}.fits")
+            hdr0 = _read_fits_header(star_sub_path[0])
+            bp = str(hdr0.get('BAYERPAT', bayer_pattern)).strip() or bayer_pattern
+            ok = _siril_full_stack(
+                list(star_sub_path), bp, tmp_fits,
+                progress_cb=lambda p, msg, *_a: progress_cb(int(p * 0.5), msg),
+            )
+            if not ok:
+                logging.warning("_starless_blend: light sub-stack failed, using deep stack as-is")
+                return deep_calibrated
+            from astropy.io import fits as _fits
+            with _fits.open(tmp_fits) as h:
+                sub_data = h[0].data.astype(np.float32)
+            os.unlink(tmp_fits)
+            linear_sidecar = str(Path(tmp_fits).with_name(Path(tmp_fits).stem + '_linear.fits'))
+            if os.path.isfile(linear_sidecar):
+                os.unlink(linear_sidecar)
+            sub_cal = sub_data[::-1].transpose(1, 2, 0).copy()
+        else:
+            raw, hdr = _read_fits(star_sub_path)
+            bp = str(hdr.get('BAYERPAT', bayer_pattern)).strip() or bayer_pattern
+            sub_bgr = _debayer(raw, bp).astype(np.float32) / 65535.0
+            sub_cal = _subtract_background(sub_bgr, mesh_scale=8)
+            sub_cal = np.clip(sub_cal, 0.0, None)
+            sub_cal = _color_calibrate(sub_cal)
+            sub_cal = _scnr_green(sub_cal)
+
+        progress_cb(60, "Registering star source")
+        aligned = _register_to(sub_cal, deep_luma)
+        if aligned is None:
+            logging.warning("_starless_blend: registration failed, using deep stack as-is")
+            return deep_calibrated
+
+        progress_cb(75, "Extracting star layer")
+        core_y, core_x = np.unravel_index(np.argmax(deep_luma), deep_luma.shape)
+        star_layer = _extract_star_layer(aligned, exclude_xy=(core_x, core_y))
+        progress_cb(90, "Building starless nebula layer")
+        starless = _build_starless_layer(deep_calibrated)
+        return np.maximum(starless, star_layer)
+    except Exception as exc:
+        logging.warning(f"_starless_blend failed ({exc}); using deep stack as-is")
+        return deep_calibrated
+
+
 # ── Crop ──────────────────────────────────────────────────────────────────────
 
 def _auto_crop(img: np.ndarray, valid_mask: np.ndarray, margin: int = 12) -> np.ndarray:
@@ -2212,11 +2439,27 @@ def rerender_preview(fits_path: str, jpeg_path: str,
                      core_pct:      float = _CORE_PCT,
                      core_Q:        float = _CORE_Q,
                      star_reduce:      float = _STAR_REDUCE,
-                     star_reduce_maxr: int   = _STAR_REDUCE_MAXR) -> str:
+                     star_reduce_maxr: int   = _STAR_REDUCE_MAXR,
+                     starless_blend:      bool = False,
+                     starless_star_sub                = None) -> str:
     """
     Regenerate the preview JPEG from an already-stacked FITS file without
     re-running frame alignment.  All post-processing parameters are tunable.
     Returns the path of the written JPEG.
+
+    starless_blend: use full star/nebula separation (see _starless_blend)
+    instead of stretching the deep stack directly — for star-saturated
+    fields (e.g. Milky Way star clouds) where _reduce_stars's erosion
+    approach doesn't meaningfully declutter the field (confirmed on
+    SH2-142, 2026-09-19: star_reduce=0.9 produced no visible change).
+    Requires starless_star_sub: EITHER a single raw CFA .fit path (str)
+    — cheap, but on a dense field only restores a fraction of the deep
+    stack's actual star population (confirmed on SH2-142: a single sub
+    found ~1,400-2,400 stars vs the deep stack's 9,624) — OR a list of
+    raw CFA .fit paths (list[str]) to lightly sub-stack first for much
+    better star-detection SNR without the deep stack's own saturation
+    (10-30 frames recommended). Mutually exclusive with star_reduce/
+    core_protect in practice, though not enforced here.
     """
     if progress_cb is None:
         progress_cb = lambda p, msg, *a: None
@@ -2267,6 +2510,13 @@ def rerender_preview(fits_path: str, jpeg_path: str,
 
         progress_cb(60, "SCNR green suppression", 0, 0)
         bgr = _scnr_green(bgr)
+
+        if starless_blend and starless_star_sub:
+            progress_cb(65, "Star/nebula separation", 0, 0)
+            bgr = _starless_blend(
+                bgr, starless_star_sub,
+                progress_cb=lambda p, msg, *_a: progress_cb(65 + int(p * 0.05), msg, 0, 0),
+            )
 
         # Prefer Siril's own autostretch (histogram-transform-function based)
         # over the Python asinh curve — it is the same stretch the ORIGINAL
