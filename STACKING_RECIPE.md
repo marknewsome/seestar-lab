@@ -317,6 +317,21 @@ reinforces this is general to any target with a compact bright feature
 inside an otherwise normally-exposed frame, not specific to one object
 type.
 
+**Counter-example, refining the theory (M81/Bode's Galaxy, 1000×10s subs,
+2026-09-30): a bright galaxy bulge does NOT trigger this limitation.**
+M81's core is genuinely bright (obviously so even in a single raw sub) but
+rendered with real graduated brightness and visible texture at full zoom —
+no flat-white clipping. This suggests the limitation is specifically about
+*spatial concentration* of brightness (a small, tightly-packed or
+point-like bright feature — a planetary nebula's central star/lobes, a
+globular cluster's packed core, an emission nebula's brightest knot), not
+brightness alone. A galaxy bulge is bright but its brightness falls off
+gradually over a much larger area, which is apparently enough for the
+single global stretch curve to render cleanly. Worth keeping in mind when
+predicting which future targets will hit this limitation: look for a
+small, sharply-bounded bright region, not just "this target has a bright
+part."
+
 M42 (Orion Nebula, 500×10s subs) initially stacked very poorly with the
 frame-wide default parameters (`bg_mesh_scale=20`, `white_pct=99.9`): the
 whole frame read as washed-out with heavy color speckle in the nebulosity,
