@@ -303,6 +303,20 @@ independently confirmed cases (an emission nebula core and a globular
 cluster core) of the same structural limitation described below, not an
 M42-specific quirk.
 
+**Also confirmed on M27 (Dumbbell Nebula, planetary nebula, 1000×10s subs,
+2026-09-29):** the bright central lobes clip to a flat white blob with the
+finer bipolar/mottled texture washed out, even though the surrounding
+fainter halo and star field render well. Tried `white_pct=97.0` (down from
+default 99.9) via re-render — this made it slightly *worse*, not better:
+`white_pct` lower means the top-of-range clip point sits at a LOWER raw
+value, so more of the frame (not less) gets pushed into full clip. The
+default settings' result remains the better one to keep. Third
+independently confirmed target class (planetary nebula, alongside emission
+nebula and globular cluster) hitting the same structural limitation —
+reinforces this is general to any target with a compact bright feature
+inside an otherwise normally-exposed frame, not specific to one object
+type.
+
 M42 (Orion Nebula, 500×10s subs) initially stacked very poorly with the
 frame-wide default parameters (`bg_mesh_scale=20`, `white_pct=99.9`): the
 whole frame read as washed-out with heavy color speckle in the nebulosity,
