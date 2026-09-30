@@ -236,6 +236,31 @@ darks/bias calibration, which is the most likely explanation) is not
 directly reproducible from available data — worth investigating if pursuing
 this further, but not yet solved.
 
+**"Just use the coldest night" does not automatically help — tested and
+measured, not just assumed (M81, 2026-09-30).** M81's pool spans 6 nights;
+the coldest (Feb 4, 10.9°C) had only 20 frames, far too few for a deep
+stack on its own. The two nights with real depth were both warm (May 8:
+583 frames/20.4°C, May 9: 541 frames/23.6°C). Tried restricting to just
+the cooler of the two (May 8, 500 frames after the usual cap) versus the
+full 1000-frame mixed-night pool the normal pipeline selected (which
+necessarily pulls in some May 9 frames too). Measured corner (empty-sky)
+noise directly rather than eyeballing it:
+
+| Stack | Frames | chroma(r−g) | chroma(b−g) | luma σ |
+|---|---|---|---|---|
+| Full pool (mixed nights, normal `max_frames=1000`) | 1000 | 5.78 | 5.65 | 43.56 |
+| May 8 only (cooler night, capped) | 500 | 6.32 | 6.38 | 48.90 |
+
+**The restricted-to-cooler-night stack was measurably WORSE, not better.**
+Halving the frame count (SNR ∝ √N) cost more than the ~3°C average
+temperature improvement gained — the noise floor is dominated by both
+factors, not sensor temperature alone, and on this particular pool the
+frame-count penalty outweighed the temperature benefit. Lesson: don't
+assume restricting to a cooler subset helps without checking whether that
+subset actually has comparable depth to the full pool — if the coldest
+night(s) can't support a similarly-sized stack, the full mixed-night pool
+may well be the better choice despite its higher average temperature.
+
 ## Chroma denoising on the Siril autostretch path
 
 Siril's own `autostretch` path has no color-noise reduction — on a
