@@ -261,6 +261,35 @@ subset actually has comparable depth to the full pool — if the coldest
 night(s) can't support a similarly-sized stack, the full mixed-night pool
 may well be the better choice despite its higher average temperature.
 
+**Counter-example where the cooler subset DID win (IC 5146, 2026-10-01).**
+Same experiment, different outcome, because the depth trade-off was much
+less severe here. IC 5146's pool spans 9 nights; the normal pipeline's
+quality-ranked 1000-frame selection pulled heavily from several warm nights
+(mean sampled CCD-TEMP ≈ 20.1°C, range 14.4–25.0°C across the pool) and
+produced a result where the Cocoon Nebula's own structure barely resolved
+at all — just a faint reddish blob, no internal detail, plus a dark
+wedge-shaped crop artifact in one corner. But unlike M81, this pool has a
+genuinely substantial cooler pair of nights: Oct 14 (169 frames, 16.6°C) +
+Oct 15 (131 frames, 15.8°C) = 300 frames at ~16.2°C average — a much
+smaller frame-count cut (1000→295 accepted) than M81's 1000→500 halving,
+because the baseline here didn't need anywhere near 1000 frames of mixed-
+quality data to begin with.
+
+| Stack | Frames | chroma(r−g) | chroma(b−g) | luma σ |
+|---|---|---|---|---|
+| Full pool (mixed nights, `max_frames=1000`) | 1000 | 7.34 | 5.58 | 47.73 |
+| Oct 14+15 only (cooler nights) | 295 | 6.44 | 5.23 | 51.31 |
+
+Luma noise alone is a mixed signal (slightly higher on the restricted
+stack), but chroma noise improved and — more importantly — the Cocoon's
+actual structure (dark absorption lane, embedded star cluster, real color
+gradation) only became visible in the restricted stack; the corner crop
+artifact also disappeared. Kept the Oct 14+15-only result as the
+reference. **Combined lesson from both experiments: whether restricting to
+a cooler subset helps depends on how much depth that subset actually has
+relative to what the full pool would otherwise use — there's no universal
+answer, measure (and look at) both before deciding.**
+
 ## Chroma denoising on the Siril autostretch path
 
 Siril's own `autostretch` path has no color-noise reduction — on a
