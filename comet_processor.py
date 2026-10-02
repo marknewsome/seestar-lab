@@ -1257,6 +1257,32 @@ def _comet_portrait(
     and this function's coverage-mask handling were fixed in the same
     session and are NOT the cause of this — they just inherit a bad
     position when this upstream detection fails.
+
+    FURTHER CONFIRMATION (2026-10-02, Lemmon 2025-11-01): the same bug can
+    corrupt an entire session's STACK, not just the single-frame portrait
+    crop. Printed all 64 frames' nucleus_pos: frames 0-14 cluster tightly
+    (real comet motion, ~40px drift over the burst) but frame 15 onward
+    jumps chaotically between unrelated clusters hundreds of px apart
+    (e.g. (1077,1861) -> (639,1492) -> (922,1903) -> (603,1486) with no
+    consistent trajectory) — the detector locked onto different field
+    stars frame to frame instead of tracking the comet. Downstream
+    effect: _comet_portrait's canvas grew to 2795x1375 to contain all the
+    scattered "nucleus" positions, 392,249px (~10%) of that canvas had no
+    real frame coverage and had to be inpainted, and BOTH comet_stack.jpg
+    and comet_nucleus_stack.jpg came out as a washed, low-contrast blur —
+    not from the stretch step (confirmed by re-running _stretch() in
+    isolation on a dumped copy of the pre-stretch composite array, which
+    reproduced the identical result) but from the composite itself already
+    being bad before any stretch runs. This was initially misattributed to
+    sensor temperature (mean ~22°C, consistent with the documented warm-
+    sensor noise pattern elsewhere in this project) and separately to a
+    corrupted alignment cache (a real, separate bug — see the atomic-write
+    fix in main()'s cache-saving code — but NOT the cause of this specific
+    problem, since a byte-for-byte identical result reproduced from a
+    completely fresh --no-cache alignment pass too). The actual fix needed
+    is the same one described above: reject/re-detect nucleus positions
+    that jump inconsistently with a frame's neighbors rather than trusting
+    every per-frame detection independently.
     """
     h, w = nucleus_stack.shape[:2]
     # Uncovered (border zero-fill) pixels are exactly 0.0 across all channels
@@ -1516,14 +1542,24 @@ def main() -> None:
     nucleus_pos: list = []
 
     if cache_ok:
-        with open(cache_json) as fh:
-            cache = json.load(fh)
+        try:
+            with open(cache_json) as fh:
+                cache = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            # A direct (non-atomic) write that got interrupted mid-write
+            # (e.g. OOM kill under memory pressure) can leave a corrupted
+            # cache file that then crashes every subsequent run, not just
+            # the interrupted one — confirmed 2026-10-02. Treat it the same
+            # as "no cache" rather than crashing.
+            print(f"[Pass 1] Cache file unreadable ({exc}) — ignoring cache, re-aligning …")
+            cache_ok = False
+            cache = {}
         # Invalidate cache if it was built from a different number of frames
-        if len(cache.get("transforms", [])) != n:
+        if cache_ok and len(cache.get("transforms", [])) != n:
             print(f"[Pass 1] Cache frame count mismatch ({len(cache.get('transforms',[]))} "
                   f"vs {n}) — ignoring cache, re-aligning …")
             cache_ok = False
-        else:
+        if cache_ok:
             transforms = [tuple(t) if t else None for t in cache["transforms"]]
             if not nucleus_hint_provided and not args.redetect_nucleus:
                 print("[Pass 1] Loading cached alignment …")
@@ -1600,12 +1636,23 @@ def main() -> None:
             else:
                 print(f"    [{i+1:2d}] nucleus not found")
 
-        with open(cache_json, "w") as fh:
+        # Write atomically (temp file + rename) rather than directly to
+        # cache_json — a direct write left a corrupted file (trailing NUL
+        # byte after valid JSON, confirmed 2026-10-02 on a Lemmon
+        # 2025-11-01 run that ran under heavy memory pressure) that then
+        # crashed every subsequent run trying to load the cache, not just
+        # the one that got interrupted. os.replace is atomic on the same
+        # filesystem, so a reader never sees a partial file either way.
+        cache_tmp = cache_json + ".tmp"
+        with open(cache_tmp, "w") as fh:
             json.dump({
                 "transforms":       [list(t) if t else None for t in transforms],
                 "nucleus_pos":      [list(p) if p else None for p in nucleus_pos],
                 "rejected_indices": sorted(rejected_indices),
             }, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(cache_tmp, cache_json)
         print(f"  Alignment cached → {cache_json}")
 
     # Temporally smooth nucleus positions before rendering.
@@ -1725,6 +1772,11 @@ def main() -> None:
     # Save composite stack JPEG — mean of all aligned frames, stretched.
     # No annotations; stars are sharp, comet trail is smeared along its path.
     stack_out = os.path.join(comet_dir, "comet_stack.jpg")
+    if os.environ.get("COMET_DEBUG_DUMP"):
+        np.save(os.path.join(comet_dir, "_debug_composite.npy"), composite)
+        print(f"  DEBUG: dumped composite {composite.shape} "
+              f"min={composite.min():.4f} max={composite.max():.4f} "
+              f"mean={composite.mean():.4f}", flush=True)
     stack_bgr = _to_bgr8(_stretch(composite), OUTPUT_WIDTH)
     cv2.imwrite(stack_out, stack_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
     print(f"  Composite stack → {stack_out}")
