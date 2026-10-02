@@ -1161,6 +1161,7 @@ def _find_tail_direction(
     nucleus_stack: np.ndarray,
     cx: float,
     cy: float,
+    coverage_mask: Optional[np.ndarray] = None,
 ) -> float:
     """
     Estimate the tail direction from the nucleus-aligned mean stack.
@@ -1175,6 +1176,16 @@ def _find_tail_direction(
          around the nucleus.  The centroid should lie in the direction of the
          coma/tail since the tail contributes more flux on one side.
       4. The tail direction is the angle from the nucleus to that centroid.
+
+    coverage_mask: boolean array, True where the nucleus-aligned stack has
+    real (non-zero-fill) data at that pixel. Each frame shifts by a
+    different amount depending on the comet's own motion that session, so
+    the union of per-frame BORDER_CONSTANT zero-fill regions is NOT
+    symmetric around the nucleus — without excluding it, the centroid gets
+    pulled toward whichever side happens to have more covered (non-border)
+    sky pixels, not toward the tail. Confirmed as a real bug 2026-10-01:
+    on Lemmon's 2025-10-29 stack the uncorrected centroid pointed at the
+    registration border, not the visually obvious upward tail.
     """
     h, w = nucleus_stack.shape[:2]
     lum = _luminance(nucleus_stack)                     # float32 [0,1]
@@ -1187,6 +1198,8 @@ def _find_tail_direction(
     outer_r = max(outer_r, inner_r + 20)
 
     ring = (r2 > inner_r ** 2) & (r2 < outer_r ** 2)
+    if coverage_mask is not None:
+        ring = ring & coverage_mask
 
     weights = lum * ring.astype(np.float32)
     total = weights.sum()
@@ -1226,9 +1239,31 @@ def _comet_portrait(
       5. Overlay comet name and date text.
 
     Returns a uint8 BGR image.
+
+    KNOWN ISSUE (confirmed, not yet fixed, 2026-10-01): the whole pipeline
+    relies on nucleus_pos (from _find_nucleus_in_frame), which defaults its
+    search window to +/-400px of the FRAME CENTER on the assumption the
+    Seestar keeps the comet roughly centered each session. When a session's
+    actual coma sits far from center (confirmed on Lemmon 2025-10-29: real
+    coma near the bottom of a 1080x1920 frame, ~740px from center — well
+    outside the 400px search radius), the detector locks onto an unrelated
+    bright star instead, and every downstream step (nucleus-centering in
+    the stack, tail direction here, this portrait's crop) inherits the
+    wrong position. Confirmed by cropping the exact detected (x,y) on the
+    raw reference frame and finding an ordinary star, not the visibly
+    obvious coma elsewhere in the same frame. A real fix needs either a
+    full-frame search (slower) or a motion-consistency check across frames
+    to reject an outlier detection — not attempted yet. _find_tail_direction
+    and this function's coverage-mask handling were fixed in the same
+    session and are NOT the cause of this — they just inherit a bad
+    position when this upstream detection fails.
     """
     h, w = nucleus_stack.shape[:2]
-    tail_ang = _find_tail_direction(nucleus_stack, cx, cy)
+    # Uncovered (border zero-fill) pixels are exactly 0.0 across all channels
+    # in the sky-subtracted stack this is called with — derive the coverage
+    # mask from that rather than require every caller to pass one separately.
+    coverage_mask = nucleus_stack.sum(axis=2) > 0
+    tail_ang = _find_tail_direction(nucleus_stack, cx, cy, coverage_mask=coverage_mask)
 
     # We want the tail to point UP, so rotate by -tail_ang
     # (clockwise positive in image coords means negative getRotationMatrix2D)
@@ -1847,7 +1882,9 @@ def main() -> None:
             print(f"    [{i+1:2d}/{n}] {meta['date_obs'][:16]}{trail_note}", flush=True)
 
         nucleus_durations = _compute_frame_durations(nucleus_metas, FPS, MAX_GAP_MULT) if use_vfr else None
-        nuc_date_range    = (f"{nucleus_metas[0]['date_obs'][:10]}  →  "
+        # cv2.putText's HERSHEY fonts have no glyph for "->"'s Unicode arrow
+        # (renders as "???" boxes) -- use a plain ASCII arrow instead.
+        nuc_date_range    = (f"{nucleus_metas[0]['date_obs'][:10]} -> "
                              f"{nucleus_metas[-1]['date_obs'][:10]}")
         nucleus_frames, nucleus_durations = _prepend_title(
             nucleus_frames, nucleus_durations, comet_name, "Nucleus Fixed", nuc_date_range)
