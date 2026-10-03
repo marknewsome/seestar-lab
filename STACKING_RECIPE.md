@@ -504,6 +504,66 @@ params, `stack_processor.py`) is left in place but **defaults to off**
 (`_CORE_PROTECT = False`) since it does not currently produce a usable
 result; do not enable it without addressing the above.
 
+### CLAHE attempt (2026-10-03): tried, does not work — four variants all failed
+
+The CLAHE suggestion above was taken up and tested on M27 (1000x10s, confirmed
+case of this limitation). **It does not fix the problem. All four variants
+failed; no code was changed.**
+
+Useful measurement first, to frame the problem correctly: M27's nebula body
+holds **12.1x internal contrast in the linear data but only 1.75x in the
+delivered JPEG**. Only 2.3% of body pixels exceed 250 and just 121 pixels
+frame-wide are 255-clipped in all channels, so **this is not hard clipping —
+it is contrast compression**. The body sits at 0.24-0.97 of the white
+reference (i.e. *below* it, not above), and arcsinh at Q=8 maps that 2.4x
+input range onto 1.6x output because it is already in the curve's flattening
+zone. Q controls faint-lift and bright-contrast with one knob, which is the
+structural reason no global Q retune can fix both (consistent with the earlier
+gentler-stretch failures).
+
+What was tried:
+1. *CLAHE on the final JPEG* (what the note above literally suggested).
+   Failed: across clip 1.0-4.0 x grid 4-16, every setting either reduced body
+   contrast or barely matched it (1.75x -> 1.24-1.82x) while inflating
+   background sigma 1.3-2.9x. By JPEG stage the body is already compressed
+   into a narrow bright band, so local equalisation has nothing to work with.
+2. *Local-mean normalisation on the linear data* (divide luminance by a
+   blurred copy, blend by amount). Failed worse: at amount>=0.5 it erased the
+   nebula entirely (no body blob detectable). The object is large relative to
+   any sane blur kernel, so the "local mean" is the nebula itself.
+3. *Masked CLAHE on stretched luminance*, mask built on linear luminance with
+   morphological opening to exclude stars and a feathered blend — explicitly
+   designed to avoid all three documented core_protect failure modes. Gave
+   only a marginal gain (body contrast 1.63x -> 1.78x) while still raising
+   background sigma 1.65x despite the mask covering only ~8.5k px.
+4. *Plain gamma on the shipped JPEG*, as a sanity check. Failed; the body
+   stays a pale blob.
+
+**Two measurement traps to avoid when working on this** (both cost time here):
+- A brightness-thresholded body mask (`lum > 120`) is not comparable across
+  renders — a brighter render yields a 4x larger "body" and flatters its own
+  contrast ratio. Use a fixed spatial region, or compare renders only at
+  matched mean brightness.
+- Local-detail rms rises under gamma because gamma amplifies noise too. It
+  looked like recovered structure and was not. **Check crops visually; the
+  scalar metrics here are all misleading on their own.**
+
+Also worth knowing: a hand-assembled `_subtract_background` ->
+`_color_calibrate` -> `_scnr_green` -> `_auto_stretch` sequence produced a
+visibly *better* M27 core than the shipped Siril render, which looked like a
+promising lead — but re-running the **real** `rerender_preview` with
+`core_protect=True` (which forces the Python stretch path) did not reproduce
+it: the actual Python-path output is washed out, noisier, and carries a strong
+green cast. Do not trust hand-assembled stage sequences as a proxy for the
+pipeline; always confirm through `rerender_preview`.
+
+**Still unsolved.** The remaining untried option from the conclusion above is
+the one that has actually been built: star/nebula layer separation
+(`_starless_blend` et al., already in `stack_processor.py`), extended to treat
+the bright *core* as its own layer sourced from a single sub — see the
+"Next attempt at core-blowout" section below, whose core-brightness step was
+never implemented.
+
 ## Next attempt at core-blowout: single-sub star layer, not a masked curve
 
 Insight (2026-09-17): comparing our stack against the Seestar app's own
