@@ -557,12 +557,63 @@ it: the actual Python-path output is washed out, noisier, and carries a strong
 green cast. Do not trust hand-assembled stage sequences as a proxy for the
 pipeline; always confirm through `rerender_preview`.
 
-**Still unsolved.** The remaining untried option from the conclusion above is
-the one that has actually been built: star/nebula layer separation
-(`_starless_blend` et al., already in `stack_processor.py`), extended to treat
-the bright *core* as its own layer sourced from a single sub — see the
-"Next attempt at core-blowout" section below, whose core-brightness step was
-never implemented.
+### ROOT CAUSE FOUND (2026-10-03): it is Siril's autostretch, and nothing is clipped
+
+Before building the single-sub core layer described below, its **premise was
+tested and found to be false**, which then led to the actual root cause.
+
+**1. Nothing is saturated in the linear data.** The planned fix assumed "500
+frames of accumulated signal pushed the core into saturation, so pull the core
+from a single, less-saturated sub." Measured on the deep linear stacks:
+
+| target | linear luminance max | px > 0.99 | px > 0.90 |
+|---|---|---|---|
+| M 27 (nebula body) | **0.0128** (1.3% of full scale, 78x headroom) | 0 | 0 |
+| M 13 | 0.9909 | 1 | 19 |
+| M 43 | 0.9518 | 0 | 60 |
+| IC 434 | 0.9255 | 0 | 51 |
+
+The handful of high pixels are *stars*, not nebula cores. M27's nebula body
+peaks at 1.3% of full scale. **There is no clipped information for a
+less-saturated core layer to recover, so that approach cannot work** — do not
+build it. (The star-layer half of `_starless_blend` remains valid; it solves a
+different problem.)
+
+**2. The washed-out M27 on disk is from the OLD pipeline — current code already
+fixes the tone.** `seestar_stacked.jpg` in `M 27_sub/` is dated 2026-09-29 and
+its own `.log` records the *Python* stretch path (`stretch_Q 8.0`, `luma_blur`,
+`chroma_blur`, `unsharp` — none of which exist on the Siril path). Re-rendering
+the same linear FITS with today's code gives materially better tone. Measured
+over a tight nebula-only mask (16,507 px; the middle 50% is where visible
+structure lives):
+
+| render | **IQR** | median | bg sigma | B | G | R | **G-R** |
+|---|---|---|---|---|---|---|---|
+| shipped 2026-09-29 (old pipeline) | 21.1 | 240.4 | 49.51 | 219.2 | 221.4 | 223.2 | **-1.7** |
+| current code (Siril autostretch) | **46.4** | 209.0 | **27.96** | 182.8 | 203.5 | 183.0 | **+20.6** |
+
+Current code more than doubles the levels given to the nebula body (21 -> 46)
+and nearly halves background sigma. **The tone problem is already solved.**
+
+**3. What actually makes the current render look bad is the green tint, not the
+stretch.** G-R goes from -1.7 (old, neutral) to +20.6 (current) — this is the
+*same* green-tint bug documented in the section above, and on a bright extended
+object it dominates the whole nebula rather than just star halos. Visually the
+current M27 reads as a green-cast blob despite its better tone numbers.
+
+**So the "bright-core" limitation and the "green tint" issue are not two
+independent problems on this target — fixing the green tint is what will make
+M27 look right.** That reframes priority: work the green tint (whose root cause
+is localised to the Siril stretch path, per the section above) rather than
+pursuing further core/stretch work here.
+
+**Also corrected:** the earlier claim in this document that Siril "crams the
+nebula into 21 levels" was wrong — that measurement was taken from the stale
+2026-09-29 JPEG, not from Siril. Called directly, `_siril_postprocess` produces
+IQR=46.4/median=209, identical to the Python path. A `black_pct` x `stretch_q`
+sweep (7 combinations, 0-40 x 4-15) produced byte-identical output every time,
+which is itself worth knowing: **those two knobs do not measurably affect the
+Siril path's result on this target.**
 
 ## Next attempt at core-blowout: single-sub star layer, not a masked curve
 
