@@ -395,13 +395,99 @@ IC 434's star-halo mean G-R is *negative* in both the shipped render (-5.11)
 and a fresh correct one (-7.34) — i.e. green sits below red on that metric.
 
 **But the teal halos are still plainly visible in the image**, so the user's
-original observation stands; the effect is real and unexplained. It is a
-hue/saturation effect concentrated in a handful of the brightest stars, not a
-mean-channel-difference effect across many — which is why both the halo-annulus
-G-R metric and a median-hue metric (median sat only 14/255, hues scattered
-16°-333° across 40 stars) fail to capture it. **No metric found so far isolates
-this; judge it visually.** Finding a measurement that tracks what the eye sees
-is the first task for the next attempt, before trying any fix.
+original observation stands. The effect is a hue/saturation phenomenon, not a
+mean-channel-difference one — which is why both the halo-annulus G-R metric and
+a median-hue metric (median sat only 14/255, hues scattered 16°-333°) fail to
+capture it.
+
+### There is now a metric: `teal_halo_metric.py` (2026-10-03)
+
+Counting beats averaging here. A pixel counts as teal if its hue is in the
+green-cyan band (140-200°), it is meaningfully saturated (S >= 30) and bright
+enough to see (V >= 100). The tool reports two numbers and **both matter**:
+`halo%` (teal in a 25px zone around the 60 brightest stars) and `frame%` (teal
+over the whole image).
+
+Measuring only the halo zone gives false "clean" verdicts: on a re-rendered
+M 43 the contamination sits in the nebulosity rather than ringing stars, and
+the star finder found only 7 stars, so halo% read 0.00% on a render whose teal
+is obvious. frame% caught it at 2.57%. Distrust halo% whenever stars < ~20.
+(The star finder uses an absolute luminance percentile, not SEP's sigma-relative
+threshold — renders differ enough in noise that an 8-sigma cut finds zero stars
+on M 13 and SH2-158, whose globalrms is ~31.)
+
+**The split is bimodal, not gradual**, so a threshold separates cleanly:
+
+| affected (frame% / halo%) | | clean (frame%) | |
+|---|---|---|---|
+| M 36 | 4.77 / 6.01 | C 34 - West Veil | 0.267 |
+| M 31_mosaic | 3.68 / 3.94 | M 33 | 0.201 |
+| M 108 | 3.44 / 8.51 | C 34 | 0.154 |
+| M 16_mosaic | 2.76 / 7.46 | M 27 | 0.075 |
+| IC 434 | 2.32 / 5.67 | SH2-158 | 0.042 |
+| M 20 | 2.23 / 4.45 | M 13 | 0.041 |
+| M 1 | 2.17 / 3.53 | M 81 | 0.014 |
+| M 43 | 1.91 / 16.18 | IC 5146 | 0.003 |
+| NGC 5907 | 1.54 / 2.62 | SH2-142 | 0.000 |
+| M 97 | 1.21 / 2.59 | | |
+| M 51 | 0.35 / 14.91 | | |
+
+**11 of 20 archived renders are affected** — this is a widespread defect, not an
+IC 434 quirk.
+
+**Two hypotheses already ruled out with this tool:**
+1. *Stretch path.* Python vs Siril does not correlate — both affected (M 43,
+   IC 434) and clean (M 27, M 81, M 13) targets used the Python path.
+2. *Stale renders / already fixed.* Re-rendering M 43 (worst affected) with
+   current code does **not** fix it: frame% goes 1.91 -> 2.57, slightly worse.
+
+**Bisect results (IC 434, the one modern affected render where every stage ran
+correctly — GraXpert OK, stacked 2026-10-03):**
+
+Measuring teal after applying the *same* stretch to each linear stage's output:
+
+| stage | teal% | bright G/R |
+|---|---|---|
+| raw linear | 0.103 | 1.237 |
+| + `_subtract_background` | 0.098 | 1.237 |
+| + `_color_calibrate` | 0.098 | 1.063 |
+| + `_graxpert_denoise` | 0.099 | 1.128 |
+| + `_scnr_green` | 0.099 | 1.128 |
+
+**No linear stage introduces teal** — all sit at ~0.1%, and the complete Python
+render (stretch + saturation + denoise/sharpen) finishes at **0.074%, clean**.
+The shipped render is 2.321%. So the defect is not in the linear pipeline and
+not in the Python render path; it is specific to how the *stacking job* builds
+its preview.
+
+**Partial cause found: `_scnr_green` never runs on the Siril preview path.**
+`_siril_full_stack` applies `_color_calibrate` and `_graxpert_denoise` before
+writing the linear FITS, but **not** `_scnr_green` — even though its own comment
+cites the green/teal tint as the reason colour calibration is there. In the
+stack job (`STEP 10`), the primary preview is `_siril_postprocess(fits_path,…)`
+reading that SCNR-less FITS; `_scnr_green` appears only in the `if not
+siril_ok:` fallback. So whenever Siril succeeds — the normal case — the
+delivered preview never gets green suppression.
+
+Confirmed by experiment on IC 434's linear FITS:
+
+| input to `_siril_postprocess` | teal% |
+|---|---|
+| without `_scnr_green` (what the job writes) | 1.482 |
+| with `_scnr_green` applied first | 1.023 |
+
+**But this is a contributing factor, not the whole cause.** Adding SCNR helps
+(1.48 -> 1.02) yet both stay above the 0.5% clean threshold, and neither
+reproduces the shipped 2.321% — so at least one more difference between this
+reproduction and the real job remains unaccounted for. **Do not "fix" this by
+just inserting `_scnr_green` and declaring victory**; verify with the metric
+that the result actually lands in the clean band (<=0.3%, where every known-good
+target sits), and account for the gap to 2.321% first.
+
+Ruled out along the way: GraXpert is not the cause (IC 434 had
+`GraXpert denoise : OK` and is still affected). The age correlation is also a
+red herring — 8 of the 11 affected renders are from May 2026, predating
+GraXpert entirely, so "no GraXpert line" there just means "old render".
 
 ## Known limitation: bright-core targets (M42-class) — core still clips to flat white
 
