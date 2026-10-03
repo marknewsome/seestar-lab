@@ -3,7 +3,8 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let _plObjects   = [];   // full result objects list
-let _plFilter    = 'all';
+let _plCatalog   = 'all';   // 'all' | 'messier' | 'caldwell' — mutually exclusive
+let _plStatus    = null;    // null | 'new' | 'reimage' — toggles independently of _plCatalog
 let _plSort      = 'rating';
 let _plMinAlt    = 20;
 let _plTaskId    = null;
@@ -40,11 +41,30 @@ let _plPollTimer = null;
     _plMinAlt = +e.target.value || 20;
     _renderTable();
   });
-  document.querySelectorAll('.planner-filter-btn').forEach(btn => {
+  // Catalog filter: mutually exclusive (All / Messier / Caldwell), like a radio group.
+  document.querySelectorAll('#pl-catalog-group .planner-filter-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('.planner-filter-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('#pl-catalog-group .planner-filter-btn')
+        .forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      _plFilter = btn.dataset.cat;
+      _plCatalog = btn.dataset.cat;
+      _renderTable();
+    });
+  });
+  // Status filter: independent toggle (New / Re-image), combinable with the
+  // catalog filter above — click again to clear, click the other to switch.
+  document.querySelectorAll('#pl-status-group .planner-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const status = btn.dataset.status;
+      const turningOn = !btn.classList.contains('active');
+      document.querySelectorAll('#pl-status-group .planner-filter-btn')
+        .forEach(b => b.classList.remove('active'));
+      if (turningOn) {
+        btn.classList.add('active');
+        _plStatus = status;
+      } else {
+        _plStatus = null;
+      }
       _renderTable();
     });
   });
@@ -198,14 +218,16 @@ function _displayResult(r) {
 function _renderTable() {
   let objs = _plObjects.slice();
 
-  // Filter
-  if (_plFilter === 'messier') {
+  // Filter — catalog and status are independent axes and combine (AND),
+  // e.g. catalog=messier + status=new shows only un-imaged Messier objects.
+  if (_plCatalog === 'messier') {
     objs = objs.filter(o => o.id.startsWith('M'));
-  } else if (_plFilter === 'caldwell') {
+  } else if (_plCatalog === 'caldwell') {
     objs = objs.filter(o => o.id.startsWith('C'));
-  } else if (_plFilter === 'new') {
+  }
+  if (_plStatus === 'new') {
     objs = objs.filter(o => !o.have_data);
-  } else if (_plFilter === 'reimage') {
+  } else if (_plStatus === 'reimage') {
     objs = objs.filter(o => o.user_rating === 'want_more' || o.user_rating === 'priority');
   }
 

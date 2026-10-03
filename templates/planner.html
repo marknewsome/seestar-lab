@@ -122,14 +122,16 @@
 
       <!-- Filter + sort bar -->
       <div class="planner-filter-bar">
-        <div class="planner-filter-group">
+        <div class="planner-filter-group" id="pl-catalog-group">
           <button class="planner-filter-btn active" data-cat="all">All</button>
           <button class="planner-filter-btn" data-cat="messier">Messier</button>
           <button class="planner-filter-btn" data-cat="caldwell">Caldwell</button>
-          <button class="planner-filter-btn planner-filter-btn-new" data-cat="new">
+        </div>
+        <div class="planner-filter-group" id="pl-status-group">
+          <button class="planner-filter-btn planner-filter-btn-new" data-status="new">
             ★ New
           </button>
-          <button class="planner-filter-btn planner-filter-btn-reimage" data-cat="reimage">
+          <button class="planner-filter-btn planner-filter-btn-reimage" data-status="reimage">
             ● Re-image
           </button>
         </div>
