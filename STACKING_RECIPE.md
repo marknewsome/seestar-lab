@@ -342,6 +342,54 @@ dark-background chroma-blur issue above. Two distinct known color-accuracy
 issues exist in this pipeline as of this writing; do not conflate them when
 debugging either one.
 
+### Investigated 2026-10-03: the suggested fix above is a dead end — ruled out
+
+Followed the "tune `_color_calibrate`'s reference-star selection" suggestion
+on a fresh IC 434 stack (500 frames) plus 10 other targets' linear FITS.
+**It does not fix the tint. Do not retry this approach.**
+
+What was tested: the `a < 5.0` size filter was suspected of excluding bright
+bloomed stars from the white-balance sample. It is not the problem — it
+excludes only 3 of 268 detections on IC 434. The *real* defect in the
+selection is different: the sample is dominated by near-noise detections
+(median flux 0.011; only 8 of 246 above flux 1.0), and since the top-200 cut
+(246 -> 200) culls almost nothing, the **median** that sets the correction is
+decided by the faint tail rather than by real stars. Adding a flux floor
+genuinely fixes *that* — measured on the linear intermediate it halved mean
+deviation from neutral across 11 targets (0.096 -> 0.048), and on the two
+worst targets (IC 434, M 43) bright-core G/R went 1.45 -> ~1.05.
+
+**But that improvement does not reach the output, and the change made the
+visible result worse.** Re-rendering end-to-end through `rerender_preview`
+and measuring the star *halos* (3-7px annulus, where the tint actually lives
+— the very cores clip to white and measure neutral, which is why the original
+whole-pixel measurement understated it) showed median G-R moving from -5.11
+to **+1.00**, i.e. halos became *more* green-leaning. Confirmed visually, not
+just numerically. The change was reverted and not committed.
+
+Why the intermediate improves but the output doesn't: after
+`_color_calibrate` the bright pixels are already G/R = 0.77 (green well
+*below* red) — there is no green excess left in the linear data to correct.
+`_scnr_green` then clips G to max(R,B), so G provably cannot exceed both
+other channels at that point either. The green therefore originates
+**downstream of calibration**, in the stretch stage. Note the default path
+is Siril `autostretch -linked` (see `_siril_postprocess`); a linked stretch
+preserves channel ratios and so cannot flip G from below-R to above-R, but it
+does expand small absolute channel gaps by orders of magnitude in the
+mid-tones — a 0.0003 linear gap becomes many 8-bit levels. Via the Python
+`_auto_stretch` fallback path G stays below R (G-R = -0.029) all the way to
+the final image, which further localises the problem to the Siril stretch
+path rather than to colour calibration.
+
+**Next investigator: start at the stretch stage, not `_color_calibrate`.**
+The open question is why the Siril-stretched output shows green halos when
+its input has none. Worth A/B-ing the Siril path against the Python
+`_auto_stretch` path on the same linear FITS and comparing halo G-R, and
+checking whether Siril's own internal processing (or the JPEG chroma
+subsampling at save time) is responsible. Probe scripts used for this
+investigation measured halo annuli rather than whole bright pixels — reuse
+that methodology; whole-pixel means hide the effect.
+
 ## Known limitation: bright-core targets (M42-class) — core still clips to flat white
 
 **Also confirmed on M13 (Hercules Cluster, globular, 500×10s subs, 2026-09-17):**
