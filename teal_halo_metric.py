@@ -82,30 +82,50 @@ def star_zone(im, stars):
 
 
 def score(path, write_mask=False):
+    """
+    Reports TWO numbers, and both matter:
+
+      halo%  teal in the zone around bright stars
+      frame% teal over the whole image
+
+    Measuring only the halo zone produces false "clean" verdicts. On M 43 the
+    contamination is spread through the nebulosity rather than ringing stars,
+    and the star finder located just 7 stars there, so the halo zone missed the
+    affected area entirely and scored 0.00% on a render whose teal is obvious to
+    the eye. The whole-frame number caught it (2.57%). Treat either exceeding
+    its threshold as a defect, and distrust halo% whenever stars < ~20.
+    """
     im = cv2.imread(path)
     if im is None:
         print(f"{path}: cannot read")
         return None
-    stars = find_bright_stars(im)
-    if not stars:
-        print(f"{path}: no stars found")
-        return None
     teal, S = teal_masks(im)
-    zone = star_zone(im, stars)
-    hit = teal & zone
-    pct = 100.0 * hit.sum() / max(zone.sum(), 1)
-    sat = float(S[hit].mean()) if hit.any() else 0.0
-    verdict = "TEAL DEFECT" if pct > 1.0 else "clean"
-    print(f"{path}\n    stars={len(stars)}  teal={pct:.2f}%  mean_sat={sat:.1f}  -> {verdict}")
+    frame_pct = 100.0 * teal.mean()
+
+    stars = find_bright_stars(im)
+    if stars:
+        zone = star_zone(im, stars)
+        hit = teal & zone
+        halo_pct = 100.0 * hit.sum() / max(zone.sum(), 1)
+    else:
+        zone = np.zeros(im.shape[:2], bool)
+        hit = np.zeros(im.shape[:2], bool)
+        halo_pct = float('nan')
+
+    sat = float(S[teal].mean()) if teal.any() else 0.0
+    defect = frame_pct > 0.5 or (len(stars) >= 20 and halo_pct > 1.0)
+    note = "" if len(stars) >= 20 else "  [few stars: halo% unreliable]"
+    print(f"{path}\n    stars={len(stars):<3} halo={halo_pct:6.2f}%  frame={frame_pct:6.3f}%  "
+          f"sat={sat:5.1f}  -> {'TEAL DEFECT' if defect else 'clean'}{note}")
 
     if write_mask:
         vis = im.copy()
-        vis[hit] = (0, 0, 255)
+        vis[teal] = (0, 0, 255)
         out = path.rsplit('.', 1)[0] + "_tealmask.jpg"
         h, w = vis.shape[:2]
         cv2.imwrite(out, cv2.resize(vis, (w // 2, h // 2)))
         print(f"    wrote {out}")
-    return pct
+    return frame_pct
 
 
 if __name__ == "__main__":
