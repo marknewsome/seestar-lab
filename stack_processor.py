@@ -2467,8 +2467,16 @@ def rerender_preview(fits_path: str, jpeg_path: str,
     # If a pre-background-subtraction linear FITS exists (saved during the
     # original stack), use it so we can re-apply bg subtraction with the new
     # mesh scale.  Falls back to the processed FITS for older stacks.
-    linear_fits = str(Path(fits_path).with_name(
-        Path(fits_path).stem + '_linear.fits'))
+    # Accept either the stacked FITS or its _linear sidecar. Passing the
+    # sidecar directly used to append _linear a second time, so has_linear
+    # came out False and the whole calibration block below was silently
+    # skipped — raw data went straight to the stretch, which looks like a
+    # severe green cast in the output.
+    if Path(fits_path).stem.endswith('_linear'):
+        linear_fits = fits_path
+    else:
+        linear_fits = str(Path(fits_path).with_name(
+            Path(fits_path).stem + '_linear.fits'))
     source_fits = linear_fits if os.path.isfile(linear_fits) else fits_path
     has_linear  = os.path.isfile(linear_fits)
 
