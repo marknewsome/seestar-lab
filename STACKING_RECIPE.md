@@ -322,6 +322,56 @@ the no-chroma-blur version, and was reverted rather than merged — the
 `_fixedpipeline_test.jpg` files left in each target's output folder are that
 rejected experiment, not an improvement; disregard them.
 
+## RESOLVED (2026-10-04): green/teal tint on bright stars
+
+**Fixed in commit `9c8cb6a`.** Two defects combined; both are described in
+detail in the investigation notes below, which are kept because several
+plausible-looking hypotheses were ruled out along the way.
+
+1. **`_scnr_green` never ran on the delivered preview.** `_siril_postprocess`
+   renders straight from the linear FITS, and SCNR only ever ran in the
+   callers' `not siril_ok` fallback branches — so whenever Siril succeeded (the
+   normal path) the preview got no green suppression at all. Now applied inside
+   `_siril_postprocess`, to a *temporary copy* so the delivered linear FITS
+   stays raw for Siril/PixInsight users.
+2. **`_scnr_green` used the maximum-neutral variant** (clip G to `max(R, B)`),
+   which still lets green sit well above the weaker channel. Switched to
+   average-neutral (clip to `(R+B)/2`).
+
+**Why the residual mattered even though it is invisible in linear data:** the
+autostretch amplifies it. A linked stretch preserves channel *ratios* but
+expands small *absolute* channel gaps by orders of magnitude in the midtones,
+so a linear G/R of ~1.13 becomes several 8-bit levels of saturation — enough to
+read as teal. Isolated by feeding the same FITS through both stretches: 0.099%
+teal via the Python stretch vs 2.321% via Siril, with a no-stretch control at
+0.000%. The effect scales with how far the stretch lifts the image (1.15% at
+Siril `targetbg` 0.05 rising to 4.79% at 0.30). A global per-channel scale
+cannot fix it, because the residual is brightness-dependent: G/R 0.77 in the
+midtones vs 1.21 in the bright band.
+
+**Verified with `teal_halo_metric.py` across the whole archive — 19 of 19
+re-renderable targets clean, no regressions:**
+
+| target | before | after | | target | before | after |
+|---|---|---|---|---|---|---|
+| M 36 | 4.773% | 0.005% | | M 43 | 1.910% | 0.059% |
+| M 31_mosaic | 3.681% | 0.000% | | NGC 5907 | 1.543% | 0.000% |
+| M 108 | 3.441% | 0.000% | | M 97 | 1.210% | 0.000% |
+| M 16_mosaic | 2.758% | 0.007% | | C 34 - West Veil | 0.267% | 0.001% |
+| IC 434 | 2.321% | 0.142% | | M 33 | 0.201% | 0.000% |
+| M 20 | 2.225% | 0.003% | | M 27 | 0.075% | 0.000% |
+| M 1 | 2.173% | 0.000% | | others | <0.05% | 0.000% |
+
+Genuine colour is preserved: M 27, a real teal planetary nebula, is
+essentially unchanged (nebula G 220.2 -> 218.5, median saturation 6.0 -> 5.0).
+
+**Note:** existing JPEGs on disk still show the old tint — they are stale
+outputs. Re-render to pick up the fix.
+
+---
+
+### Original investigation notes (kept for the ruled-out hypotheses)
+
 ## Known issue: green tint on bright stars, separate from the chroma-blur bug
 
 Independently of the chroma-blur dark-background tint above, bright star
