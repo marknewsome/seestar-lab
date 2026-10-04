@@ -60,12 +60,13 @@
       <button class="filter-btn"        data-group="other"   data-label="Other">Other</button>
     </div>
 
-    <!-- Captured / all toggle -->
+    <!-- Capture-status filter -->
     <div class="catalog-toggle">
-      <label class="toggle-label">
-        <input type="checkbox" id="captured-only" />
-        Show captured only
-      </label>
+      <div class="filter-bar catalog-status-bar" id="status-filter">
+        <button class="filter-btn active" data-status="all">All</button>
+        <button class="filter-btn"        data-status="captured">Captured only</button>
+        <button class="filter-btn"        data-status="missing">Missing only</button>
+      </div>
     </div>
 
     <!-- Loading state -->

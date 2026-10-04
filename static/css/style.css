@@ -965,21 +965,15 @@ main {
   margin-bottom: 1rem;
 }
 
-.toggle-label {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.85rem;
-  color: var(--text-muted);
-  cursor: pointer;
-  user-select: none;
+/* Capture-status filter sits under the type tabs; slightly smaller so the
+   two rows read as primary (type) and secondary (status). */
+.catalog-status-bar {
+  margin-bottom: 0;
 }
 
-.toggle-label input[type="checkbox"] {
-  accent-color: var(--accent);
-  width: 1rem;
-  height: 1rem;
-  cursor: pointer;
+.catalog-status-bar .filter-btn {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.75rem;
 }
 
 /* ── Catalog grid ────────────────────────────────────────────────────────── */

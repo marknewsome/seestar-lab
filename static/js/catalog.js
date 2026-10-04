@@ -3,7 +3,7 @@
 // ── State ──────────────────────────────────────────────────────────────────────
 let allItems      = [];   // full catalog from API
 let activeGroup   = 'all';
-let capturedOnly  = false;
+let activeStatus  = 'all';   // 'all' | 'captured' | 'missing'
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -16,9 +16,16 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  document.getElementById('captured-only').addEventListener('change', e => {
-    capturedOnly = e.target.checked;
-    applyFilter();
+  // Capture-status filter: mutually exclusive, and combines with the type
+  // tabs above (e.g. Galaxies + Missing only).
+  document.querySelectorAll('#status-filter .filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#status-filter .filter-btn')
+        .forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activeStatus = btn.dataset.status;
+      applyFilter();
+    });
   });
 
   loadCatalog();
@@ -58,7 +65,10 @@ function applyFilter() {
   document.querySelectorAll('.cat-card').forEach(el => {
     const group    = el.dataset.group;
     const captured = el.dataset.captured === '1';
-    const show = (!capturedOnly || captured) &&
+    const statusOk = activeStatus === 'all'
+                  || (activeStatus === 'captured' && captured)
+                  || (activeStatus === 'missing'  && !captured);
+    const show = statusOk &&
                  (activeGroup === 'all' || group === activeGroup);
     el.style.display = show ? '' : 'none';
     if (show) anyVisible = true;
@@ -71,9 +81,13 @@ function applyFilter() {
       empty = document.createElement('div');
       empty.className = 'empty-state cat-empty-msg';
       empty.style.gridColumn = '1 / -1';
-      empty.innerHTML = '<div class="empty-icon">🔭</div><p>No objects match this filter.</p>';
       grid.appendChild(empty);
     }
+    // "Missing only" with nothing left means the set is complete — that is a
+    // result worth celebrating, not an empty-filter dead end.
+    empty.innerHTML = activeStatus === 'missing'
+      ? '<div class="empty-icon">✦</div><p>Nothing left to capture here — this set is complete.</p>'
+      : '<div class="empty-icon">🔭</div><p>No objects match this filter.</p>';
   } else if (empty) {
     empty.remove();
   }
