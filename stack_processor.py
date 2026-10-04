@@ -765,14 +765,30 @@ def _chroma_smooth(img: np.ndarray, sigma: float = 2.0) -> np.ndarray:
 
 def _scnr_green(img: np.ndarray) -> np.ndarray:
     """
-    Maximum-neutral Subtractive Chromatic Noise Reduction for the green channel.
+    Average-neutral Subtractive Chromatic Noise Reduction for the green channel.
     OSC Bayer sensors have 2× as many green photosites as red or blue, so the
-    integrated stack always has excess green noise.  This clips the green channel
-    to max(R, B) wherever it exceeds that value — the standard Siril SCNR step.
+    integrated stack always has excess green noise. This clips green to the mean
+    of R and B wherever it exceeds that.
+
+    Average-neutral rather than the maximum-neutral variant (clip to max(R, B)),
+    which leaves a residual imbalance the stretch then amplifies into visible
+    teal star halos: max(R, B) still lets G sit well above the *weaker* channel,
+    and a linked autostretch — while preserving linear channel ratios — expands
+    small absolute channel gaps by orders of magnitude in the midtones, so a
+    G/R of ~1.13 in linear data becomes several 8-bit levels of saturation. The
+    effect scales with how much the stretch lifts the image (measured on IC 434:
+    teal 1.15% at Siril targetbg 0.05 rising to 4.79% at 0.30), which is why it
+    cannot be corrected by a global per-channel scale — the residual is
+    brightness-dependent (G/R 0.77 in midtones vs 1.21 in the bright band).
+
+    Measured on IC 434 via teal_halo_metric.py: 2.321% -> 0.142%, with no
+    regression on clean targets (M 27, M 81, M 13, IC 5146 all <= 0.072%) and
+    no loss of genuine colour on M 27, a real teal planetary nebula (nebula
+    G 220.2 -> 218.5, median saturation 6.0 -> 5.0).
     """
     result = img.copy()
     result[:, :, 1] = np.minimum(img[:, :, 1],
-                                  np.maximum(img[:, :, 2], img[:, :, 0]))
+                                 (img[:, :, 2] + img[:, :, 0]) / 2.0)
     return result
 
 
@@ -1264,6 +1280,30 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
         except Exception:
             return path
 
+    # Green suppression before the stretch. The delivered linear FITS is left
+    # untouched (users open it in Siril/PixInsight and expect raw linear data),
+    # so SCNR is applied to a temporary copy that only feeds the preview. It has
+    # to happen pre-stretch: the residual green is tiny in linear data and only
+    # becomes visible because the autostretch amplifies it (see _scnr_green).
+    # Previously SCNR ran only in the callers' not-siril_ok fallback branches,
+    # so every preview rendered by this function — the normal path — skipped it.
+    scnr_fits = None
+    try:
+        from astropy.io import fits as _fits
+        with _fits.open(fits_path) as _h:
+            _d = _h[0].data
+        if _d is not None and _d.ndim == 3 and _d.shape[0] == 3:
+            _bgr = np.stack([_d[2], _d[1], _d[0]], axis=2).astype(np.float32)
+            scnr_fits = str(Path(fits_path).with_name(
+                Path(fits_path).stem + '_scnr_tmp.fits'))
+            if _write_fits(scnr_fits, _scnr_green(_bgr), Path(fits_path).stem):
+                fits_path = scnr_fits
+            else:
+                scnr_fits = None
+    except Exception as exc:
+        logging.warning(f"SCNR before Siril preview failed, using FITS as-is: {exc}")
+        scnr_fits = None
+
     fits_win = to_win(fits_path)
     jpeg_win = to_win(os.path.splitext(jpeg_path)[0])  # Siril appends .jpg itself
 
@@ -1348,6 +1388,13 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
         except Exception:
             pass
         return False
+
+    finally:
+        if scnr_fits:
+            try:
+                os.unlink(scnr_fits)
+            except OSError:
+                pass
 
 
 # ── Siril full pipeline (register + stack + preview) ─────────────────────────
