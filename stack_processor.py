@@ -1312,7 +1312,7 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
                        targetbg:    float = 0.15,
                        chroma_k:    int   = _CHROMA_BLUR_K,
                        chroma_sig:  float = _CHROMA_BLUR_SIG,
-                       core_rescue: bool  = True) -> bool:
+                       core_rescue: bool  = False) -> bool:
     """
     Call the Windows Siril CLI to produce a finished JPEG from a linear FITS.
 
@@ -1423,17 +1423,28 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
         if os.path.isfile(expected) and expected != jpeg_path:
             os.replace(expected, jpeg_path)
 
-        # Bright-core rescue. targetbg 0.15 is tuned for faint extended targets
-        # and is right for most of the archive, but on a target with a compact
-        # bright core (planetary nebula, globular, emission-nebula knot) it
-        # pushes the whole object against white: M 27's nebula body lands with
-        # its middle 50% inside 24 of 255 levels and 46.5% of it above 240,
-        # which is the long-standing "core clips to a flat white blob" problem.
-        # Nothing is clipped in the linear data — it is purely where the stretch
-        # puts it — so re-rendering darker recovers the structure: M 27 goes to
-        # IQR 56 with 0.1% blown (from 25.5%), and background sigma drops too.
-        # Detect rather than guess, since lowering it globally measurably dims
-        # faint targets like the Veil, where 0.15 is the better result.
+        # Bright-core rescue — OPT-IN (core_rescue defaults False).
+        #
+        # targetbg 0.15 pushes a compact bright core against white: M 27's
+        # nebula body lands with its middle 50% inside 24 of 255 levels and
+        # 46.5% of it above 240, the long-standing "core clips to a flat white
+        # blob" problem. Nothing is clipped in the linear data, so re-rendering
+        # at 0.05 recovers it — M 27 goes to IQR 56 with 0.1% blown (from
+        # 25.5%), M 13 resolves stars into the core.
+        #
+        # It is NOT on by default because the rescue always costs faint signal:
+        # measured across every flagged target, the faint band (above sky, below
+        # the core) loses 12-21% of its pixels — IC 434 -21.1%, M 81 -15.7%,
+        # M 27 -11.9%, M 31 -29%. On M 31 and IC 434 the trade is visibly bad,
+        # the outer disc and the red nebulosity dimming for a better core.
+        #
+        # Nor is the detection reliable enough to automate: no measured
+        # statistic separates "genuinely blown nebula core" from "bright star
+        # glow" or "galaxy bulge worth keeping". Blob area, faint-band fraction
+        # and blob-interior saturation were all tried; IC 434 (a star glow)
+        # scores as blown as M 13 (a real globular core) on every one. Which
+        # rendering is better is a per-target judgement, so it is exposed as a
+        # switch rather than guessed at.
         if core_rescue and targetbg > _CORE_RESCUE_TARGETBG:
             if _blown_core_area(jpeg_path) > _CORE_BLOWN_MIN_AREA:
                 progress_cb(50, "Bright core detected — re-rendering darker")
@@ -2578,7 +2589,8 @@ def rerender_preview(fits_path: str, jpeg_path: str,
                      star_reduce:      float = _STAR_REDUCE,
                      star_reduce_maxr: int   = _STAR_REDUCE_MAXR,
                      starless_blend:      bool = False,
-                     starless_star_sub                = None) -> str:
+                     starless_star_sub                = None,
+                     core_rescue:         bool        = False) -> str:
     """
     Regenerate the preview JPEG from an already-stacked FITS file without
     re-running frame alignment.  All post-processing parameters are tunable.
@@ -2696,6 +2708,7 @@ def rerender_preview(fits_path: str, jpeg_path: str,
                     progress_cb=lambda p, msg, *_a: progress_cb(70 + int(p * 0.15), msg, 0, 0),
                     shadowsclip=shadowsclip, targetbg=targetbg,
                     chroma_k=chroma_k, chroma_sig=chroma_sig,
+                    core_rescue=core_rescue,
                 )
             finally:
                 try:

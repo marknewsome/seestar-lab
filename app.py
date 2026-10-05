@@ -898,6 +898,7 @@ def api_stack_rerender(session_name: str):
     star_reduce_maxr = int(body.get("star_reduce_maxr", _STAR_REDUCE_MAXR))
     starless_blend    = bool(body.get("starless_blend", False))
     starless_star_sub = body.get("starless_star_sub") or None
+    core_rescue       = bool(body.get("core_rescue", False))
 
     frames_total    = job.get("frames_total", 0) or 0
     frames_accepted = job.get("frames_accepted", 0) or 0
@@ -938,7 +939,8 @@ def api_stack_rerender(session_name: str):
                              star_reduce=star_reduce,
                              star_reduce_maxr=star_reduce_maxr,
                              starless_blend=starless_blend,
-                             starless_star_sub=starless_star_sub)
+                             starless_star_sub=starless_star_sub,
+                             core_rescue=core_rescue)
             db.finish_stack_job(session_name, output_path,
                                 frames_accepted, frames_total)
             _broadcast({"type": "stack_done", "session_name": session_name,
