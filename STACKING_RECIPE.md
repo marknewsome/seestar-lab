@@ -639,10 +639,36 @@ default targetbg, the two groups sit 3.5x either side of a 2,000px threshold:
 | M 81 | 4,939 | IC 5146 | 2 |
 
 Results after the rescue: M 27 8,153 -> 238, M 81 4,939 -> 928, IC 434
-5,050 -> 1,694, with every faint target untouched. **M 43 and M 13 only halve**
-(33,252 -> 16,789 and 9,970 -> 3,879) — their cores are intrinsically extreme,
-so they improve markedly but are not fully solved. That residue is the only
-part of this limitation that remains.
+5,050 -> 1,694. **M 43 and M 13 only halve** (33,252 -> 16,789 and 9,970 ->
+3,879) — their cores are intrinsically extreme.
+
+### …but it is OPT-IN, not automatic (`core_rescue`, default False)
+
+Applying it across the archive showed **the rescue always costs faint signal**.
+The faint band (above sky, below the core) loses pixels on every flagged
+target: IC 434 **-21.1%**, M 31 **-29%**, M 81 **-15.7%**, M 27 **-11.9%**. On
+M 31 the outer disc visibly dims, and on IC 434 the red nebulosity does — in
+both cases a worse picture overall despite the better core.
+
+**Detection is not reliable enough to automate.** Three discriminators were
+tried and none separates "genuinely blown nebula core" from "bright star glow"
+or "galaxy bulge worth keeping":
+
+| statistic | why it fails |
+|---|---|
+| eroded blob area | IC 434 (a star glow) scores 5,050 — above M 81's real 4,939 |
+| faint-band fraction | all six flagged targets cluster at 35-40% |
+| blob-interior saturation | IC 434 17.5% ≈ M 13's 18.5% real globular core |
+
+So which render is better is a **per-target judgement call**, exposed as a
+switch (`core_rescue` on `rerender_preview` and `/api/stack/rerender`) rather
+than guessed at. Default off; no archived render is changed by it.
+
+**Worth knowing if revisiting:** an earlier version of this note claimed the
+rescue was safe to run automatically because faint targets were "untouched".
+That was measured only on targets the detector *didn't* flag. Measuring the
+flagged ones showed the cost, and six archived renders were restored after
+being re-rendered on that mistaken basis.
 
 ### Original investigation notes (kept for the ruled-out approaches)
 
