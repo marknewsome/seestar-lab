@@ -596,6 +596,56 @@ Ruled out along the way: GraXpert is not the cause (IC 434 had
 red herring — 8 of the 11 affected renders are from May 2026, predating
 GraXpert entirely, so "no GraXpert line" there just means "old render".
 
+## LARGELY RESOLVED (2026-10-05): bright-core targets — it was targetbg all along
+
+**Fixed in commit `54e0605`.** The sections below record a long search for a
+tone-mapping technique (three masked-curve attempts, CLAHE in four variants,
+a single-sub core layer whose premise turned out to be false). The actual cause
+was far more mundane: **`targetbg`**.
+
+Siril's autostretch runs at `targetbg 0.15`, which was tuned for faint extended
+targets and is right for most of the archive. On a target with a compact bright
+core it pushes the whole object against white — M 27's nebula body lands with
+its middle 50% inside **24 of 255 levels**, 46.5% of it above 240. Nothing is
+clipped in the linear data (that finding stands); it is purely *where the
+stretch puts it*. Re-rendering at `targetbg 0.05`:
+
+| | targetbg 0.15 | targetbg 0.05 |
+|---|---|---|
+| M 27 body IQR | 24 | **56** |
+| M 27 body >245 | 25.5% | **0.1%** |
+| M 27 background σ | 8.54 | **2.91** |
+
+Better on every axis, including noise. M 13 goes from "flat white blob with no
+resolved stars" to individual stars visible well into the core.
+
+**Lowering it globally is wrong**, which is presumably why this was never
+found: faint targets measurably dim (median luminance roughly halves across the
+board), and on the Veil the 0.15 render is visibly better — more filament
+structure, more faint outer wisps. So the fix **detects** instead.
+
+**The detector matters as much as the fix.** Percent-above-threshold does not
+work: a dense star field scores as high as a blown core. What separates them is
+measuring the largest *contiguous* near-white region **after eroding away
+isolated star cores** (`_blown_core_area`). Measured across the archive at the
+default targetbg, the two groups sit 3.5x either side of a 2,000px threshold:
+
+| needs rescue (px) | | leave alone (px) | |
+|---|---|---|---|
+| M 43 | 33,252 | C 34 West Veil | 1,412 |
+| M 13 | 9,970 | M 33 | 452 |
+| M 27 | 8,153 | SH2-142 | 269 |
+| IC 434 | 5,050 | M 36 | 90 |
+| M 81 | 4,939 | IC 5146 | 2 |
+
+Results after the rescue: M 27 8,153 -> 238, M 81 4,939 -> 928, IC 434
+5,050 -> 1,694, with every faint target untouched. **M 43 and M 13 only halve**
+(33,252 -> 16,789 and 9,970 -> 3,879) — their cores are intrinsically extreme,
+so they improve markedly but are not fully solved. That residue is the only
+part of this limitation that remains.
+
+### Original investigation notes (kept for the ruled-out approaches)
+
 ## Known limitation: bright-core targets (M42-class) — core still clips to flat white
 
 **Also confirmed on M13 (Hercules Cluster, globular, 500×10s subs, 2026-09-17):**
