@@ -226,15 +226,72 @@ load pixel data — keeps this fast even on large pools; ~90s for one session
 of 27,850 frames across 88 nights, sampling 8 frames/night).
 
 There is evidence the vendor's own onboard/live stacking software handles
-warm-sensor conditions meaningfully better than a from-scratch pipeline
-without deliberate work: comparing this pipeline's output against the
-Seestar app's own onboard-stacked JPEG for the same target under similarly
-warm conditions showed the vendor output at roughly 1/3 the noise (σ≈14-17
-vs σ≈44-49). No dark/bias calibration frames were found saved anywhere
-accessible in the raw session data, so the vendor's technique (if it is
-darks/bias calibration, which is the most likely explanation) is not
-directly reproducible from available data — worth investigating if pursuing
-this further, but not yet solved.
+warm-sensor conditions better than this pipeline. **Re-measured 2026-10-05;
+the numbers below correct two wrong claims in the earlier version of this
+note.**
+
+**Dark subtraction is NOT the explanation — ruled out.** It was the leading
+hypothesis ("no darks found in the session data, so we can't reproduce it").
+Testing for the fixed pattern a dark frame would remove, on a warm M 81
+session (21.5°C, 60 sampled subs): **zero pixels above 5σ**, spatial structure
+only **0.09×** the temporal noise, and raw subs have `min = 0 ADU` with no
+hot-pixel tail. A genuinely uncalibrated CMOS frame has a bias pedestal of a
+few hundred ADU plus hot pixels. **The Seestar already applies dark/bias
+calibration on-device before writing each `.fit`**, so there is nothing left
+for us to subtract and adding dark support would gain exactly nothing.
+
+**The gap is ~1.6-2.9×, not 3×, and the earlier σ≈44-49 figure does not
+reproduce.** Comparing like-for-like needs care, because our render puts the
+background much darker than the vendor's (bg level 5.5-11.6 vs 21.2-28.6), and
+a darker render has lower absolute σ for free. Measured three ways:
+
+| target | vendor σ (bg level) | ours σ (bg level) | ours scaled to vendor's bg |
+|---|---|---|---|
+| M 81 (568f) | 8.35 (26.1) | 4.41 (8.1) | 14.28 → **1.71×** |
+| M 27 (437f) | 9.18 (28.6) | 3.65 (7.2) | 14.53 → **1.58×** |
+| IC 434 (1032f) | 5.63 (21.2) | 4.18 (5.5) | 16.16 → **2.87×** |
+
+So on raw absolute σ we look *better* than the vendor, which is misleading; at
+matched background brightness we are 1.6-2.9× noisier. Use the matched-level
+comparison — absolute σ and σ/level both mislead on their own.
+
+**Still unexplained**, but the remaining candidates are narrower: the vendor
+likely applies its own noise reduction to the onboard JPEG, and/or benefits
+from live per-frame rejection we don't replicate. Worth noting the vendor
+stacks are also *fewer frames* than ours in every case above and still come
+out cleaner at matched brightness.
+
+### Firmware eras change the raw frames (surveyed 2026-10-05)
+
+The archive spans **14 Seestar firmware versions** (`PROGRAM` header), 4.43
+through 9.31, April 2025 to October 2026. Two things worth knowing:
+
+- **Resolution has never changed** — every frame sampled across every era is
+  1080×1920. Any resolution difference between old and new captures is not
+  something this archive contains.
+- **Bias handling changed twice, and it is visible in the pixel data.**
+
+| era | `BIAS` header | raw pixel floor |
+|---|---|---|
+| fw 4.43 | absent | pedestal present (p1 ≈ 508-743) |
+| fw 6.70-8.46 | absent | pedestal removed on-device (p1 ≈ 0-32, `min = 0`) |
+| fw 9.16+ | **present, ≈466-467** | pedestal restored (`min` ≈ 300-600) |
+
+Header keywords were also added over time: `EQMODE`/`WIDECAM` by fw 5.50,
+`DATE-EXP` by fw 6.70, `BIAS` by fw 9.16. Nothing has been removed.
+
+**No pipeline change is needed for this, but the reason is worth recording so
+it isn't re-litigated:** the pedestal is a constant offset, and every stage
+that could care about it already subtracts a background first. Frame quality
+scoring computes `green - bkg.back()` before `sep.extract` and divides SNR by
+`globalrms` rather than the raw level, so scores are unaffected; Siril's
+`-norm=addscale` and `_subtract_background` handle it downstream. The pipeline
+never reads the `BIAS` keyword and does not need to.
+
+**The mid-era (fw 6.70-8.46) frames are the relevant ones for the dark-current
+test above** — their `min = 0` floor is what shows the device was subtracting
+bias/dark itself. On fw 9.x frames that test would need the ~467 ADU pedestal
+removed first before the same conclusion could be drawn.
 
 **"Just use the coldest night" does not automatically help — tested and
 measured, not just assumed (M81, 2026-09-30).** M81's pool spans 6 nights;
