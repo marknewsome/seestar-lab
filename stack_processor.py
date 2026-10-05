@@ -1277,12 +1277,42 @@ SIRIL_CLI          = "/mnt/c/Program Files/Siril/bin/siril-cli.exe"
 SIRIL_WIN_WORK_BASE = "/mnt/g/Temp"   # Windows-accessible temp root for Siril jobs
 
 
+_CORE_BLOWN_MIN_AREA = 2000   # px; largest contiguous near-white region, after
+                              # eroding away isolated star cores, that marks a
+                              # target as having a blown-out core. Measured on
+                              # the archive at the default targetbg: bright-core
+                              # targets (M 27, M 43, M 13, M 81, IC 434) land at
+                              # 4,939-33,252px, faint extended ones (Veil,
+                              # SH2-142, M 33, IC 5146, M 36) at 2-1,412px.
+_CORE_RESCUE_TARGETBG = 0.05  # targetbg to re-render with when a core is blown
+
+
+def _blown_core_area(jpeg_path: str) -> int:
+    """
+    Largest contiguous near-white region in a rendered JPEG, after eroding away
+    isolated star cores. Distinguishes "a bright compact object clipped to a
+    flat white blob" from "a normal field with bright stars in it" — plain
+    percent-above-threshold does not, because a dense star field scores just as
+    high as a blown nebula core.
+    """
+    img = cv2.imread(jpeg_path)
+    if img is None:
+        return 0
+    lum = (0.299 * img[:, :, 2] + 0.587 * img[:, :, 1]
+           + 0.114 * img[:, :, 0]).astype(np.float32)
+    hot = (lum > 235).astype(np.uint8)
+    eroded = cv2.erode(hot, np.ones((7, 7), np.uint8))
+    n, _lab, stats, _c = cv2.connectedComponentsWithStats(eroded, 8)
+    return int(stats[1:, cv2.CC_STAT_AREA].max()) if n > 1 else 0
+
+
 def _siril_postprocess(fits_path: str, jpeg_path: str,
                        progress_cb: Optional[Callable] = None,
                        shadowsclip: float = -2.00,
                        targetbg:    float = 0.15,
                        chroma_k:    int   = _CHROMA_BLUR_K,
-                       chroma_sig:  float = _CHROMA_BLUR_SIG) -> bool:
+                       chroma_sig:  float = _CHROMA_BLUR_SIG,
+                       core_rescue: bool  = True) -> bool:
     """
     Call the Windows Siril CLI to produce a finished JPEG from a linear FITS.
 
@@ -1323,6 +1353,7 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
     # becomes visible because the autostretch amplifies it (see _scnr_green).
     # Previously SCNR ran only in the callers' not-siril_ok fallback branches,
     # so every preview rendered by this function — the normal path — skipped it.
+    orig_fits_path = fits_path   # before the SCNR temp swap below, for retries
     scnr_fits = None
     try:
         from astropy.io import fits as _fits
@@ -1391,6 +1422,29 @@ def _siril_postprocess(fits_path: str, jpeg_path: str,
         expected = os.path.splitext(jpeg_path)[0] + '.jpg'
         if os.path.isfile(expected) and expected != jpeg_path:
             os.replace(expected, jpeg_path)
+
+        # Bright-core rescue. targetbg 0.15 is tuned for faint extended targets
+        # and is right for most of the archive, but on a target with a compact
+        # bright core (planetary nebula, globular, emission-nebula knot) it
+        # pushes the whole object against white: M 27's nebula body lands with
+        # its middle 50% inside 24 of 255 levels and 46.5% of it above 240,
+        # which is the long-standing "core clips to a flat white blob" problem.
+        # Nothing is clipped in the linear data — it is purely where the stretch
+        # puts it — so re-rendering darker recovers the structure: M 27 goes to
+        # IQR 56 with 0.1% blown (from 25.5%), and background sigma drops too.
+        # Detect rather than guess, since lowering it globally measurably dims
+        # faint targets like the Veil, where 0.15 is the better result.
+        if core_rescue and targetbg > _CORE_RESCUE_TARGETBG:
+            if _blown_core_area(jpeg_path) > _CORE_BLOWN_MIN_AREA:
+                progress_cb(50, "Bright core detected — re-rendering darker")
+                # orig_fits_path, not fits_path: by here fits_path points at
+                # this call's SCNR temp copy, which the finally below deletes.
+                return _siril_postprocess(
+                    orig_fits_path, jpeg_path, progress_cb,
+                    shadowsclip=shadowsclip, targetbg=_CORE_RESCUE_TARGETBG,
+                    chroma_k=chroma_k, chroma_sig=chroma_sig,
+                    core_rescue=False,
+                )
 
         # Chroma-only denoise on the stretched JPEG. Siril's autostretch
         # path has no color noise reduction of its own (unlike the Python
