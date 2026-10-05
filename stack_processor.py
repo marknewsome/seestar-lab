@@ -877,6 +877,18 @@ def _reduce_stars(img: np.ndarray, amount: float = 0.5, max_radius: int = 25) ->
 
 _STARLESS_MAX_RADIUS = 12    # px; excludes large bright non-stellar blobs (nebula cores)
 _STARLESS_MAX_ELONG  = 2.5   # a/b ratio; real stars are round, nebula wisps are elongated
+_STARLESS_MASK_MULT  = 1.5   # mask radius as a multiple of each star's SEP a/b.
+                             # Was 2.5, which is fine on a sparse field but on a
+                             # dense one (SH2-142, ~9.7k stars) masked 25.3% of
+                             # the frame and merged neighbouring circles into
+                             # large contiguous holes — 790 blobs bigger than 3x
+                             # a lone circle, the largest 90x — which the fill
+                             # cannot handle convincingly, reading as halos and
+                             # softness. At 1.5 the same field masks 14.8% with
+                             # a largest blob of 902px (vs 4514px).
+_STARLESS_FILL_K     = 21    # median kernel for filling masked star positions;
+                             # must comfortably exceed the largest mask radius
+                             # so the window still sees unmasked background.
 _STAR_LAYER_MAX_RADIUS = 10
 _STAR_LAYER_MAX_ELONG  = 2.0
 
@@ -931,7 +943,7 @@ def _build_starless_layer(img: np.ndarray) -> np.ndarray:
     h, w = luma.shape
     mask = np.zeros((h, w), dtype=np.uint8)
     for o in stars:
-        r = max(int(round(max(float(o['a']), float(o['b'])) * 2.5)), 3)
+        r = max(int(round(max(float(o['a']), float(o['b'])) * _STARLESS_MASK_MULT)), 2)
         cv2.circle(mask, (int(round(o['x'])), int(round(o['y']))), r, 255, -1)
     if not np.any(mask):
         return img.copy()
@@ -940,9 +952,33 @@ def _build_starless_layer(img: np.ndarray) -> np.ndarray:
     for c in range(3):
         ch = img[:, :, c]
         scale = max(float(np.percentile(ch, 99.5)), 1e-8)
-        ch_u8 = np.clip(ch / scale * 255.0, 0, 255).astype(np.uint8)
-        inpainted_u8 = cv2.inpaint(ch_u8, mask, 5, cv2.INPAINT_TELEA)
-        starless[:, :, c] = inpainted_u8.astype(np.float32) / 255.0 * scale
+        # sqrt companding before the uint8 round-trip cv2.inpaint forces on us.
+        # Linear astro data is extremely bottom-heavy — SH2-142's median sits at
+        # 0.3% of the p99.5 scale, i.e. 8-bit level 0.83 — so quantising it
+        # linearly sent 54.9% of pixels to zero and gave a 100% median relative
+        # error, erasing exactly the faint nebulosity this function exists to
+        # preserve. Companding drops that to 0.8% zeros and 5.5% median error.
+        # Pixels above the scale clip either way, but those are the star cores
+        # being inpainted away, so the clipping is harmless.
+        norm = np.clip(ch / scale, 0.0, 1.0)
+        ch_u8 = np.clip(np.sqrt(norm) * 255.0, 0, 255).astype(np.uint8)
+        # A wide median fill rather than cv2.inpaint. Both TELEA and NS
+        # propagate inward from the mask boundary, and on a dense field those
+        # boundary pixels still sit in star halo, so each hole fills far too
+        # bright and reads as a ring/donut: measured against the local
+        # background on SH2-142, TELEA lands at 2.40x and NS at 3.02x (NS is
+        # worse, despite being the obvious alternative to try), while a median
+        # lands at 1.11x. A median ignores bright outliers instead of
+        # propagating them, which is exactly the right behaviour for stars.
+        filled_u8 = cv2.medianBlur(ch_u8, _STARLESS_FILL_K)
+        filled = (filled_u8.astype(np.float32) / 255.0) ** 2 * scale
+        # Keep the original float pixels everywhere the mask didn't touch.
+        # The fill returns a whole new image, so taking it wholesale would push
+        # the uint8 round-trip's residual error into untouched nebulosity
+        # (measured 6.4% median change outside the mask on SH2-142) — the exact
+        # "slight overall softness vs the plain stack" this function was
+        # reported for. Only masked pixels have anything to gain from it.
+        starless[:, :, c] = np.where(mask > 0, filled, ch)
     return starless
 
 

@@ -906,15 +906,60 @@ harder problem than filling isolated small circles — the artifact reads
 like inpaint-boundary softness bleeding into the surrounding real pixels
 where the mask covers a large fraction of a local neighborhood.
 
-**Not yet fixed.** Next steps to try, in likely order of impact:
-- Tighten the mask radius multiplier (currently 2.5×) for dense fields, or
-  scale it inversely with local star density instead of a fixed constant
-- Investigate `cv2.INPAINT_NS` (Navier-Stokes) as an alternative to TELEA —
-  different failure characteristics on large contiguous regions
-- Consider capping how much of the frame the starless mask is allowed to
-  cover before falling back to `_reduce_stars`'s lighter erosion approach
-  instead (i.e. pick the technique per-field based on measured star
-  density, not a single hardcoded approach)
+### Root-caused 2026-10-05: the mask is too SMALL, not too large
+
+The suspicion above (mask circles merging into large holes TELEA can't fill)
+is real but **is not the main cause**, and the suggested fixes were tested and
+largely do not work. Measured on SH2-142:
+
+- **The mask covers a star's core but not its halo.** For the 200 brightest
+  stars the profile only falls to 2x background at a **median 26px radius**,
+  while SEP's `a/b` is a median 2.1px, giving a mask radius of just **3.2px** at
+  the old 2.5x multiplier. So each star loses its core and keeps its entire
+  halo — and that surviving ring of halo *is* the reported artifact.
+- **Fixing it by enlarging the mask is self-defeating on a dense field.**
+  Scaling the radius with brightness so halos are actually covered needs
+  **43-67% of the frame** masked at ~9.7k stars. That is no longer "removing
+  stars from nebulosity"; it is erasing most of the image and interpolating it
+  back. This is a structural limit of mask-and-fill on dense fields, not a
+  tuning problem.
+- **`cv2.INPAINT_NS` is worse, not better.** Both inpainters propagate inward
+  from the mask boundary, and on a dense field those boundary pixels are
+  themselves in star halo, so holes fill too bright. Measured against local
+  background: TELEA 2.40x, NS 3.02x. A plain wide median lands at **1.11x**,
+  because it ignores bright outliers instead of propagating them.
+
+**Three fixes applied** (commit below). They do not make dense fields work, but
+they remove real defects that were degrading *every* field:
+
+1. **sqrt companding before `cv2.inpaint`'s forced uint8 round-trip.** Linear
+   astro data is extremely bottom-heavy — SH2-142's median sits at 0.3% of the
+   p99.5 scale, i.e. 8-bit level 0.83 — so quantising linearly sent **54.9% of
+   pixels to zero** with a **100% median relative error**, erasing exactly the
+   faint nebulosity this code exists to preserve. Companding: 0.8% zeros, 5.5%
+   median error.
+2. **Composite only masked pixels.** The fill returns a whole new image, and
+   taking it wholesale pushed the round-trip's residual error into untouched
+   nebulosity (6.4% median change outside the mask) — the "slight overall
+   softness vs the plain stack" originally reported. Now 0.000% outside.
+3. **Median fill instead of TELEA**, and mask multiplier 2.5 -> 1.5.
+
+Result on a *sparse* field (M 43, 715 stars, 1.36% coverage), which is what
+this feature was built for: nebulosity fully intact, 95.7% of masked-star
+brightness removed, only a few faint residual rings. On SH2-142 (9,720 stars,
+9.90% coverage) the rings remain clearly visible — **dense fields are still not
+usable.**
+
+**If this is picked up again,** the mask-and-fill approach is probably the wrong
+tool for dense fields; a real starless transform (StarNet/StarXTerminator-style
+learned model) does not have this halo problem because it does not work by
+masking. Note also that `starless_blend` is API-only, defaults to `False`, and
+has no UI — nothing in normal use touches it.
+
+**Measurement warning:** the obvious metrics mislead here. "Inside-mask
+brightness reduced 97.8%" looked like success while the crop plainly showed
+ring artifacts, and an earlier variant scored *better* on star removal while
+looking worse. Check crops visually.
 
 Restored SH2-142's known-good plain stack (`save/SH2-142_320frames_2026-09-19.jpg`)
 after each failed attempt rather than leaving a broken result in place.
