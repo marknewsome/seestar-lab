@@ -41,11 +41,24 @@ from astropy.io import fits
 N_FRAMES = 60
 
 
-def analyse(target):
+def analyse(target, since=None):
     files = sorted(glob.glob(os.path.join(target, "*.fit")))
     name = os.path.basename(target.rstrip("/")).replace("_sub", "")
+    if since:
+        # Target folders accumulate subs across many nights and firmware eras,
+        # so an unfiltered sample silently mixes them — which makes a
+        # darks-on/darks-off comparison meaningless. Filter by the capture date
+        # in the filename.
+        import re
+        keep = []
+        for f in files:
+            m = re.search(r"(20\d{6})-", os.path.basename(f))
+            if m and m.group(1) >= since:
+                keep.append(f)
+        files = keep
+        name = f"{name} [>={since}]"
     if len(files) < 10:
-        print(f"{name:<22} (only {len(files)} subs — need >= 10)")
+        print(f"{name:<30} (only {len(files)} subs — need >= 10)")
         return
 
     idx = np.linspace(0, len(files) - 1, min(N_FRAMES, len(files))).astype(int)
@@ -64,7 +77,7 @@ def analyse(target):
         bias = hdr.get("BIAS", "-") if bias is None else bias
 
     if len(frames) < 10:
-        print(f"{name:<22} (could not read enough frames)")
+        print(f"{name:<30} (could not read enough frames)")
         return
 
     arr = np.stack(frames)
@@ -73,30 +86,53 @@ def analyse(target):
 
     base = float(np.median(med))
     mad = float(np.median(np.abs(med - base))) * 1.4826
-    hot = int((med > base + 10 * mad).sum()) if mad > 0 else 0
+    # Count only ISOLATED bright pixels. A plain threshold counts nebulosity
+    # too — on NGC 281 it reported 687,869 "hot pixels", which is the nebula.
+    # These are RAW BAYER frames, so a plain 3x3 median compares pixels of
+    # different colours and the colour mosaic itself reads as isolated
+    # structure; compare each pixel against its own-colour neighbours instead,
+    # by de-interleaving the CFA into its four sub-planes first.
+    isolated = np.zeros_like(med, dtype=np.float32)
+    for dy in (0, 1):
+        for dx in (0, 1):
+            plane = med[dy::2, dx::2].astype(np.float32)
+            import cv2 as _cv2
+            isolated[dy::2, dx::2] = plane - _cv2.medianBlur(plane, 3)
+    hot = int((isolated > 10 * mad).sum()) if mad > 0 else 0
 
     half = arr.shape[0] // 2
     m1 = np.median(arr[:half], axis=0)
     m2 = np.median(arr[half:], axis=0)
-    hi = med > base + 5 * mad if mad > 0 else np.zeros_like(med, bool)
+    hi = isolated > 5 * mad if mad > 0 else np.zeros_like(med, bool)
     corr = (float(np.corrcoef(m1[hi].ravel(), m2[hi].ravel())[0, 1])
             if hi.sum() > 100 else float("nan"))
 
     fixed_ratio = med.std() / max(noise, 1e-9)
-    verdict = ("FIXED PATTERN PRESENT" if (hot > 500 and corr > 0.5)
+    # half-corr is the load-bearing number, not the hot count. On a bright
+    # extended target the "hot" count tracks nebulosity no matter how the
+    # isolation filter is tuned (NGC 281 scores six figures either way), but a
+    # genuine sensor pattern is the SAME pixels in both halves of the sample,
+    # so it correlates near 1.0 while sky structure does not. Threshold set
+    # high deliberately: measured across this archive, darks-on and darks-off
+    # sessions alike top out around 0.5-0.76, so anything below ~0.9 is not a
+    # fixed pattern.
+    verdict = ("FIXED PATTERN PRESENT" if (corr == corr and corr > 0.9)
                else "clean (no fixed pattern to subtract)")
 
-    print(f"{name:<22} fw={fw:<5} BIAS={str(bias):<5} T={np.nanmean(temps):5.1f}C  "
+    print(f"{name:<30} fw={fw:<5} BIAS={str(bias):<5} T={np.nanmean(temps):5.1f}C  "
           f"n={arr.shape[0]:<3} min={arr.min():5.0f}  "
           f"hot={hot:>7}  fixed/noise={fixed_ratio:5.2f}  "
           f"half-corr={corr:6.3f}  -> {verdict}")
 
 
 if __name__ == "__main__":
-    targets = sys.argv[1:]
-    if not targets:
+    args = sys.argv[1:]
+    since = None
+    if args and args[0].startswith("--since="):
+        since = args.pop(0).split("=", 1)[1]
+    if not args:
         print(__doc__)
         sys.exit(1)
-    print(f"{'session':<22} {'headers':<30} {'measurements'}")
-    for t in targets:
-        analyse(t)
+    print(f"{'session':<30} {'headers':<30} {'measurements'}")
+    for t in args:
+        analyse(t, since=since)
