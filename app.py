@@ -723,7 +723,9 @@ def api_stack_start():
     for dir_path in session.get("paths", []):
         try:
             for fname in sorted(os.listdir(dir_path)):
-                if fname.startswith("."):
+                # Skip our own outputs (seestar_stacked.fits / _linear.fits):
+                # they live in the sub dir and would be fed back in as subs.
+                if fname.startswith((".", "seestar_stacked")):
                     continue
                 if _Path(fname).suffix.lower() in FITS_EXT:
                     fits_files.append(os.path.join(dir_path, fname))
@@ -1216,7 +1218,7 @@ def api_stack_quality_start(session_name: str):
     for dir_path in session.get("paths", []):
         try:
             for fname in sorted(os.listdir(dir_path)):
-                if not fname.startswith(".") and _Path(fname).suffix.lower() in FITS_EXT:
+                if not fname.startswith((".", "seestar_stacked")) and _Path(fname).suffix.lower() in FITS_EXT:
                     fits_files.append(os.path.join(dir_path, fname))
         except OSError:
             pass
@@ -1311,7 +1313,7 @@ def api_stack_temp_start(session_name: str):
     for dir_path in session.get("paths", []):
         try:
             for fname in sorted(os.listdir(dir_path)):
-                if not fname.startswith(".") and _Path(fname).suffix.lower() in FITS_EXT:
+                if not fname.startswith((".", "seestar_stacked")) and _Path(fname).suffix.lower() in FITS_EXT:
                     fits_files.append(os.path.join(dir_path, fname))
         except OSError:
             pass
@@ -3296,7 +3298,7 @@ if __name__ == "__main__":
         for dir_path in session.get("paths", []):
             try:
                 for fname in sorted(os.listdir(dir_path)):
-                    if not fname.startswith(".") and _Path(fname).suffix.lower() in FITS_EXT:
+                    if not fname.startswith((".", "seestar_stacked")) and _Path(fname).suffix.lower() in FITS_EXT:
                         fits_files.append(os.path.join(dir_path, fname))
             except OSError:
                 pass
