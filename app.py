@@ -3275,6 +3275,14 @@ def api_shutdown():
 
 if __name__ == "__main__":
     db.init_db()
+    try:
+        from stack_processor import scratch_dir as _scratch_dir
+        print(f"Stacking scratch dir: {_scratch_dir()}")
+        from stack_processor import sweep_stale_scratch as _sweep
+        for _p in _sweep():
+            print(f"[startup] Removed stale scratch: {_p}")
+    except Exception as _e:
+        print(f"WARNING: {_e}\n         Stack jobs will refuse to start until this is fixed.")
     n_purged = db.purge_resource_fork_jobs()
     if n_purged:
         print(f"[startup] Purged {n_purged} macOS resource-fork pseudo-file job(s) from DB.")

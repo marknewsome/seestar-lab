@@ -28,10 +28,13 @@ Pipeline:
 
 Drive I/O strategy
 ------------------
-All source files are copied to a local temp dir (tempfile.mkdtemp) before either
-pass begins.  The source drive (spinning or network mount) is read exactly once,
-sequentially, during the copy.  Every subsequent operation — quality scan, frame
-selection, alignment, integration — reads from local SSD.
+Stage A/B scoring reads the source frames in place (sequentially, so a network
+or spinning source is fine).  Only the selected frames are copied — once — into
+the Siril work dir on the scratch drive (scratch_dir(), default /mnt/f/Temp,
+override with SEESTAR_SCRATCH_DIR).  Scratch is a drvfs-mounted Windows drive
+so Siril sees it natively; it is never the WSL root VHD, because filling that
+crashes the whole machine.  A per-session frame cache on scratch is opt-in
+(use_cache) and is only built when explicitly requested.
 
 The copy covers all frames so the quality scan is also fast; previously the scan
 ran directly on the source drive which caused a seek per file on spinning media.
@@ -59,6 +62,88 @@ from typing import Callable, Optional
 
 FITS_EXT          = {'.fit', '.fits', '.fts'}
 MIN_FRAMES        = 3      # refuse to stack fewer than this many accepted frames
+
+# Scratch root for ALL stacking temp data: the frame copy, the persistent
+# frame cache and the Siril work dir.  Must be a Windows drive mounted via
+# drvfs (so Siril can see it) and must NOT be the WSL root VHD — a 1500-frame
+# stack writes ~70 GB of scratch, which grows the sparse VHD until the host
+# C: drive is full and the machine crashes (2026-11-16).  Override with
+# SEESTAR_SCRATCH_DIR.
+SCRATCH_DIR = os.environ.get("SEESTAR_SCRATCH_DIR", "/mnt/f/Temp")
+
+
+def scratch_dir() -> str:
+    """Return the validated scratch root, creating it if needed.
+
+    Raises RuntimeError rather than silently falling back to /tmp if the
+    configured path lives on the same filesystem as the WSL root — e.g. when
+    the F: drive is not attached, /mnt/f is just an empty folder on the VHD.
+    """
+    root_dev = os.stat('/').st_dev
+    base = SCRATCH_DIR
+    # Walk up to the nearest existing ancestor so we test the real mount,
+    # not a sub-folder makedirs would create on the wrong device.
+    probe = base
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if os.stat(probe).st_dev == root_dev:
+        raise RuntimeError(
+            f"Stacking scratch dir {base} is on the WSL root disk — the drive "
+            f"is probably not attached/mounted. Attach it or set "
+            f"SEESTAR_SCRATCH_DIR to a mounted Windows drive."
+        )
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def siril_scratch_bytes(h: int, w: int, n: int) -> int:
+    """Scratch bytes a Siril run on n frames of h×w needs, with 15 % headroom.
+
+    Raw CFA copy (2 B/px) + Siril's debayered RGB (uint16, 6 B/px) +
+    registered float32 RGB frames (12 B/px).
+    """
+    return int(h * w * (2 + 6 + 12) * n * 1.15)
+
+
+_SCRATCH_PREFIXES = ("seestar_siril_", "seestar_stack_", "starless_substack_")
+
+
+def sweep_stale_scratch(min_age_s: float = 600.0) -> list[str]:
+    """Remove leftover job dirs/files under the scratch root.
+
+    A crash or power loss leaves seestar_siril_* / seestar_stack_* behind
+    forever (tens of GB each).  Called at app startup, before the stack
+    worker starts, so nothing listed here can still be in use.  Anything
+    modified within min_age_s is left alone as a guard against a Siril
+    process from a previous app instance still writing.
+    """
+    removed: list[str] = []
+    try:
+        base = scratch_dir()
+    except Exception as exc:
+        logging.warning(f"scratch sweep skipped: {exc}")
+        return removed
+    now = time.time()
+    for name in os.listdir(base):
+        if not name.startswith(_SCRATCH_PREFIXES):
+            continue
+        path = os.path.join(base, name)
+        try:
+            if now - os.path.getmtime(path) < min_age_s:
+                continue
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            removed.append(path)
+        except OSError as exc:
+            logging.warning(f"scratch sweep: could not remove {path}: {exc}")
+    if removed:
+        logging.info(f"scratch sweep: removed {len(removed)} stale item(s) from {base}")
+    return removed
 QUALITY_THRESHOLD = 0.40   # reject frames below this fraction of median sharpness
 DEFAULT_MAX_FRAMES = 500   # keep only this many best frames (quality-ranked)
 DRIZZLE_SCALE     = 2      # Lanczos upsample factor (matches Seestar's output size)
@@ -1080,7 +1165,7 @@ def _starless_blend(deep_calibrated: np.ndarray, star_sub_path,
             # Light sub-stack: reuse _siril_full_stack for register+stack+
             # calibrate on a small frame count, then read its own output.
             tmp_fits = os.path.join(
-                tempfile.gettempdir(), f"starless_substack_{int(time.time())}.fits")
+                scratch_dir(), f"starless_substack_{int(time.time())}.fits")
             hdr0 = _read_fits_header(star_sub_path[0])
             bp = str(hdr0.get('BAYERPAT', bayer_pattern)).strip() or bayer_pattern
             ok = _siril_full_stack(
@@ -1274,7 +1359,7 @@ def _auto_stretch(img: np.ndarray,
 # ── Siril CLI post-processing ─────────────────────────────────────────────────
 
 SIRIL_CLI          = "/mnt/c/Program Files/Siril/bin/siril-cli.exe"
-SIRIL_WIN_WORK_BASE = "/mnt/g/Temp"   # Windows-accessible temp root for Siril jobs
+# Siril work dirs live under scratch_dir() (see top of file).
 
 
 _CORE_BLOWN_MIN_AREA = 2000   # px; largest contiguous near-white region, after
@@ -1553,35 +1638,32 @@ def _siril_full_stack(
         except Exception:
             return path
 
-    work_dir = os.path.join(SIRIL_WIN_WORK_BASE, f"seestar_siril_{int(time.time())}")
+    scratch  = scratch_dir()
+    work_dir = os.path.join(scratch, f"seestar_siril_{int(time.time())}")
 
     try:
         os.makedirs(work_dir, exist_ok=True)
 
-        # Pre-flight disk-space check.
-        # Raw CFA input (2 B/px) + Siril's debayered RGB copy (uint16, 6 B/px)
-        # + registered float32 RGB frames (12 B/px).
+        # Pre-flight disk-space check (StackProcessor.run also checks before
+        # any copying starts; this one is the last line of defence).
         n = len(selected_files)
         if n > 0:
             import shutil as _shutil
             sample_raw, sample_hdr = _read_fits(selected_files[0])
             h_s, w_s = sample_raw.shape[:2]
-            input_bytes  = h_s * w_s * 2 * n              # uint16 CFA input
-            debayer_bytes = h_s * w_s * 3 * 2 * n         # uint16 RGB (convert)
-            reg_bytes    = h_s * w_s * 3 * 4 * n          # float32 registered RGB
-            needed_bytes = (input_bytes + debayer_bytes + reg_bytes) * 1.15
-            free_bytes   = _shutil.disk_usage(SIRIL_WIN_WORK_BASE).free
+            needed_bytes = siril_scratch_bytes(h_s, w_s, n)
+            free_bytes   = _shutil.disk_usage(scratch).free
             if needed_bytes > free_bytes:
                 needed_gb = needed_bytes / 1024**3
                 free_gb   = free_bytes   / 1024**3
                 logging.warning(
                     f"Siril full stack: insufficient disk space — "
                     f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB free on "
-                    f"{SIRIL_WIN_WORK_BASE}.  Reduce max_frames or free disk space."
+                    f"{scratch}.  Reduce max_frames or free disk space."
                 )
                 progress_cb(0,
                     f"Disk space error: need {needed_gb:.1f} GB, "
-                    f"only {free_gb:.1f} GB free — reduce max_frames or free space on C:"
+                    f"only {free_gb:.1f} GB free on {scratch} — reduce max_frames or free space"
                 )
                 return False
             sample_has_bayerpat = bool(str(sample_hdr.get('BAYERPAT', '')).strip())
@@ -2061,47 +2143,79 @@ class StackProcessor:
                 f"Need at least {MIN_FRAMES} FITS files to stack, found {total}"
             )
 
-        # Persistent frame cache on local SSD — always under tempfile.gettempdir()
-        # so it stays on local storage regardless of where the output FITS lives
-        # (e.g. network share, external drive).  Keyed by the session directory
-        # name so each session gets its own cache.
+        # Persistent frame cache on the scratch drive (never the WSL VHD —
+        # see scratch_dir()).  Keyed by the session directory name so each
+        # session gets its own cache.
+        scratch     = scratch_dir()
         session_key = re.sub(r'[^\w\-]', '_', Path(output_path).parent.name)
-        cache_dir   = os.path.join(tempfile.gettempdir(),
-                                   'seestar_cache', session_key)
+        cache_dir   = os.path.join(scratch, 'seestar_cache', session_key)
 
-        # ── Copy all source frames to local SSD temp dir ──────────────────────
-        # If use_cache=True and a valid cache exists, skip the copy and read
-        # directly from cache.  Otherwise copy to a temp dir; on success the
-        # temp dir is promoted to cache (renamed) so future re-stacks are free.
-        tmp_dir = None
-        if use_cache and os.path.isdir(cache_dir):
+        # ── Early disk-space preflight ────────────────────────────────────
+        # Estimate the Siril scratch footprint from the frame geometry and the
+        # number of frames that can be selected, and fail now — before any
+        # copying or the ~30 min of Stage A/B scoring — rather than at 37 %.
+        n_est = min(max_frames, total)
+        try:
+            sample_raw, _ = _read_fits(fits_files[0])
+            h0, w0 = sample_raw.shape[:2]
+            frame_bytes = int(sample_raw.nbytes)
+            del sample_raw
+        except Exception as exc:
+            raise RuntimeError(f"Could not read first frame for preflight: {exc}")
+        needed = siril_scratch_bytes(h0, w0, n_est)
+        build_cache = False
+        if use_cache:
+            if (os.path.isdir(cache_dir) and len([
+                    f for f in os.listdir(cache_dir)
+                    if Path(f).suffix.lower() in FITS_EXT]) >= MIN_FRAMES):
+                pass                     # read from existing cache below
+            else:
+                build_cache = True       # cache requested but absent: build it
+                needed += frame_bytes * total
+        free = shutil.disk_usage(scratch).free
+        run_stats['scratch_need_gb'] = round(needed / 1024**3, 1)
+        run_stats['scratch_free_gb'] = round(free   / 1024**3, 1)
+        if needed > free:
+            raise RuntimeError(
+                f"Not enough scratch space on {scratch}: need "
+                f"{needed / 1024**3:.1f} GB for {n_est} frames, "
+                f"{free / 1024**3:.1f} GB free — lower max_frames or free space"
+            )
+
+        # ── Frame source ──────────────────────────────────────────────────
+        # Stage A/B score straight from the source files; only the selected
+        # frames are copied, once, into the Siril work dir.  The per-session
+        # cache is opt-in (use_cache): read it when present, build it when
+        # requested but absent.  It is never built as a side effect.
+        if use_cache and not build_cache:
             cached = sorted(
                 f for f in os.listdir(cache_dir)
                 if Path(f).suffix.lower() in FITS_EXT
             )
-            if len(cached) >= MIN_FRAMES:
-                fits_files = [os.path.join(cache_dir, f) for f in cached]
-                run_stats['used_cache'] = True
-                run_stats['total']      = len(fits_files)
-                total = len(fits_files)
-                progress_cb(10, f"Using {total} cached frames (skipping copy)", 0, total)
+            fits_files = [os.path.join(cache_dir, f) for f in cached]
+            run_stats['used_cache'] = True
+            run_stats['total']      = len(fits_files)
+            total = len(fits_files)
+            progress_cb(10, f"Using {total} cached frames", 0, total)
 
-        if not run_stats['used_cache']:
-            tmp_dir = tempfile.mkdtemp(prefix="seestar_stack_")
         try:
-            if not run_stats['used_cache']:
-                progress_cb(1, f"Copying {total} frames to local temp dir…", 0, total)
+            if build_cache:
+                progress_cb(1, f"Building frame cache on {scratch} ({total} frames)…", 0, total)
                 _chk()
+                if os.path.isdir(cache_dir):
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                os.makedirs(cache_dir, exist_ok=True)
                 local_files: list[str] = []
                 for ci, src in enumerate(fits_files):
                     _chk()
-                    dst = os.path.join(tmp_dir, os.path.basename(src))
+                    dst = os.path.join(cache_dir, os.path.basename(src))
                     _copy_file_no_sendfile(src, dst)
                     local_files.append(dst)
                     if (ci + 1) % 50 == 0 or ci + 1 == total:
                         progress_cb(1 + int(9 * (ci + 1) / total),
-                                    f"Copying: {ci + 1}/{total}", 0, total)
+                                    f"Caching: {ci + 1}/{total}", 0, total)
                 fits_files = local_files
+                run_stats['used_cache'] = True
 
             # ════════════════════════════════════════════════════════════════
             # STAGE A — fast quality filter (Bayer only, no debayer)
@@ -2217,8 +2331,8 @@ class StackProcessor:
                             for j in range(n_selected)
                         ],
                     }, f, indent=2)
-            except OSError:
-                pass
+            except OSError as exc:
+                logging.warning(f"could not save last_selection.json: {exc}")
 
             # Reference frame: highest Stage B quality score (best FWHM + stars + SNR)
             ref_rank_idx = max(range(n_selected),
@@ -2301,20 +2415,12 @@ class StackProcessor:
                         preview_u8 = _denoise_sharpen(preview_u8)
                         cv2.imwrite(str(output_path), preview_u8[::-1],
                                     [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logging.warning(f"preview fallback failed: {exc}")
 
                 run_stats['elapsed_s'] = round(time.monotonic() - t_start, 1)
                 log_path = str(Path(output_path).with_suffix('.log'))
                 _write_stack_log(log_path, run_stats, output_path)
-                if tmp_dir is not None:
-                    try:
-                        if os.path.isdir(cache_dir):
-                            shutil.rmtree(cache_dir)
-                        shutil.move(tmp_dir, cache_dir)
-                        tmp_dir = None
-                    except Exception:
-                        pass
                 progress_cb(100, "Done", n_selected, total)
                 return {
                     "frames_total":    total,
@@ -2417,8 +2523,8 @@ class StackProcessor:
                         n_batch += 1
                         batch_valid  &= valid
                         batch_metrics.append(sel_metrics[fi])
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logging.warning(f"align: skipping {os.path.basename(fpath)}: {exc}")
 
                 if n_batch < 1:
                     continue
@@ -2548,16 +2654,6 @@ class StackProcessor:
             log_path = str(Path(output_path).with_suffix('.log'))
             _write_stack_log(log_path, run_stats, output_path)
 
-            # Promote temp dir → persistent cache so the next re-stack is free.
-            if tmp_dir is not None:
-                try:
-                    if os.path.isdir(cache_dir):
-                        shutil.rmtree(cache_dir)
-                    shutil.move(tmp_dir, cache_dir)
-                    tmp_dir = None  # transferred; don't delete in finally
-                except Exception:
-                    pass  # cache promotion failed — not fatal
-
             progress_cb(100, "Done", n_accepted, total)
             return {
                 "frames_total":    total,
@@ -2566,8 +2662,8 @@ class StackProcessor:
                 "log_path":        log_path,
             }
         finally:
-            if tmp_dir is not None:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+            if build_cache and not run_stats.get('used_cache'):
+                shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 def rerender_preview(fits_path: str, jpeg_path: str,
